@@ -8,3 +8,6 @@ edition = "2018"
 
 [dependencies]
 jwalk = "0.5.1"
+clap  = "2.33.2"
+colored = "2"
+shellexpand = "2.0.0"
