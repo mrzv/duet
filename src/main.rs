@@ -1,4 +1,4 @@
-use std::error::Error;
+use color_eyre::eyre;
 
 #[macro_use]
 extern crate clap;
@@ -8,7 +8,9 @@ use colored::*;
 mod profile;
 mod scan;
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), eyre::Error> {
+    color_eyre::install().unwrap();
+
     let matches = clap_app!(duet =>
         (version: "0.1.0")
         (author: "Dmitriy Morozov <dmitriy@mrzv.org>")
