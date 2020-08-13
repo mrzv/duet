@@ -36,5 +36,9 @@ fn main() -> Result<(), eyre::Error> {
 
     scan::scan(&prf, &path)?;
 
+    if dry_run {
+        return Ok(());
+    }
+
     Ok(())
 }

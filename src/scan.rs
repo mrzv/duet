@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{PathBuf};
 
 use std::os::unix::fs::MetadataExt;
 use jwalk::{WalkDir};
@@ -13,14 +13,10 @@ use crate::profile::Profile;
 // TODO: restrict to same file system
 
 pub fn scan(prf: &Profile, path: &Option<&str>) -> Result<(), Error> {
-    let to_scan = Path::new(&prf.local);
-    let to_scan = {
-        if let Some(path) = path {
-            to_scan.join(path)
-        } else {
-            to_scan.to_path_buf()
-        }
-    };
+    let mut to_scan = PathBuf::from(&prf.local);
+    if let Some(path) = path {
+        to_scan.push(path);
+    }
 
     println!("Going to scan: {}", to_scan.display());
 
