@@ -1,13 +1,58 @@
 use std::fs::File;
 use std::io::{self, prelude::*, BufReader};
+use std::path::{PathBuf};
+use std::cmp::Ordering;
+use std::fmt;
 
 use shellexpand;
+
+pub enum Location {
+    Include(PathBuf),
+    Exclude(PathBuf),
+}
+
+impl Location {
+    fn path(&self) -> &PathBuf {
+        match self {
+            Location::Include(path) => path,
+            Location::Exclude(path) => path,
+        }
+    }
+}
+
+impl Ord for Location {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.path().cmp(other.path())
+    }
+}
+
+impl PartialOrd for Location {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Location {
+    fn eq(&self, other: &Self) -> bool {
+        self.path() == other.path()
+    }
+}
+
+impl Eq for Location { }
+
+impl fmt::Display for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self {
+            Location::Include(path) => write!(f, "+ {}", path.to_str().unwrap()),
+            Location::Exclude(path) => write!(f, "- {}", path.to_str().unwrap()),
+        }
+    }
+}
 
 pub struct Profile {
     pub local:   String,
     pub remote:  String,
-    pub include: Vec<String>,
-    pub exclude: Vec<String>,
+    pub paths:   Vec<Location>,
     pub ignore:  Vec<String>,
 }
 
@@ -18,8 +63,7 @@ pub fn parse(name: &str) -> Result<Profile, io::Error> {
     let mut p = Profile {
         local:   String::new(),
         remote:  String::new(),
-        include: Vec::new(),
-        exclude: Vec::new(),
+        paths:   Vec::new(),
         ignore:  Vec::new(),
     };
 
@@ -47,9 +91,9 @@ pub fn parse(name: &str) -> Result<Profile, io::Error> {
         // includes/excludes
         if locations == 2 {
             if line.trim().starts_with('+') {
-                p.include.push(line);
+                p.paths.push(Location::Include(PathBuf::from(&line[1..])));
             } else if line.trim().starts_with('-') {
-                p.exclude.push(line);
+                p.paths.push(Location::Exclude(PathBuf::from(&line[1..])));
             } else if line == "[ignore]" {
                 locations += 1;
             } else {
@@ -59,6 +103,8 @@ pub fn parse(name: &str) -> Result<Profile, io::Error> {
             p.ignore.push(line);
         }
     }
+
+    p.paths.sort();
 
     Ok(p)
 }
