@@ -52,6 +52,7 @@ impl fmt::Display for Location {
 
 pub type Locations = Vec<Location>;
 
+#[derive(Debug)]
 pub struct Profile {
     pub local:   String,
     pub remote:  String,
@@ -88,6 +89,7 @@ pub fn parse(name: &str) -> Result<Profile, io::Error> {
         } else if locations == 1 {
             p.remote = line;
             locations += 1;
+            p.paths.push(Location::Exclude(PathBuf::from(".")));    // implicitly exclude .
             continue;
         }
 
