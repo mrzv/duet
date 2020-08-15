@@ -6,13 +6,14 @@ use std::fmt;
 
 use shellexpand;
 
+#[derive(Debug, Clone)]
 pub enum Location {
     Include(PathBuf),
     Exclude(PathBuf),
 }
 
 impl Location {
-    fn path(&self) -> &PathBuf {
+    pub fn path(&self) -> &PathBuf {
         match self {
             Location::Include(path) => path,
             Location::Exclude(path) => path,
@@ -49,10 +50,12 @@ impl fmt::Display for Location {
     }
 }
 
+pub type Locations = Vec<Location>;
+
 pub struct Profile {
     pub local:   String,
     pub remote:  String,
-    pub paths:   Vec<Location>,
+    pub paths:   Locations,
     pub ignore:  Vec<String>,
 }
 

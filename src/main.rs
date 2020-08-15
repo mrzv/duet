@@ -7,6 +7,7 @@ use colored::*;
 
 mod profile;
 mod scan;
+mod utils;
 
 fn main() -> Result<(), eyre::Error> {
     color_eyre::install().unwrap();
