@@ -1,4 +1,5 @@
 use color_eyre::eyre;
+use std::path::{PathBuf};
 
 #[macro_use]
 extern crate clap;
@@ -33,7 +34,7 @@ fn main() -> Result<(), eyre::Error> {
 
     let dry_run = matches.is_present("dry_run");
 
-    let path = matches.value_of("path");
+    let path = matches.value_of("path").map(|x| PathBuf::from(x));
 
     scan::scan(&prf, &path)?;
 

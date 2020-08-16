@@ -1,27 +1,39 @@
-use std::path::{PathBuf};
+use std::path::{PathBuf,Path};
 use std::fs;
 use std::io;
 use itertools::{MultiPeek,multipeek};
 
 use std::os::unix::fs::MetadataExt;
 
+use savefile::{save_file,load_file};
+use savefile_derive::Savefile;
+
 //use glob;
 // TODO: incorporate ignore
 
-use crate::profile::{Profile,Locations,Location};
+use crate::profile::{Profile,Locations};
 
 struct Directory {
     entries: <Vec<fs::DirEntry> as IntoIterator>::IntoIter,
 }
 
-struct DirIterator {
+pub struct DirIterator {
     stack: Vec<Directory>,
     dev:   u64,
     base:  PathBuf,
     locations: MultiPeek<<Locations as IntoIterator>::IntoIter>,
 }
 
-impl DirIterator {
+#[derive(Debug,Savefile)]
+pub struct DirEntryWithMeta {
+    path: String,
+    size: u64,
+    mtime: i64,
+    ino: u64,
+    mode: u32,
+}
+
+impl<'a> DirIterator {
     fn push(&mut self, path: &PathBuf) {
         let mut paths: Vec<_> = fs::read_dir(path).unwrap()
                                                   .map(|r| r.unwrap())
@@ -31,7 +43,7 @@ impl DirIterator {
         self.stack.push(Directory { entries: paths.into_iter() });
     }
 
-    fn from_with_dev(path: &PathBuf, dev_path: &PathBuf, prf: &Profile) -> Self {
+    pub fn create(path: &PathBuf, dev_path: &PathBuf, prf: &Profile) -> Self {
         let dev = dev_path.symlink_metadata().ok().unwrap().dev();
 
         let mut it = DirIterator {
@@ -53,7 +65,7 @@ impl DirIterator {
         let locations = &mut self.locations;
 
         // assumes that locations start with something that's <= path
-        while let Some(l1) = locations.peek() {
+        while let Some(_l1) = locations.peek() {
             if let Some(l2) = locations.peek() {
                 let l = self.base.join(l2.path());
                 if &l <= path {
@@ -68,12 +80,16 @@ impl DirIterator {
         }
         locations.reset_peek();
     }
+
+    fn relative(&self, path: &'a PathBuf) -> &'a Path {
+        path.strip_prefix(&self.base).unwrap()
+    }
 }
 
 impl Iterator for DirIterator {
-    type Item = (PathBuf,fs::Metadata);
+    type Item = DirEntryWithMeta;
 
-    fn next(&mut self) -> Option<(PathBuf,fs::Metadata)> {
+    fn next(&mut self) -> Option<DirEntryWithMeta> {
         let entry = loop {
             let dir = self.stack.last_mut();
 
@@ -100,11 +116,16 @@ impl Iterator for DirIterator {
             self.push(&path);
         }
 
-        Some((path,meta))
+        Some(DirEntryWithMeta {
+                path: self.relative(&path).to_str().unwrap().to_string(),
+                size: meta.size(),
+                mtime: meta.mtime(),
+                ino: meta.ino(),
+                mode: meta.mode(), })
     }
 }
 
-pub fn scan(prf: &Profile, path: &Option<&str>) -> Result<(), io::Error> {
+pub fn scan(prf: &Profile, path: &Option<PathBuf>) -> Result<(), io::Error> {
     let mut to_scan = PathBuf::from(&prf.local);
     let device_path = PathBuf::from(&prf.local);
     if let Some(path) = path {
@@ -113,13 +134,19 @@ pub fn scan(prf: &Profile, path: &Option<&str>) -> Result<(), io::Error> {
 
     println!("Going to scan: {}", to_scan.display());
 
-    let mut count = 0;
+    let entries: Vec<_> = DirIterator::create(&to_scan, &device_path, &prf).collect();
+    let count = entries.len();
+    save_file("save.bin", 0, &entries).unwrap();
+    println!("Count: {}", count);
 
-    for (path,_meta) in DirIterator::from_with_dev(&to_scan, &device_path, &prf) {
-        //println!("{}", path.display());
-        count += 1;
-    }
+    //let mut count = 0;
+    //for entry in DirIterator::create(&to_scan, &device_path, &prf) {
+    //    println!("{:?}", entry);
+    //    count += 1;
+    //}
 
+    let entries: Vec<DirEntryWithMeta> = load_file("save.bin", 0).unwrap();
+    let count = entries.len();
     println!("Count: {}", count);
 
     Ok(())
