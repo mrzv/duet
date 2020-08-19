@@ -170,12 +170,11 @@ impl Iterator for DirIterator {
                 continue;
             }
 
-            if path.starts_with(&self.restrict) {
+            // check restriction and crossing the filesystem boundary
+            if path.starts_with(&self.restrict) && self.dev == meta.dev() {
                 break (path,meta);
             }
         };
-
-        // TODO: if we are crossing the filesystem boundary, should we skip this entry?
 
         Some(DirEntryWithMeta {
                 path: self.relative(&path).to_str().unwrap().to_string(),
