@@ -35,6 +35,7 @@ pub struct DirEntryWithMeta {
     mtime:  i64,
     ino:    u64,
     mode:   u32,
+    target: Option<String>,
 }
 
 impl<'a> DirIterator {
@@ -178,6 +179,7 @@ impl Iterator for DirIterator {
 
         Some(DirEntryWithMeta {
                 path: self.relative(&path).to_str().unwrap().to_string(),
+                target: path.read_link().map_or(None, |p| Some(p.to_str().unwrap().to_string())),
                 size: meta.size(),
                 mtime: meta.mtime(),
                 ino: meta.ino(),
