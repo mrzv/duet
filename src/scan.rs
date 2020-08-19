@@ -38,59 +38,6 @@ pub struct DirEntryWithMeta {
 }
 
 impl<'a> DirIterator {
-    fn push(&mut self, path: &PathBuf) {
-        // check the restriction
-        if !path.starts_with(&self.restrict) && !self.restrict.starts_with(path) {
-            log::debug!("Skipping (restriction): {:?} vs {:?}", path, self.restrict);
-            return;
-        }
-
-        // read old parent and descendants
-        let (mut parent, mut from, mut to) = if self.stack.is_empty() {
-            (0, 0, self.locations.len() - 1)
-        } else {
-            let parent    = self.stack.last().unwrap().parent;
-            let (from,to) = self.stack.last().unwrap().descendants;
-            (parent, from, to)
-        };
-
-        // update descendants
-        while from <= to && !self.locations[from].path().starts_with(path) {
-            from += 1;
-        }
-        let parent_to = to;
-        if from < self.locations.len() {
-            to = from;
-        }
-        while to <= parent_to && self.locations[to].path().starts_with(path) {
-            to += 1;
-        }
-
-        // update parent
-        if from <= to && self.locations[from].path() == path {
-            parent = from;
-        }
-        log::debug!("from = {}, to = {}, parent = {}", from, to, parent);
-        if from <= to {
-            log::debug!("from = {:?}, to = {:?}, parent = {:?}",
-                        self.locations.get(from), self.locations.get(to), self.locations.get(parent));
-        }
-
-        // no need to descend if we are in the exclude regime and there are no descendants
-        if self.locations[parent].is_exclude() && from > to {
-            log::debug!("Skipping excluded: {:?}", path);
-            return;
-        }
-
-        // read the directory
-        let mut paths: Vec<_> = fs::read_dir(path).unwrap()
-                                                  .map(|r| r.unwrap())
-                                                  .collect();
-        paths.sort_by_key(|dir| dir.path());
-
-        self.stack.push(Directory { entries: paths.into_iter(), parent, descendants: (from,to) });
-    }
-
     pub fn create(path: &PathBuf, dev_path: &PathBuf, prf: &Profile) -> Self {
         let dev = dev_path.symlink_metadata().ok().unwrap().dev();
 
@@ -107,7 +54,7 @@ impl<'a> DirIterator {
             locations,
         };
         for x in &it.locations {
-            println!("Location: {:?}", x);
+            log::debug!("Location: {:?}", x);
         }
 
         it.push(&it.base.clone());
@@ -115,11 +62,68 @@ impl<'a> DirIterator {
         it
     }
 
+    fn push(&mut self, path: &PathBuf) {
+        // check the restriction
+        if !path.starts_with(&self.restrict) && !self.restrict.starts_with(path) {
+            log::trace!("Skipping (restriction): {:?} vs {:?}", path, self.restrict);
+            return;
+        }
+
+        let (parent, from, to) = self.find_parent_descendants(path);
+
+        // no need to descend if we are in the exclude regime and there are no descendants
+        if self.locations[parent].is_exclude() && from > to {
+            log::trace!("Skipping excluded: {:?}", path);
+            return;
+        }
+
+        // read the directory
+        let mut paths: Vec<_> = fs::read_dir(path).unwrap()
+                                                  .map(|r| r.unwrap())
+                                                  .collect();
+        paths.sort_by_key(|dir| dir.path());
+
+        self.stack.push(Directory { entries: paths.into_iter(), parent, descendants: (from,to) });
+    }
+
+    // narrow the last parent/descendants on the stack for the path
+    fn find_parent_descendants(&self, path: &PathBuf) -> (usize, usize, usize) {
+        // read old parent and descendants
+        let (mut parent, mut from, mut to) = if self.stack.is_empty() {
+            (0, 0, self.locations.len() - 1)
+        } else {
+            let dir       = self.stack.last().unwrap();
+            let parent    = dir.parent;
+            let (from,to) = dir.descendants;
+            (parent, from, to)
+        };
+
+        // update descendants
+        while from <= to && !self.locations[from].path().starts_with(path) {
+            from += 1;
+        }
+        if from <= to {
+            let parent_to = to;
+            to = from;
+            while to < parent_to && self.locations[to+1].path().starts_with(path) {
+                to += 1;
+            }
+        }
+
+        // update parent
+        if from <= to && self.locations[from].path() == path {
+            parent = from;
+        }
+
+        (parent, from, to)
+    }
+
     fn relative(&self, path: &'a PathBuf) -> &'a Path {
         path.strip_prefix(&self.base).unwrap()
     }
 
-    fn find_location(&self, path: &PathBuf, parent: usize, descendants: (usize, usize)) -> &Location {
+    // find closest parent among self.locations
+    fn find_parent(&self, path: &PathBuf, parent: usize, descendants: (usize, usize)) -> &Location {
         let (mut from, to) = descendants;
         while from <= to && from < self.locations.len() {
             if self.locations[from].path() == path {
@@ -161,8 +165,8 @@ impl Iterator for DirIterator {
                 self.push(&path);
             }
 
-            if self.find_location(&path, parent, descendants).is_exclude() {
-                log::debug!("Not reporting (excluded): {:?}", path);
+            if self.find_parent(&path, parent, descendants).is_exclude() {
+                log::trace!("Not reporting (excluded): {:?}", path);
                 continue;
             }
 
@@ -189,7 +193,7 @@ pub fn scan(prf: &Profile, path: &Option<PathBuf>) -> Result<(), io::Error> {
         to_scan.push(path);
     }
 
-    println!("Going to scan: {}", to_scan.display());
+    log::info!("Going to scan: {}", to_scan.display());
 
     //let entries: Vec<_> = DirIterator::create(&to_scan, &device_path, &prf).collect();
     //let count = entries.len();
