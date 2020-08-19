@@ -6,12 +6,15 @@ extern crate clap;
 
 use colored::*;
 
+use env_logger;
+
 mod profile;
 mod scan;
 mod utils;
 
 fn main() -> Result<(), eyre::Error> {
     color_eyre::install().unwrap();
+    env_logger::init();
 
     let matches = clap_app!(duet =>
         (version: "0.1.0")
