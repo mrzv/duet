@@ -1,12 +1,12 @@
 use color_eyre::eyre;
-use std::path::{PathBuf};
+use env_logger;
 
 #[macro_use]
 extern crate clap;
 
 use colored::*;
 
-use env_logger;
+use savefile::{save_file,load_file};
 
 mod profile;
 mod scan;
@@ -37,9 +37,27 @@ fn main() -> Result<(), eyre::Error> {
 
     let dry_run = matches.is_present("dry_run");
 
-    let path = matches.value_of("path").map(|x| PathBuf::from(x));
+    let path = matches.value_of("path");
 
-    scan::scan(PathBuf::from(&prf.local), &path, &prf.locations)?;
+
+    //let count = scan::scan(&prf.local, &path, &prf.locations).count();
+    //println!("Count: {}", count);
+
+    //let entries: Vec<_> = scan::scan(&prf.local, &path, &prf.locations).collect();
+    //let count = entries.len();
+    //save_file("save.bin", 0, &entries).unwrap();
+    //println!("Count: {}", count);
+
+    let mut count = 0;
+    for entry in scan::scan(&prf.local, &path, &prf.locations) {
+        println!("{:?}", entry);
+        count += 1;
+    }
+    println!("Count: {}", count);
+
+    //let entries: Vec<DirEntryWithMeta> = load_file("save.bin", 0).unwrap();
+    //let count = entries.len();
+    //println!("Count: {}", count);
 
     if dry_run {
         return Ok(());

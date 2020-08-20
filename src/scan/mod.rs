@@ -1,10 +1,8 @@
 use std::path::{PathBuf,Path};
 use std::fs;
-use std::io;
 
 use std::os::unix::fs::MetadataExt;
 
-use savefile::{save_file,load_file};
 use savefile_derive::Savefile;
 
 use log;
@@ -188,7 +186,8 @@ impl Iterator for DirIterator {
     }
 }
 
-pub fn scan(base: PathBuf, path: &Option<PathBuf>, locations: &Locations) -> Result<(), io::Error> {
+pub fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: &Option<Q>, locations: &Locations) -> DirIterator {
+    let base = PathBuf::from(base.as_ref());
     let mut restrict = PathBuf::from(&base);
     if let Some(path) = path {
         restrict.push(path);
@@ -196,20 +195,5 @@ pub fn scan(base: PathBuf, path: &Option<PathBuf>, locations: &Locations) -> Res
 
     log::info!("Going to scan: {}", restrict.display());
 
-    //let entries: Vec<_> = DirIterator::create(base, restrict, locations).collect();
-    //let count = entries.len();
-    //save_file("save.bin", 0, &entries).unwrap();
-
-    let mut count = 0;
-    for entry in DirIterator::create(base, restrict, locations) {
-        println!("{:?}", entry);
-        count += 1;
-    }
-
-    //let entries: Vec<DirEntryWithMeta> = load_file("save.bin", 0).unwrap();
-    //let count = entries.len();
-
-    println!("Count: {}", count);
-
-    Ok(())
+    DirIterator::create(base, restrict, locations)
 }
