@@ -39,7 +39,7 @@ fn main() -> Result<(), eyre::Error> {
 
     let path = matches.value_of("path").map(|x| PathBuf::from(x));
 
-    scan::scan(&prf, &path)?;
+    scan::scan(PathBuf::from(&prf.local), &path, &prf.locations)?;
 
     if dry_run {
         return Ok(());

@@ -7,12 +7,14 @@ use std::os::unix::fs::MetadataExt;
 use savefile::{save_file,load_file};
 use savefile_derive::Savefile;
 
+use log;
+
 //use glob;
 // TODO: incorporate ignore
 
-use crate::profile::{Profile,Locations,Location};
+pub mod location;
 
-use log;
+use location::{Locations,Location};
 
 struct Directory {
     entries: <Vec<fs::DirEntry> as IntoIterator>::IntoIter,
@@ -39,19 +41,18 @@ pub struct DirEntryWithMeta {
 }
 
 impl<'a> DirIterator {
-    pub fn create(path: &PathBuf, dev_path: &PathBuf, prf: &Profile) -> Self {
-        let dev = dev_path.symlink_metadata().ok().unwrap().dev();
-
-        let base = PathBuf::from(&prf.local);
+    pub fn create(base: PathBuf, restrict: PathBuf, locations: &Locations) -> Self {
+        let dev = base.symlink_metadata().ok().unwrap().dev();
 
         // prefix locations with base
-        let locations = prf.locations.iter().map(|l| l.prefix(&base)).collect();
+        let mut locations: Locations = locations.iter().map(|l| l.prefix(&base)).collect();
+        locations.sort();
 
         let mut it = DirIterator {
             stack:     vec![],
             dev,
             base,
-            restrict:  path.clone(),
+            restrict,
             locations,
         };
         for x in &it.locations {
@@ -187,21 +188,20 @@ impl Iterator for DirIterator {
     }
 }
 
-pub fn scan(prf: &Profile, path: &Option<PathBuf>) -> Result<(), io::Error> {
-    let mut to_scan = PathBuf::from(&prf.local);
-    let device_path = PathBuf::from(&prf.local);
+pub fn scan(base: PathBuf, path: &Option<PathBuf>, locations: &Locations) -> Result<(), io::Error> {
+    let mut restrict = PathBuf::from(&base);
     if let Some(path) = path {
-        to_scan.push(path);
+        restrict.push(path);
     }
 
-    log::info!("Going to scan: {}", to_scan.display());
+    log::info!("Going to scan: {}", restrict.display());
 
-    //let entries: Vec<_> = DirIterator::create(&to_scan, &device_path, &prf).collect();
+    //let entries: Vec<_> = DirIterator::create(base, restrict, locations).collect();
     //let count = entries.len();
     //save_file("save.bin", 0, &entries).unwrap();
 
     let mut count = 0;
-    for entry in DirIterator::create(&to_scan, &device_path, &prf) {
+    for entry in DirIterator::create(base, restrict, locations) {
         println!("{:?}", entry);
         count += 1;
     }
