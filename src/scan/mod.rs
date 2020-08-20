@@ -11,6 +11,7 @@ use log;
 // TODO: incorporate ignore
 
 pub mod location;
+pub mod change;
 
 use location::{Locations,Location};
 
