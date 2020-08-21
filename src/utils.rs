@@ -59,7 +59,7 @@ impl<T,U,KT,KU,K> Iterator for MatchSorted<Peekable<T>,Peekable<U>,KT,KU,K>
     }
 }
 
-fn match_sorted<T,U,KT,KU,K>(r1: T, r2: U, key1: KT, key2: KU) -> MatchSorted<Peekable<T::IntoIter>,Peekable<U::IntoIter>,KT,KU,K>
+pub fn match_sorted<T,U,KT,KU,K>(r1: T, r2: U, key1: KT, key2: KU) -> MatchSorted<Peekable<T::IntoIter>,Peekable<U::IntoIter>,KT,KU,K>
     where
         T: IntoIterator,
         U: IntoIterator,

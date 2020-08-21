@@ -3,6 +3,7 @@ use std::fmt;
 
 use super::DirEntryWithMeta;
 
+#[derive(Debug, Clone)]
 pub enum Change {
     Added(DirEntryWithMeta),
     Removed(DirEntryWithMeta),

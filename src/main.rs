@@ -40,24 +40,12 @@ fn main() -> Result<(), eyre::Error> {
     let path = matches.value_of("path");
 
 
-    //let count = scan::scan(&prf.local, &path, &prf.locations).count();
-    //println!("Count: {}", count);
+    let current_entries: Vec<_> = scan::scan(&prf.local, &path, &prf.locations).collect();
+    let old_entries: Vec<scan::DirEntryWithMeta> = load_file("save.bin", 0).unwrap();
 
-    //let entries: Vec<_> = scan::scan(&prf.local, &path, &prf.locations).collect();
-    //let count = entries.len();
-    //save_file("save.bin", 0, &entries).unwrap();
-    //println!("Count: {}", count);
+    scan::changes(old_entries.into_iter(), current_entries.into_iter());
 
-    let mut count = 0;
-    for entry in scan::scan(&prf.local, &path, &prf.locations) {
-        println!("{:?}", entry);
-        count += 1;
-    }
-    println!("Count: {}", count);
-
-    //let entries: Vec<DirEntryWithMeta> = load_file("save.bin", 0).unwrap();
-    //let count = entries.len();
-    //println!("Count: {}", count);
+    //save_file("save.bin", 0, &current_entries).unwrap();
 
     if dry_run {
         return Ok(());
