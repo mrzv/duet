@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt;
+use colored::*;
 
 use crate::utils::{match_sorted,MatchSorted};
 
@@ -45,8 +46,8 @@ impl Eq for Change { }
 impl fmt::Display for Change {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self {
-            Change::Added(_)    => write!(f, "A {}", self.path()),
-            Change::Removed(_)  => write!(f, "R {}", self.path()),
+            Change::Added(_)    => write!(f, "+ {}", self.path().green()),
+            Change::Removed(_)  => write!(f, "- {}", self.path().red()),
             Change::Modified(_,_) => write!(f, "M {}", self.path()),
         }
     }
