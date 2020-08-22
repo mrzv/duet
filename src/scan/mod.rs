@@ -1,13 +1,12 @@
 use std::path::{PathBuf,Path};
 use std::fs;
+use std::cmp::Ordering;
 
 use std::os::unix::fs::MetadataExt;
 
 use savefile_derive::Savefile;
 
 use log;
-
-use crate::utils::match_sorted;
 
 //use glob;
 // TODO: incorporate ignore
@@ -16,7 +15,7 @@ pub mod location;
 pub mod change;
 
 use location::{Locations,Location};
-use change::Change;
+pub use change::{changes,Change};
 
 struct Directory {
     entries: <Vec<fs::DirEntry> as IntoIterator>::IntoIter,
@@ -42,10 +41,30 @@ pub struct DirEntryWithMeta {
     target: Option<String>,
 }
 
-impl PartialEq for DirEntryWithMeta {
-    fn eq(&self, other: &Self) -> bool {
+impl DirEntryWithMeta {
+    fn same(&self, other: &Self) -> bool {
         assert_eq!(self.path, other.path);
         self.size == other.size && self.mtime == other.mtime && self.ino == other.ino && self.mode == other.mode && self.target == other.target
+    }
+}
+
+impl PartialEq for DirEntryWithMeta {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for DirEntryWithMeta { }
+
+impl PartialOrd for DirEntryWithMeta {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DirEntryWithMeta {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.path.cmp(&other.path)
     }
 }
 
@@ -208,28 +227,4 @@ pub fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: &Option<Q>, locations
     log::info!("Going to scan: {}", restrict.display());
 
     DirIterator::create(base, restrict, locations)
-}
-
-pub fn changes<I1, I2>(it1: I1, it2: I2)
-    where
-        I1: Iterator<Item = DirEntryWithMeta>,
-        I2: Iterator<Item = DirEntryWithMeta>,
-{
-    for (a,b) in match_sorted(it1, it2, |x| &x.path, |x| &x.path) {
-        let change = match (a,b) {
-            (None, None) => None,
-            (Some(a), None) => Some(Change::Removed(a)),
-            (None, Some(b)) => Some(Change::Added(b)),
-            (Some(a), Some(b)) => {
-                if a != b {
-                    Some(Change::Modified(b))
-                } else {
-                    None
-                }
-            }
-        };
-        if change != None {
-            println!("{:?}", change);
-        }
-    }
 }

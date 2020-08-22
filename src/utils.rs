@@ -1,39 +1,33 @@
 use std::iter::{Peekable};
 use std::cmp::Ordering;
 
-pub struct MatchSorted<T,U,KT,KU,K>
+pub struct MatchSorted_<T,U,K>
     where
-        T: Iterator,
-        U: Iterator,
-        KT: Fn(&T::Item) -> &K,
-        KU: Fn(&U::Item) -> &K,
+        T: Iterator<Item = K>,
+        U: Iterator<Item = K>,
         K: std::cmp::Ord,
 {
     it1: T,
     it2: U,
-    key1: KT,
-    key2: KU,
 }
 
-impl<T,U,KT,KU,K> MatchSorted<Peekable<T>,Peekable<U>,KT,KU,K>
+pub type MatchSorted<T,U,K> = MatchSorted_<Peekable<T>,Peekable<U>,K>;
+
+impl<T,U,K> MatchSorted<T,U,K>
     where
-        T: Iterator,
-        U: Iterator,
-        KT: Fn(&T::Item) -> &K,
-        KU: Fn(&U::Item) -> &K,
+        T: Iterator<Item = K>,
+        U: Iterator<Item = K>,
         K: std::cmp::Ord,
 {
-    pub fn new(it1: T, it2: U, key1: KT, key2: KU) -> MatchSorted<Peekable<T>,Peekable<U>,KT,KU,K> {
-        MatchSorted { it1: it1.peekable(), it2: it2.peekable(), key1, key2 }
+    pub fn new(it1: T, it2: U) -> MatchSorted<T,U,K> {
+        MatchSorted { it1: it1.peekable(), it2: it2.peekable() }
     }
 }
 
-impl<T,U,KT,KU,K> Iterator for MatchSorted<Peekable<T>,Peekable<U>,KT,KU,K>
+impl<T,U,K> Iterator for MatchSorted<T,U,K>
     where
-        T: Iterator,
-        U: Iterator,
-        KT: Fn(&T::Item) -> &K,
-        KU: Fn(&U::Item) -> &K,
+        T: Iterator<Item = K>,
+        U: Iterator<Item = K>,
         K: std::cmp::Ord,
 {
     type Item = (Option<T::Item>, Option<U::Item>);
@@ -48,8 +42,8 @@ impl<T,U,KT,KU,K> Iterator for MatchSorted<Peekable<T>,Peekable<U>,KT,KU,K>
             _ => return Some((self.it1.next(),self.it2.next())),
         };
 
-        let xk = (self.key1)(x);
-        let yk = (self.key2)(y);
+        let xk = x;
+        let yk = y;
 
         match xk.cmp(yk) {
             Ordering::Less    => Some((self.it1.next(), None)),
@@ -59,15 +53,13 @@ impl<T,U,KT,KU,K> Iterator for MatchSorted<Peekable<T>,Peekable<U>,KT,KU,K>
     }
 }
 
-pub fn match_sorted<T,U,KT,KU,K>(r1: T, r2: U, key1: KT, key2: KU) -> MatchSorted<Peekable<T::IntoIter>,Peekable<U::IntoIter>,KT,KU,K>
+pub fn match_sorted<T,U,K>(it1: T, it2: U) -> MatchSorted<T,U,K>
     where
-        T: IntoIterator,
-        U: IntoIterator,
-        KT: Fn(&T::Item) -> &K,
-        KU: Fn(&U::Item) -> &K,
+        T: Iterator<Item = K>,
+        U: Iterator<Item = K>,
         K: std::cmp::Ord,
 {
-    MatchSorted::new(r1.into_iter(),r2.into_iter(),key1,key2)
+    MatchSorted::new(it1,it2)
 }
 
 #[test]
@@ -76,7 +68,7 @@ fn test_match_sorted() {
     let y = vec!(2,5,6,7);
 
     //let z = MatchSorted::new(x.iter(),y.iter(), |a| a, |a| a);
-    for (x,y) in match_sorted(x, y, |a| a, |a| a) {
+    for (x,y) in match_sorted(x.iter(), y.iter()) {
         println!("{:?} {:?}", x,y);
     }
 }

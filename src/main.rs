@@ -41,11 +41,18 @@ fn main() -> Result<(), eyre::Error> {
 
 
     let current_entries: Vec<_> = scan::scan(&prf.local, &path, &prf.locations).collect();
-    let old_entries: Vec<scan::DirEntryWithMeta> = load_file("save.bin", 0).unwrap();
+    let old_entries: Vec<scan::DirEntryWithMeta> =
+        if std::path::Path::new("save.bin").exists() {
+            load_file("save.bin", 0).unwrap()
+        } else {
+            Vec::new()
+        };
 
-    scan::changes(old_entries.into_iter(), current_entries.into_iter());
+    for c in scan::changes(old_entries.iter(), current_entries.iter()) {
+        println!("{:?}", c);
+    }
 
-    //save_file("save.bin", 0, &current_entries).unwrap();
+    save_file("save.bin", 0, &current_entries).unwrap();
 
     if dry_run {
         return Ok(());
