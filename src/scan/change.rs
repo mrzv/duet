@@ -9,7 +9,7 @@ use super::DirEntryWithMeta;
 pub enum Change {
     Added(DirEntryWithMeta),
     Removed(DirEntryWithMeta),
-    Modified(DirEntryWithMeta),
+    Modified(DirEntryWithMeta, DirEntryWithMeta),
 }
 
 impl Change {
@@ -17,7 +17,7 @@ impl Change {
         match self {
             Change::Added(dir)    => &dir.path,
             Change::Removed(dir)  => &dir.path,
-            Change::Modified(dir) => &dir.path,
+            Change::Modified(dir1,dir2) => { assert_eq!(dir1.path, dir2.path); &dir2.path},
         }
     }
 }
@@ -47,7 +47,7 @@ impl fmt::Display for Change {
         match &self {
             Change::Added(_)    => write!(f, "A {}", self.path()),
             Change::Removed(_)  => write!(f, "R {}", self.path()),
-            Change::Modified(_) => write!(f, "M {}", self.path()),
+            Change::Modified(_,_) => write!(f, "M {}", self.path()),
         }
     }
 }
@@ -79,7 +79,7 @@ impl<'a, I1,I2> Iterator for ChangesIterator<'a, I1, I2>
                 (None, Some(b)) => break Some(Change::Added(b.clone())),
                 (Some(a), Some(b)) => {
                     if !a.same(b) {
-                        break Some(Change::Modified(b.clone()))
+                        break Some(Change::Modified(a.clone(), b.clone()))
                     } else {
                         continue;
                     }

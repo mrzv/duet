@@ -46,6 +46,10 @@ impl DirEntryWithMeta {
         assert_eq!(self.path, other.path);
         self.size == other.size && self.mtime == other.mtime && self.ino == other.ino && self.mode == other.mode && self.target == other.target
     }
+
+    pub fn starts_with(&self, path: &str) -> bool {
+        self.path.starts_with(path)
+    }
 }
 
 impl PartialEq for DirEntryWithMeta {
@@ -217,12 +221,10 @@ impl Iterator for DirIterator {
     }
 }
 
-pub fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: &Option<Q>, locations: &Locations) -> DirIterator {
+pub fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &Locations) -> DirIterator {
     let base = PathBuf::from(base.as_ref());
     let mut restrict = PathBuf::from(&base);
-    if let Some(path) = path {
-        restrict.push(path);
-    }
+    restrict.push(path);
 
     log::info!("Going to scan: {}", restrict.display());
 

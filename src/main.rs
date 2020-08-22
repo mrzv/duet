@@ -1,5 +1,6 @@
 use color_eyre::eyre;
 use env_logger;
+use log;
 
 #[macro_use]
 extern crate clap;
@@ -26,37 +27,36 @@ fn main() -> Result<(), eyre::Error> {
     ).get_matches();
 
     let profile_name = matches.value_of("profile").unwrap();
-    let prf = profile::parse(profile_name);
-    if let Ok(_) = prf {
-        println!("Using profile: {}", profile_name.yellow());
-    } else if let Err(why) = prf {
-        eprintln!("Failed to read {}:\n{}", profile_name.yellow(), why.to_string().magenta());
-        std::process::exit(1);
-    }
-    let prf = prf.unwrap();
+    let prf = profile::parse(profile_name).expect(&format!("Failed to read profile {}", profile_name.yellow()));
+    println!("Using profile: {}", profile_name.yellow());
 
     let dry_run = matches.is_present("dry_run");
+    let path = matches.value_of("path").unwrap_or("");
 
-    let path = matches.value_of("path");
-
-
-    let current_entries: Vec<_> = scan::scan(&prf.local, &path, &prf.locations).collect();
-    let old_entries: Vec<scan::DirEntryWithMeta> =
+    let restricted_current_entries: Vec<_> = scan::scan(&prf.local, &path, &prf.locations).collect();
+    let all_old_entries: Vec<scan::DirEntryWithMeta> =
         if std::path::Path::new("save.bin").exists() {
             load_file("save.bin", 0).unwrap()
         } else {
             Vec::new()
         };
 
-    for c in scan::changes(old_entries.iter(), current_entries.iter()) {
-        println!("{:?}", c);
-    }
+    let restricted_old_entries_iter = all_old_entries
+                                        .iter()
+                                        .filter(|dir: &&scan::DirEntryWithMeta| dir.starts_with(path));
 
-    save_file("save.bin", 0, &current_entries).unwrap();
+    for c in scan::changes(restricted_old_entries_iter, restricted_current_entries.iter()) {
+        log::debug!("{:?}", c);
+        println!("{}", c);
+    }
 
     if dry_run {
         return Ok(());
     }
+
+    // TODO: apply changes
+
+    save_file("save.bin", 0, &restricted_current_entries).unwrap();
 
     Ok(())
 }
