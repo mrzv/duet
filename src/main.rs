@@ -1,6 +1,6 @@
 use color_eyre::eyre;
 use env_logger;
-use log;
+//use log;
 
 #[macro_use]
 extern crate clap;
@@ -12,6 +12,9 @@ use savefile::{save_file,load_file};
 mod profile;
 mod scan;
 mod utils;
+
+type Entries = Vec<scan::DirEntryWithMeta>;
+type Changes = Vec<scan::Change>;
 
 fn main() -> Result<(), eyre::Error> {
     color_eyre::install().unwrap();
@@ -33,21 +36,21 @@ fn main() -> Result<(), eyre::Error> {
     let dry_run = matches.is_present("dry_run");
     let path = matches.value_of("path").unwrap_or("");
 
-    let restricted_current_entries: Vec<_> = scan::scan(&prf.local, &path, &prf.locations).collect();
-    let all_old_entries: Vec<scan::DirEntryWithMeta> =
-        if std::path::Path::new("save.bin").exists() {
-            load_file("save.bin", 0).unwrap()
-        } else {
-            Vec::new()
-        };
+    let (local_all_old, local_changes) = old_and_changes(&prf.local, &path, &prf.locations);
+    let (_remote_all_old, remote_changes) = old_and_changes(&prf.remote, &path, &prf.locations);
 
-    let restricted_old_entries_iter = all_old_entries
-                                        .iter()
-                                        .filter(|dir: &&scan::DirEntryWithMeta| dir.starts_with(path));
-
-    for c in scan::changes(restricted_old_entries_iter, restricted_current_entries.iter()) {
-        log::debug!("{:?}", c);
-        println!("{}", c);
+    let mut conflicts: Vec<(&scan::Change, &scan::Change)> = Vec::new();
+    for (a,b) in utils::match_sorted(local_changes.iter(), remote_changes.iter()) {
+        match (a,b) {
+            (Some(a), None) => println!("---> {}", a),
+            (None, Some(b)) => println!("<--- {}", b),
+            (Some(a), Some(b)) => conflicts.push((a,b)),
+            _ => (),
+        }
+    }
+    println!("Conflicts:");
+    for (a,_b) in conflicts {
+        println!("<--> {}", a);
     }
 
     if dry_run {
@@ -56,7 +59,25 @@ fn main() -> Result<(), eyre::Error> {
 
     // TODO: apply changes
 
-    save_file("save.bin", 0, &restricted_current_entries).unwrap();
+    save_file("save.bin", 0, &local_all_old).unwrap();
 
     Ok(())
+}
+
+fn old_and_changes(base: &str, restrict: &str, locations: &scan::location::Locations) -> (Entries, Changes) {
+    let restricted_current_entries: Entries = scan::scan(base, restrict, locations).collect();
+    let all_old_entries: Entries =
+        if std::path::Path::new("save.bin").exists() {
+            load_file("save.bin", 0).unwrap()
+        } else {
+            Vec::new()
+        };
+
+    let restricted_old_entries_iter = all_old_entries
+                                          .iter()
+                                          .filter(move |dir: &&scan::DirEntryWithMeta| dir.starts_with(restrict));
+
+    let changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_entries.iter()).collect();
+
+    (all_old_entries, changes)
 }
