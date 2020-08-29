@@ -1,5 +1,5 @@
 use std::fmt;
-use super::scan::change::{Change};
+use super::scan::change::{Change,same};
 
 pub enum Action {
     Local(Change),
@@ -12,8 +12,14 @@ impl Action {
         match (loc,roc) {
             (Some(lc), None) => Some(Action::Remote(lc.clone())),
             (None, Some(rc)) => Some(Action::Local(rc.clone())),
-            (Some(lc), Some(rc)) => Some(Action::Conflict(lc.clone(),rc.clone())),
-            _ => None,
+            (Some(lc), Some(rc)) => {
+                if same(lc,rc) {
+                    None
+                } else {
+                    Some(Action::Conflict(lc.clone(),rc.clone()))
+                }
+            }
+            (None,None) => None,
         }
     }
 }
@@ -23,7 +29,7 @@ impl fmt::Display for Action {
         match &self {
             Action::Local(l)        => write!(f, "<--- {}", l),
             Action::Remote(r)       => write!(f, "---> {}", r),
-            Action::Conflict(l,_r)  => write!(f, "<--> {}", l),
+            Action::Conflict(l,r)  => write!(f, "{} <--> {}", l, r),
         }
     }
 }

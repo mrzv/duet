@@ -44,13 +44,9 @@ fn main() -> Result<(), eyre::Error> {
     let (local_all_old, local_changes) = old_and_changes(&shellexpand::full(&prf.local).ok().unwrap().to_string(), &path, &prf.locations);
     let (_remote_all_old, remote_changes) = old_and_changes(&shellexpand::full(&prf.remote).ok().unwrap().to_string(), &path, &prf.locations);
 
-    let mut actions: Actions = Vec::new();
-    for (lc,rc) in utils::match_sorted(local_changes.iter(), remote_changes.iter()) {
-        if let Some(a) = Action::create(lc,rc) {
-            actions.push(a);
-        }
-    }
-
+    let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
+                                .filter_map(|(lc,rc)| Action::create(lc,rc))
+                                .collect();
     for a in &actions {
         println!("{}", a);
     }

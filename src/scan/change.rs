@@ -23,6 +23,21 @@ impl Change {
     }
 }
 
+pub fn same(x: &Change, y: &Change) -> bool {
+    match (x,y) {
+        (Change::Removed(_), Change::Removed(_)) => true,
+        (Change::Added(d1), Change::Added(d2)) => {
+            assert_eq!(d1.path, d2.path);
+            d1.size == d2.size && d1.mtime == d2.mtime && d1.mode == d2.mode && d1.target == d2.target
+        },
+        (Change::Modified(_,d1), Change::Modified(_,d2)) => {
+            assert_eq!(d1.path, d2.path);
+            d1.size == d2.size && d1.mtime == d2.mtime && d1.mode == d2.mode && d1.target == d2.target
+        },
+        _ => false,
+    }
+}
+
 impl Ord for Change {
     fn cmp(&self, other: &Self) -> Ordering {
         self.path().cmp(other.path())
