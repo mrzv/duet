@@ -2,8 +2,6 @@ use std::fs::File;
 use std::io::{self, prelude::*, BufReader};
 use std::path::{PathBuf};
 
-use shellexpand;
-
 use crate::scan::location::{Location,Locations};
 
 #[derive(Debug)]
@@ -21,7 +19,7 @@ pub fn parse(name: &str) -> Result<Profile, io::Error> {
     let mut p = Profile {
         local:      String::new(),
         remote:     String::new(),
-        locations:  Vec::new(),
+        locations:  vec![Location::Exclude(PathBuf::from("."))],    // implicitly exclude .
         ignore:     Vec::new(),
     };
 
@@ -33,17 +31,12 @@ pub fn parse(name: &str) -> Result<Profile, io::Error> {
         }
 
         if locations == 0 {
-            if let Ok(line) = shellexpand::full(&line) {
-                p.local = line.to_string();
-                locations += 1;
-                continue;
-            } else {
-                return parse_error(&line);
-            }
+            p.local = line.to_string();
+            locations += 1;
+            continue;
         } else if locations == 1 {
             p.remote = line;
             locations += 1;
-            p.locations.push(Location::Exclude(PathBuf::from(".")));    // implicitly exclude .
             continue;
         }
 
