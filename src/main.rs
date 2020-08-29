@@ -26,8 +26,8 @@ fn main() -> Result<(), eyre::Error> {
     env_logger::init();
 
     let matches = clap_app!(duet =>
-        (version: "0.1.0")
-        (author: "Dmitriy Morozov <dmitriy@mrzv.org>")
+        (version: crate_version!())
+        (author: crate_authors!())
         (about: "bi-directional synchronization")
         (@subcommand sync =>
             (about: "synchronize according to profile")
@@ -51,20 +51,15 @@ fn main() -> Result<(), eyre::Error> {
         let statefile = matches.value_of("state").unwrap();
         return inspect(statefile);
     } else if let Some(matches) = matches.subcommand_matches("snapshot") {
-        let profile_name = matches.value_of("profile").unwrap();
-        let prf = profile::parse(profile_name).expect(&format!("Failed to read profile {}", profile_name.yellow()));
+        let profile = matches.value_of("profile").unwrap();
         let statefile = matches.value_of("state").unwrap();
-        println!("Using profile: {}", profile_name.yellow());
-        return snapshot(&prf, statefile);
+        return snapshot(profile, statefile);
     } else if let Some(matches) = matches.subcommand_matches("sync") {
-        let profile_name = matches.value_of("profile").unwrap();
-        let prf = profile::parse(profile_name).expect(&format!("Failed to read profile {}", profile_name.yellow()));
-        println!("Using profile: {}", profile_name.yellow());
-
+        let profile = matches.value_of("profile").unwrap();
         let dry_run = matches.is_present("dry_run");
         let path = matches.value_of("path").unwrap_or("");
 
-        return sync(&prf, path, dry_run);
+        return sync(profile, path, dry_run);
     }
 
     Ok(())
@@ -89,19 +84,25 @@ fn old_entries(fname: &str) -> Entries {
     entries
 }
 
-fn snapshot(prf: &profile::Profile, statefile: &str) -> Result<(), eyre::Error> {
+fn snapshot(name: &str, statefile: &str) -> Result<(), eyre::Error> {
+    let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
+    println!("Using profile: {}", name.yellow());
+
     let local_base = shellexpand::full(&prf.local).ok().unwrap().to_string();
     let current_entries: Entries = scan::scan(&local_base, "", &prf.locations).collect();
     save_file(statefile, 0, &current_entries).unwrap();
     Ok(())
 }
 
-fn sync(prf: &profile::Profile, path: &str, dry_run: bool) -> Result<(), eyre::Error> {
+fn sync(name: &str, path: &str, dry_run: bool) -> Result<(), eyre::Error> {
+    let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
+    println!("Using profile: {}", name.yellow());
+
     let local_base = shellexpand::full(&prf.local).ok().unwrap().to_string();
     let remote_base = shellexpand::full(&prf.remote).ok().unwrap().to_string();
 
-    let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations);
-    let (_remote_all_old, remote_changes) = old_and_changes(&remote_base, &path, &prf.locations);
+    let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(profile::local_state(name).to_str().unwrap()));
+    let (_remote_all_old, remote_changes) = old_and_changes(&remote_base, &path, &prf.locations, None);
 
     let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
                                 .filter_map(|(lc,rc)| Action::create(lc,rc))
@@ -123,12 +124,16 @@ fn sync(prf: &profile::Profile, path: &str, dry_run: bool) -> Result<(), eyre::E
     Ok(())
 }
 
-fn old_and_changes(base: &str, restrict: &str, locations: &scan::location::Locations) -> (Entries, Changes) {
+fn old_and_changes(base: &str, restrict: &str, locations: &scan::location::Locations, statefile: Option<&str>) -> (Entries, Changes) {
     let restricted_current_entries: Entries = scan::scan(base, restrict, locations).collect();
     let all_old_entries: Entries =
-        if std::path::Path::new("save.bin").exists() {
-            log::debug!("Loading: save.bin");
-            load_file("save.bin", 0).unwrap()
+        if let Some(f) = statefile {
+            if std::path::Path::new(f).exists() {
+                log::debug!("Loading: {}", f);
+                load_file(f, 0).unwrap()
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };

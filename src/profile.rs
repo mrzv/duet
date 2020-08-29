@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io::{self, prelude::*, BufReader};
 use std::path::{PathBuf};
 
+use shellexpand;
+
 use crate::scan::location::{Location,Locations};
 
 #[derive(Debug)]
@@ -12,8 +14,24 @@ pub struct Profile {
     pub ignore:     Vec<String>,
 }
 
+pub fn location(name: &str) -> PathBuf {
+    let mut base = PathBuf::from(shellexpand::full("~/.config/duet/").unwrap().to_string());
+    base.push(name);
+    base
+}
+
+pub fn local_state(name: &str) -> PathBuf {
+    let mut profile_location = location(name);
+    profile_location.push("local_state");
+    profile_location
+}
+
 pub fn parse(name: &str) -> Result<Profile, io::Error> {
-    let f      = File::open(name)?;
+    let mut profile_location = location(name);
+    profile_location.push("profile");
+    log::debug!("Loading {:?}", profile_location);
+
+    let f      = File::open(profile_location)?;
     let reader = BufReader::new(f);
 
     let mut p = Profile {
