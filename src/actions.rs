@@ -22,14 +22,24 @@ impl Action {
             (None,None) => None,
         }
     }
+
+    pub fn apply(&self) {
+        match &self {
+            Action::Local(_l) => {
+            },
+            _ => {}
+        }
+    }
 }
 
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self {
+            // actions are reversed:
+            // local action means remote change, and remote action means local change
             Action::Local(l)        => write!(f, "<--- {}", l),
             Action::Remote(r)       => write!(f, "---> {}", r),
-            Action::Conflict(l,r)  => write!(f, "{} <--> {}", l, r),
+            Action::Conflict(l,_r)  => write!(f, "<--> {}", l),
         }
     }
 }

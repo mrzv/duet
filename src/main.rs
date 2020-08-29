@@ -29,20 +29,79 @@ fn main() -> Result<(), eyre::Error> {
         (version: "0.1.0")
         (author: "Dmitriy Morozov <dmitriy@mrzv.org>")
         (about: "bi-directional synchronization")
-        (@arg profile: +required "profile to synchronize")
-        (@arg path:              "path to synchronize")
-        (@arg dry_run: -n        "don't apply changes")
+        (@subcommand sync =>
+            (about: "synchronize according to profile")
+            (@arg profile: +required "profile to synchronize")
+            (@arg path:              "path to synchronize")
+            (@arg dry_run: -n        "don't apply changes")
+        )
+        (@subcommand snapshot =>
+            (about: "take snapshot")
+            (@arg profile: +required "profile to snapshot")
+            (@arg state:   +required "state file to save snapshot")
+        )
+        (@subcommand inspect =>
+            (about: "inspect a state file")
+            (@arg state: +required "statefile to show")
+        )
     ).get_matches();
 
-    let profile_name = matches.value_of("profile").unwrap();
-    let prf = profile::parse(profile_name).expect(&format!("Failed to read profile {}", profile_name.yellow()));
-    println!("Using profile: {}", profile_name.yellow());
+    // inspect subcommand
+    if let Some(matches) = matches.subcommand_matches("inspect") {
+        let statefile = matches.value_of("state").unwrap();
+        return inspect(statefile);
+    } else if let Some(matches) = matches.subcommand_matches("snapshot") {
+        let profile_name = matches.value_of("profile").unwrap();
+        let prf = profile::parse(profile_name).expect(&format!("Failed to read profile {}", profile_name.yellow()));
+        let statefile = matches.value_of("state").unwrap();
+        println!("Using profile: {}", profile_name.yellow());
+        return snapshot(&prf, statefile);
+    } else if let Some(matches) = matches.subcommand_matches("sync") {
+        let profile_name = matches.value_of("profile").unwrap();
+        let prf = profile::parse(profile_name).expect(&format!("Failed to read profile {}", profile_name.yellow()));
+        println!("Using profile: {}", profile_name.yellow());
 
-    let dry_run = matches.is_present("dry_run");
-    let path = matches.value_of("path").unwrap_or("");
+        let dry_run = matches.is_present("dry_run");
+        let path = matches.value_of("path").unwrap_or("");
 
-    let (local_all_old, local_changes) = old_and_changes(&shellexpand::full(&prf.local).ok().unwrap().to_string(), &path, &prf.locations);
-    let (_remote_all_old, remote_changes) = old_and_changes(&shellexpand::full(&prf.remote).ok().unwrap().to_string(), &path, &prf.locations);
+        return sync(&prf, path, dry_run);
+    }
+
+    Ok(())
+}
+
+fn inspect(statefile: &str) -> Result<(), eyre::Error> {
+    let entries: Entries = old_entries(statefile);
+    for e in entries {
+        println!("{:?}", e);
+    }
+    Ok(())
+}
+
+fn old_entries(fname: &str) -> Entries {
+    let entries: Entries =
+        if std::path::Path::new(fname).exists() {
+            log::debug!("Loading: {}", fname);
+            load_file(fname, 0).unwrap()
+        } else {
+            Vec::new()
+        };
+    entries
+}
+
+fn snapshot(prf: &profile::Profile, statefile: &str) -> Result<(), eyre::Error> {
+    let local_base = shellexpand::full(&prf.local).ok().unwrap().to_string();
+    let current_entries: Entries = scan::scan(&local_base, "", &prf.locations).collect();
+    save_file(statefile, 0, &current_entries).unwrap();
+    Ok(())
+}
+
+fn sync(prf: &profile::Profile, path: &str, dry_run: bool) -> Result<(), eyre::Error> {
+    let local_base = shellexpand::full(&prf.local).ok().unwrap().to_string();
+    let remote_base = shellexpand::full(&prf.remote).ok().unwrap().to_string();
+
+    let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations);
+    let (_remote_all_old, remote_changes) = old_and_changes(&remote_base, &path, &prf.locations);
 
     let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
                                 .filter_map(|(lc,rc)| Action::create(lc,rc))
@@ -55,10 +114,12 @@ fn main() -> Result<(), eyre::Error> {
         return Ok(());
     }
 
-    // TODO: apply changes
+    // apply changes
+    for a in &actions {
+        a.apply();
+    }
 
     save_file("save.bin", 0, &local_all_old).unwrap();
-
     Ok(())
 }
 

@@ -17,20 +17,6 @@ pub mod change;
 use location::{Locations,Location};
 pub use change::{changes,Change};
 
-struct Directory {
-    entries: <Vec<fs::DirEntry> as IntoIterator>::IntoIter,
-    parent: usize,
-    descendants: (usize, usize),
-}
-
-pub struct DirIterator {
-    stack:     Vec<Directory>,
-    dev:       u64,
-    base:      PathBuf,
-    restrict:  PathBuf,
-    locations: Locations,
-}
-
 #[derive(Debug,Clone,Savefile)]
 pub struct DirEntryWithMeta {
     path:   String,
@@ -72,6 +58,20 @@ impl Ord for DirEntryWithMeta {
     }
 }
 
+
+pub struct DirIterator {
+    stack:     Vec<Directory>,
+    dev:       u64,
+    base:      PathBuf,
+    restrict:  PathBuf,
+    locations: Locations,
+}
+
+struct Directory {
+    entries: <Vec<fs::DirEntry> as IntoIterator>::IntoIter,
+    parent: usize,
+    descendants: (usize, usize),
+}
 
 impl<'a> DirIterator {
     pub fn create(base: PathBuf, restrict: PathBuf, locations: &Locations) -> Self {
