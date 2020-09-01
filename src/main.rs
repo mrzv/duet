@@ -38,28 +38,43 @@ fn main() -> Result<(), eyre::Error> {
         (@subcommand snapshot =>
             (about: "take snapshot")
             (@arg profile: +required "profile to snapshot")
-            (@arg state:   +required "state file to save snapshot")
+            (@arg state:             "state file to save snapshot")
         )
         (@subcommand inspect =>
             (about: "inspect a state file")
             (@arg state: +required "statefile to show")
         )
+        (@subcommand changes =>
+            (about: "show changes compared to a given state")
+            (@arg profile: +required "profile to compare")
+            (@arg state:             "state file to compare")
+        )
+        (@subcommand info =>
+            (about: "show info about a profile")
+            (@arg profile: +required "profile to compare")
+        )
     ).get_matches();
 
-    // inspect subcommand
-    if let Some(matches) = matches.subcommand_matches("inspect") {
-        let statefile = matches.value_of("state").unwrap();
-        return inspect(statefile);
-    } else if let Some(matches) = matches.subcommand_matches("snapshot") {
-        let profile = matches.value_of("profile").unwrap();
-        let statefile = matches.value_of("state").unwrap();
-        return snapshot(profile, statefile);
-    } else if let Some(matches) = matches.subcommand_matches("sync") {
+    if let Some(matches) = matches.subcommand_matches("sync") {
         let profile = matches.value_of("profile").unwrap();
         let dry_run = matches.is_present("dry_run");
         let path = matches.value_of("path").unwrap_or("");
 
         return sync(profile, path, dry_run);
+    } else if let Some(matches) = matches.subcommand_matches("snapshot") {
+        let profile = matches.value_of("profile").unwrap();
+        let statefile = matches.value_of("state");
+        return snapshot(profile, statefile);
+    } else if let Some(matches) = matches.subcommand_matches("inspect") {
+        let statefile = matches.value_of("state").unwrap();
+        return inspect(statefile);
+    } else if let Some(matches) = matches.subcommand_matches("changes") {
+        let profile = matches.value_of("profile").unwrap();
+        let statefile = matches.value_of("state");
+        return changes(profile, statefile);
+    } else if let Some(matches) = matches.subcommand_matches("info") {
+        let profile = matches.value_of("profile").unwrap();
+        return info(profile);
     }
 
     Ok(())
@@ -84,13 +99,44 @@ fn old_entries(fname: &str) -> Entries {
     entries
 }
 
-fn snapshot(name: &str, statefile: &str) -> Result<(), eyre::Error> {
+fn snapshot(name: &str, statefile: Option<&str>) -> Result<(), eyre::Error> {
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
     let local_base = shellexpand::full(&prf.local).ok().unwrap().to_string();
     let current_entries: Entries = scan::scan(&local_base, "", &prf.locations).collect();
-    save_file(statefile, 0, &current_entries).unwrap();
+
+    let statefile = if let Some(s) = statefile {
+        String::from(s)
+    } else {
+        String::from(profile::local_state(name).to_str().unwrap())
+    };
+    save_file(&statefile, 0, &current_entries).unwrap();
+    Ok(())
+}
+
+fn changes(name: &str, statefile: Option<&str>) -> Result<(), eyre::Error> {
+    let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
+    println!("Using profile: {}", name.yellow());
+
+    let local_base = shellexpand::full(&prf.local).ok().unwrap().to_string();
+
+    let statefile = if let Some(s) = statefile {
+        String::from(s)
+    } else {
+        String::from(profile::local_state(name).to_str().unwrap())
+    };
+    let (_, changes) = old_and_changes(&local_base, "", &prf.locations, Some(&statefile));
+
+    for c in changes {
+        println!("{}", c);
+    }
+
+    Ok(())
+}
+
+fn info(name: &str) -> Result<(), eyre::Error> {
+    println!("Profile {} located at {}", name.yellow(), profile::location(name).to_str().unwrap());
     Ok(())
 }
 
