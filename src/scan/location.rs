@@ -1,8 +1,9 @@
 use std::path::{PathBuf};
 use std::cmp::Ordering;
 use std::fmt;
+use savefile_derive::Savefile;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Savefile)]
 pub enum Location {
     Include(PathBuf),
     Exclude(PathBuf),

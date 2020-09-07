@@ -1,4 +1,5 @@
 use color_eyre::eyre;
+use eyre::Result;
 use env_logger;
 //use log;
 
@@ -9,19 +10,22 @@ use colored::*;
 
 use shellexpand;
 
-use savefile::{save_file,load_file};
+use std::process::{Command, Stdio};
+use savefile::{save_file,load_file,save,load};
+use std::io::{self};
 
 mod profile;
 mod scan;
 mod utils;
 mod actions;
 use actions::Action;
+use scan::location::{Locations};
 
 type Entries = Vec<scan::DirEntryWithMeta>;
 type Changes = Vec<scan::Change>;
 type Actions = Vec<actions::Action>;
 
-fn main() -> Result<(), eyre::Error> {
+fn main() -> Result<()> {
     color_eyre::install().unwrap();
     env_logger::init();
 
@@ -53,6 +57,9 @@ fn main() -> Result<(), eyre::Error> {
             (about: "show info about a profile")
             (@arg profile: +required "profile to compare")
         )
+        (@subcommand server =>
+            (about: "run server-side code")
+        )
     ).get_matches();
 
     if let Some(matches) = matches.subcommand_matches("sync") {
@@ -75,12 +82,14 @@ fn main() -> Result<(), eyre::Error> {
     } else if let Some(matches) = matches.subcommand_matches("info") {
         let profile = matches.value_of("profile").unwrap();
         return info(profile);
+    } else if let Some(_matches) = matches.subcommand_matches("server") {
+        return server();
     }
 
     Ok(())
 }
 
-fn inspect(statefile: &str) -> Result<(), eyre::Error> {
+fn inspect(statefile: &str) -> Result<()> {
     let entries: Entries = old_entries(statefile);
     for e in entries {
         println!("{:?}", e);
@@ -99,11 +108,11 @@ fn old_entries(fname: &str) -> Entries {
     entries
 }
 
-fn snapshot(name: &str, statefile: Option<&str>) -> Result<(), eyre::Error> {
+fn snapshot(name: &str, statefile: Option<&str>) -> Result<()> {
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
-    let local_base = shellexpand::full(&prf.local).ok().unwrap().to_string();
+    let local_base = shellexpand::full(&prf.local)?.to_string();
     let current_entries: Entries = scan::scan(&local_base, "", &prf.locations).collect();
 
     let statefile = if let Some(s) = statefile {
@@ -115,11 +124,11 @@ fn snapshot(name: &str, statefile: Option<&str>) -> Result<(), eyre::Error> {
     Ok(())
 }
 
-fn changes(name: &str, statefile: Option<&str>) -> Result<(), eyre::Error> {
+fn changes(name: &str, statefile: Option<&str>) -> Result<()> {
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
-    let local_base = shellexpand::full(&prf.local).ok().unwrap().to_string();
+    let local_base = shellexpand::full(&prf.local)?.to_string();
 
     let statefile = if let Some(s) = statefile {
         String::from(s)
@@ -135,20 +144,20 @@ fn changes(name: &str, statefile: Option<&str>) -> Result<(), eyre::Error> {
     Ok(())
 }
 
-fn info(name: &str) -> Result<(), eyre::Error> {
+fn info(name: &str) -> Result<()> {
     println!("Profile {} located at {}", name.yellow(), profile::location(name).to_str().unwrap());
     Ok(())
 }
 
-fn sync(name: &str, path: &str, dry_run: bool) -> Result<(), eyre::Error> {
+fn sync(name: &str, path: &str, dry_run: bool) -> Result<()> {
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
-    let local_base = shellexpand::full(&prf.local).ok().unwrap().to_string();
-    let remote_base = shellexpand::full(&prf.remote).ok().unwrap().to_string();
+    let local_base = shellexpand::full(&prf.local)?.to_string();
+    let remote_base = shellexpand::full(&prf.remote)?.to_string();
 
     let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(profile::local_state(name).to_str().unwrap()));
-    let (_remote_all_old, remote_changes) = old_and_changes(&remote_base, &path, &prf.locations, None);
+    let remote_changes = get_remote_changes(&remote_base, &path, &prf.locations).expect("Couldn't get remote changes");
 
     let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
                                 .filter_map(|(lc,rc)| Action::create(lc,rc))
@@ -170,7 +179,43 @@ fn sync(name: &str, path: &str, dry_run: bool) -> Result<(), eyre::Error> {
     Ok(())
 }
 
-fn old_and_changes(base: &str, restrict: &str, locations: &scan::location::Locations, statefile: Option<&str>) -> (Entries, Changes) {
+fn get_remote_changes(base: &str, path: &str, locations: &Locations) -> Result<Changes> {
+    // launch server
+    let mut server = Command::new("target/debug/duet")       // TODO: need a better way to find the command
+        .arg("server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn child process");
+
+    let server_in = server.stdin.as_mut().expect("Failed to open stdin");
+    let server_out = server.stdout.as_mut().expect("Failed to read stdout");
+
+    save(server_in, 0, &String::from(base)).expect("Can't send base to the server");
+    save(server_in, 0, &String::from(path)).expect("Can't send path to the server");
+    save(server_in, 0, locations).expect("Can't send locations to the server");
+
+    let changes: Changes = load(server_out, 0).expect("Failed to load changes");
+
+    Ok(changes)
+}
+
+fn server() -> Result<()> {
+    let stdin = &mut io::stdin();
+
+    let base: String = load(stdin, 0).expect("Failed to load base");
+    let path: String = load(stdin, 0).expect("Failed to load path");
+    let locations: Locations = load(stdin, 0).expect("Failed to load locations");
+
+    let (_all_old, changes) = old_and_changes(&base, &path, &locations, None);
+
+    let stdout = &mut io::stdout();
+    save(stdout, 0, &changes).expect("Can't send changes to the client");
+
+    Ok(())
+}
+
+fn old_and_changes(base: &str, restrict: &str, locations: &Locations, statefile: Option<&str>) -> (Entries, Changes) {
     let restricted_current_entries: Entries = scan::scan(base, restrict, locations).collect();
     let all_old_entries: Entries =
         if let Some(f) = statefile {
