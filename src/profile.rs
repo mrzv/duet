@@ -26,6 +26,13 @@ pub fn local_state(name: &str) -> PathBuf {
     profile_location
 }
 
+pub fn remote_state(id: &str) -> PathBuf {
+    let mut base = PathBuf::from(shellexpand::full("~/.config/duet/").unwrap().to_string());
+    base.push("remotes");
+    base.push(id);
+    base
+}
+
 pub fn parse(name: &str) -> Result<Profile, io::Error> {
     let mut profile_location = location(name);
     profile_location.push("profile");
