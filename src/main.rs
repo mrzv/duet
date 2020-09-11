@@ -48,6 +48,11 @@ fn main() -> Result<()> {
         (@subcommand server =>
             (about: "run server-side code")
         )
+        // testing/debugging
+        (@subcommand walk =>
+            (about: "walk a directory")
+            (@arg path: +required  "path to walk")
+        )
     ).get_matches();
 
     if let Some(matches) = matches.subcommand_matches("sync") {
@@ -72,6 +77,9 @@ fn main() -> Result<()> {
         return info(profile);
     } else if let Some(_matches) = matches.subcommand_matches("server") {
         return server();
+    } else if let Some(matches) = matches.subcommand_matches("walk") {
+        let path = matches.value_of("path").unwrap();
+        return walk(path);
     }
 
     Ok(())
@@ -146,8 +154,8 @@ fn sync(name: &str, path: &str, dry_run: bool) -> Result<()> {
     let local_base = shellexpand::full(&prf.local)?.to_string();
     let remote_base = shellexpand::full(&prf.remote)?.to_string();
 
-    let local_state = profile::local_state(name).to_str().unwrap();
-    let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(local_state));
+    let local_state = profile::local_state(name).to_string_lossy().into_owned();
+    let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(&local_state));
     let remote_changes = get_remote_changes(&remote_base, &path, &prf.locations, &local_id).expect("Couldn't get remote changes");
 
     let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
@@ -166,7 +174,7 @@ fn sync(name: &str, path: &str, dry_run: bool) -> Result<()> {
         a.apply();
     }
 
-    savefile::save_file(local_state, 0, &local_all_old).unwrap();
+    savefile::save_file(&local_state, 0, &local_all_old).unwrap();
     Ok(())
 }
 
@@ -245,4 +253,14 @@ fn old_and_changes(base: &str, restrict: &str, locations: &Locations, statefile:
     let changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_entries.iter()).collect();
 
     (all_old_entries, changes)
+}
+
+fn walk(path: &str) -> Result<()> {
+    use std::path::PathBuf;
+    let locations = vec![scan::location::Location::Include(PathBuf::from("."))];
+    let entries: Entries = scan::scan(path, "", &locations).collect();
+    for e in entries {
+        println!("{}", e.path());
+    }
+    Ok(())
 }

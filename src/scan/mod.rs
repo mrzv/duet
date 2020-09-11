@@ -36,6 +36,10 @@ impl DirEntryWithMeta {
     pub fn starts_with(&self, path: &str) -> bool {
         self.path.starts_with(path)
     }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 impl PartialEq for DirEntryWithMeta {
