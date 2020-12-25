@@ -115,7 +115,7 @@ async fn scan_entries(base: &str, path: &str, locations: &Locations) -> Result<E
     let entries = tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel(32);
         tokio::spawn(async move {
-            scan::scan(&base, &path, &locations, tx).await;
+            scan::scan(&base, &path, &locations, tx).await
         });
 
         let mut entries: Entries = Entries::new();
@@ -290,7 +290,7 @@ async fn walk(path: &str) -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel(32);
     tokio::spawn(async move {
-        scan::scan(path, "", &locations, tx).await;
+        scan::scan(path, "", &locations, tx).await
     });
 
     while let Some(e) = rx.recv().await {

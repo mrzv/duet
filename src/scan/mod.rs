@@ -6,6 +6,8 @@ use std::os::unix::fs::MetadataExt;
 
 use savefile_derive::Savefile;
 
+use color_eyre::eyre::Result;
+
 use tokio::sync::mpsc;
 
 use log;
@@ -227,7 +229,15 @@ impl Iterator for DirIterator {
     }
 }
 
-pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &Locations, tx: mpsc::Sender<DirEntryWithMeta>) {
+/// Send all [directory entries](DirEntryWithMeta) into the channel, given via its [Sender](mpsc::Sender) `tx`.
+///
+/// # Arguments
+///
+/// * `base` - root path of the scan, `locations` are specified relative to this path
+/// * `path` - restriction under base, which should be scanned
+/// * `locations` - [locations](Locations) to scan
+/// * `tx` - [Sender](mpsc::Sender) of the channel, where to send the [directory entries](DirEntryWithMeta)
+pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &Locations, tx: mpsc::Sender<DirEntryWithMeta>) -> Result<()> {
     let base = PathBuf::from(base.as_ref());
     let mut restrict = PathBuf::from(&base);
     restrict.push(path);
@@ -235,6 +245,8 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &
     log::info!("Going to scan: {}", restrict.display());
 
     for e in DirIterator::create(base, restrict, locations) {
-        tx.send(e).await;
+        tx.send(e).await?;
     }
+
+    Ok(())
 }
