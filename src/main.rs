@@ -2,6 +2,8 @@ use color_eyre::eyre::Result;
 use clap::{clap_app,crate_version,crate_authors};
 use colored::*;
 
+use tokio::sync::mpsc;
+
 mod profile;
 mod scan;
 mod utils;
@@ -13,7 +15,8 @@ type Entries = Vec<scan::DirEntryWithMeta>;
 type Changes = Vec<scan::Change>;
 type Actions = Vec<Action>;
 
-fn main() -> Result<()> {
+#[tokio::main]
+pub async fn main() -> Result<()> {
     color_eyre::install().unwrap();
     env_logger::init();
 
@@ -64,7 +67,7 @@ fn main() -> Result<()> {
     } else if let Some(matches) = matches.subcommand_matches("snapshot") {
         let profile = matches.value_of("profile").unwrap();
         let statefile = matches.value_of("state");
-        return snapshot(profile, statefile);
+        return snapshot(profile, statefile).await;
     } else if let Some(matches) = matches.subcommand_matches("inspect") {
         let statefile = matches.value_of("state").unwrap();
         return inspect(statefile);
@@ -79,7 +82,7 @@ fn main() -> Result<()> {
         return server();
     } else if let Some(matches) = matches.subcommand_matches("walk") {
         let path = matches.value_of("path").unwrap();
-        return walk(path);
+        return walk(path).await;
     }
 
     Ok(())
@@ -104,12 +107,21 @@ fn old_entries(fname: &str) -> Entries {
     entries
 }
 
-fn snapshot(name: &str, statefile: Option<&str>) -> Result<()> {
+async fn snapshot(name: &str, statefile: Option<&str>) -> Result<()> {
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
     let local_base = shellexpand::full(&prf.local)?.to_string();
-    let current_entries: Entries = scan::scan(&local_base, "", &prf.locations).collect();
+
+    let (tx, mut rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        scan::scan(&local_base, "", &prf.locations, tx).await;
+    });
+
+    let mut current_entries: Entries = Entries::new();
+    while let Some(e) = rx.recv().await {
+        current_entries.push(e);
+    }
 
     let statefile = if let Some(s) = statefile {
         String::from(s)
@@ -233,33 +245,42 @@ fn server() -> Result<()> {
 }
 
 fn old_and_changes(base: &str, restrict: &str, locations: &Locations, statefile: Option<&str>) -> (Entries, Changes) {
-    let restricted_current_entries: Entries = scan::scan(base, restrict, locations).collect();
-    let all_old_entries: Entries =
-        if let Some(f) = statefile {
-            if std::path::Path::new(f).exists() {
-                log::debug!("Loading: {}", f);
-                savefile::load_file(f, 0).unwrap()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+    //let restricted_current_entries: Entries = scan::scan(base, restrict, locations).collect();
+    //let all_old_entries: Entries =
+    //    if let Some(f) = statefile {
+    //        if std::path::Path::new(f).exists() {
+    //            log::debug!("Loading: {}", f);
+    //            savefile::load_file(f, 0).unwrap()
+    //        } else {
+    //            Vec::new()
+    //        }
+    //    } else {
+    //        Vec::new()
+    //    };
 
-    let restricted_old_entries_iter = all_old_entries
-                                          .iter()
-                                          .filter(move |dir: &&scan::DirEntryWithMeta| dir.starts_with(restrict));
+    //let restricted_old_entries_iter = all_old_entries
+    //                                      .iter()
+    //                                      .filter(move |dir: &&scan::DirEntryWithMeta| dir.starts_with(restrict));
 
-    let changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_entries.iter()).collect();
+    //let changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_entries.iter()).collect();
 
-    (all_old_entries, changes)
+    //(all_old_entries, changes)
+
+    (Entries::new(), Changes::new())
 }
 
-fn walk(path: &str) -> Result<()> {
+async fn walk(path: &str) -> Result<()> {
     use std::path::PathBuf;
     let locations = vec![scan::location::Location::Include(PathBuf::from("."))];
-    let entries: Entries = scan::scan(path, "", &locations).collect();
-    for e in entries {
+
+    let path = path.to_string();
+
+    let (tx, mut rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        scan::scan(path, "", &locations, tx).await;
+    });
+
+    while let Some(e) = rx.recv().await {
         println!("{}", e.path());
     }
     Ok(())

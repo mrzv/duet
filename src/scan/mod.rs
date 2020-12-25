@@ -6,6 +6,8 @@ use std::os::unix::fs::MetadataExt;
 
 use savefile_derive::Savefile;
 
+use tokio::sync::mpsc;
+
 use log;
 
 //use glob;
@@ -225,12 +227,14 @@ impl Iterator for DirIterator {
     }
 }
 
-pub fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &Locations) -> DirIterator {
+pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &Locations, tx: mpsc::Sender<DirEntryWithMeta>) {
     let base = PathBuf::from(base.as_ref());
     let mut restrict = PathBuf::from(&base);
     restrict.push(path);
 
     log::info!("Going to scan: {}", restrict.display());
 
-    DirIterator::create(base, restrict, locations)
+    for e in DirIterator::create(base, restrict, locations) {
+        tx.send(e).await;
+    }
 }
