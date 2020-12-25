@@ -63,7 +63,7 @@ pub async fn main() -> Result<()> {
         let dry_run = matches.is_present("dry_run");
         let path = matches.value_of("path").unwrap_or("");
 
-        return sync(profile, path, dry_run);
+        return sync(profile, path, dry_run).await;
     } else if let Some(matches) = matches.subcommand_matches("snapshot") {
         let profile = matches.value_of("profile").unwrap();
         let statefile = matches.value_of("state");
@@ -74,12 +74,12 @@ pub async fn main() -> Result<()> {
     } else if let Some(matches) = matches.subcommand_matches("changes") {
         let profile = matches.value_of("profile").unwrap();
         let statefile = matches.value_of("state");
-        return changes(profile, statefile);
+        return changes(profile, statefile).await;
     } else if let Some(matches) = matches.subcommand_matches("info") {
         let profile = matches.value_of("profile").unwrap();
         return info(profile);
     } else if let Some(_matches) = matches.subcommand_matches("server") {
-        return server();
+        return server().await;
     } else if let Some(matches) = matches.subcommand_matches("walk") {
         let path = matches.value_of("path").unwrap();
         return walk(path).await;
@@ -107,21 +107,35 @@ fn old_entries(fname: &str) -> Entries {
     entries
 }
 
+async fn scan_entries(base: &str, path: &str, locations: &Locations) -> Result<Entries> {
+    let base = base.to_string();
+    let path = path.to_string();
+    let locations = locations.clone();
+
+    let entries = tokio::spawn(async move {
+        let (tx, mut rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            scan::scan(&base, &path, &locations, tx).await;
+        });
+
+        let mut entries: Entries = Entries::new();
+        while let Some(e) = rx.recv().await {
+            entries.push(e);
+        }
+
+        entries
+    }).await?;
+
+    Ok(entries)
+}
+
 async fn snapshot(name: &str, statefile: Option<&str>) -> Result<()> {
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
     let local_base = shellexpand::full(&prf.local)?.to_string();
 
-    let (tx, mut rx) = mpsc::channel(32);
-    tokio::spawn(async move {
-        scan::scan(&local_base, "", &prf.locations, tx).await;
-    });
-
-    let mut current_entries: Entries = Entries::new();
-    while let Some(e) = rx.recv().await {
-        current_entries.push(e);
-    }
+    let current_entries: Entries = scan_entries(&local_base, "", &prf.locations).await?;
 
     let statefile = if let Some(s) = statefile {
         String::from(s)
@@ -132,7 +146,7 @@ async fn snapshot(name: &str, statefile: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn changes(name: &str, statefile: Option<&str>) -> Result<()> {
+async fn changes(name: &str, statefile: Option<&str>) -> Result<()> {
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
@@ -143,7 +157,7 @@ fn changes(name: &str, statefile: Option<&str>) -> Result<()> {
     } else {
         String::from(profile::local_state(name).to_str().unwrap())
     };
-    let (_, changes) = old_and_changes(&local_base, "", &prf.locations, Some(&statefile));
+    let (_, changes) = old_and_changes(&local_base, "", &prf.locations, Some(&statefile)).await?;
 
     for c in changes {
         println!("{}", c);
@@ -157,7 +171,7 @@ fn info(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn sync(name: &str, path: &str, dry_run: bool) -> Result<()> {
+async fn sync(name: &str, path: &str, dry_run: bool) -> Result<()> {
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
@@ -167,7 +181,7 @@ fn sync(name: &str, path: &str, dry_run: bool) -> Result<()> {
     let remote_base = shellexpand::full(&prf.remote)?.to_string();
 
     let local_state = profile::local_state(name).to_string_lossy().into_owned();
-    let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(&local_state));
+    let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(&local_state)).await?;
     let remote_changes = get_remote_changes(&remote_base, &path, &prf.locations, &local_id).expect("Couldn't get remote changes");
 
     let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
@@ -225,7 +239,7 @@ fn get_remote_changes(base: &str, path: &str, locations: &Locations, local_id: &
     Ok(changes)
 }
 
-fn server() -> Result<()> {
+async fn server() -> Result<()> {
     use std::io::{self};
     use savefile::{save,load};
 
@@ -236,7 +250,7 @@ fn server() -> Result<()> {
     let locations: Locations = load(stdin, 0).expect("Failed to load locations");
     let remote_id: String = load(stdin, 0).expect("Failed to load path");
 
-    let (_all_old, changes) = old_and_changes(&base, &path, &locations, Some(profile::remote_state(&remote_id).to_str().unwrap()));
+    let (_all_old, changes) = old_and_changes(&base, &path, &locations, Some(profile::remote_state(&remote_id).to_str().unwrap())).await?;
 
     let stdout = &mut io::stdout();
     save(stdout, 0, &changes).expect("Can't send changes to the client");
@@ -244,29 +258,28 @@ fn server() -> Result<()> {
     Ok(())
 }
 
-fn old_and_changes(base: &str, restrict: &str, locations: &Locations, statefile: Option<&str>) -> (Entries, Changes) {
-    //let restricted_current_entries: Entries = scan::scan(base, restrict, locations).collect();
-    //let all_old_entries: Entries =
-    //    if let Some(f) = statefile {
-    //        if std::path::Path::new(f).exists() {
-    //            log::debug!("Loading: {}", f);
-    //            savefile::load_file(f, 0).unwrap()
-    //        } else {
-    //            Vec::new()
-    //        }
-    //    } else {
-    //        Vec::new()
-    //    };
+async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, statefile: Option<&str>) -> Result<(Entries, Changes)> {
+    let restricted_current_scan = scan_entries(base, restrict, locations);
 
-    //let restricted_old_entries_iter = all_old_entries
-    //                                      .iter()
-    //                                      .filter(move |dir: &&scan::DirEntryWithMeta| dir.starts_with(restrict));
+    let all_old_entries: Entries =
+        if let Some(f) = statefile {
+            if std::path::Path::new(f).exists() {
+                log::debug!("Loading: {}", f);
+                savefile::load_file(f, 0).unwrap()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
 
-    //let changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_entries.iter()).collect();
+    let restricted_old_entries_iter = all_old_entries
+                                          .iter()
+                                          .filter(move |dir: &&scan::DirEntryWithMeta| dir.starts_with(restrict));
 
-    //(all_old_entries, changes)
+    let changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_scan.await?.iter()).collect();
 
-    (Entries::new(), Changes::new())
+    Ok((all_old_entries, changes))
 }
 
 async fn walk(path: &str) -> Result<()> {
