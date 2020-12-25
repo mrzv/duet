@@ -1,5 +1,4 @@
 use std::path::{PathBuf,Path};
-use std::fs;
 use std::cmp::Ordering;
 
 use std::os::unix::fs::MetadataExt;
@@ -8,7 +7,8 @@ use savefile_derive::Savefile;
 
 use color_eyre::eyre::Result;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc,Semaphore};
+use std::sync::Arc;
 
 use log;
 
@@ -66,167 +66,121 @@ impl Ord for DirEntryWithMeta {
     }
 }
 
-
-pub struct DirIterator {
-    stack:     Vec<Directory>,
-    dev:       u64,
-    base:      PathBuf,
-    restrict:  PathBuf,
-    locations: Locations,
-}
-
-struct Directory {
-    entries: <Vec<fs::DirEntry> as IntoIterator>::IntoIter,
+#[derive(Debug,Clone)]
+struct ParentFromTo {
     parent: usize,
-    descendants: (usize, usize),
+    from: usize,
+    to: usize
 }
 
-impl<'a> DirIterator {
-    pub fn create(base: PathBuf, restrict: PathBuf, locations: &Locations) -> Self {
-        let dev = base.symlink_metadata().ok().unwrap().dev();
+fn narrow_parent_from_to(pft: ParentFromTo, path: &PathBuf, locations: &Locations) -> ParentFromTo {
+    let mut parent = pft.parent;
+    let mut from = pft.from;
+    let mut to = pft.to;
 
-        // prefix locations with base
-        let mut locations: Locations = locations.iter().map(|l| l.prefix(&base)).collect();
-        locations.sort();
-
-        let mut it = DirIterator {
-            stack:     vec![],
-            dev,
-            base,
-            restrict,
-            locations,
-        };
-        for x in &it.locations {
-            log::debug!("Location: {:?}", x);
+    // update descendants
+    while from <= to && !locations[from].path().starts_with(path) {
+        from += 1;
+    }
+    if from <= to {
+        let parent_to = to;
+        to = from;
+        while to < parent_to && locations[to+1].path().starts_with(path) {
+            to += 1;
         }
-
-        it.push(&it.base.clone());
-
-        it
     }
 
-    fn push(&mut self, path: &PathBuf) {
-        // check the restriction
-        if !path.starts_with(&self.restrict) && !self.restrict.starts_with(path) {
-            log::trace!("Skipping (restriction): {:?} vs {:?}", path, self.restrict);
-            return;
-        }
-
-        let (parent, from, to) = self.find_parent_descendants(path);
-
-        // no need to descend if we are in the exclude regime and there are no descendants
-        if self.locations[parent].is_exclude() && from > to {
-            log::trace!("Skipping excluded: {:?}", path);
-            return;
-        }
-
-        // read the directory
-        let mut paths: Vec<_> = fs::read_dir(path).unwrap()
-                                                  .map(|r| r.unwrap())
-                                                  .collect();
-        paths.sort_by_key(|dir| dir.path());
-
-        self.stack.push(Directory { entries: paths.into_iter(), parent, descendants: (from,to) });
+    // update parent
+    if from <= to && locations[from].path() == path {
+        parent = from;
     }
 
-    // narrow the last parent/descendants on the stack for the path
-    fn find_parent_descendants(&self, path: &PathBuf) -> (usize, usize, usize) {
-        // read old parent and descendants
-        let (mut parent, mut from, mut to) = if self.stack.is_empty() {
-            (0, 0, self.locations.len() - 1)
-        } else {
-            let dir       = self.stack.last().unwrap();
-            let parent    = dir.parent;
-            let (from,to) = dir.descendants;
-            (parent, from, to)
-        };
-
-        // update descendants
-        while from <= to && !self.locations[from].path().starts_with(path) {
-            from += 1;
-        }
-        if from <= to {
-            let parent_to = to;
-            to = from;
-            while to < parent_to && self.locations[to+1].path().starts_with(path) {
-                to += 1;
-            }
-        }
-
-        // update parent
-        if from <= to && self.locations[from].path() == path {
-            parent = from;
-        }
-
-        (parent, from, to)
-    }
-
-    fn relative(&self, path: &'a PathBuf) -> &'a Path {
-        path.strip_prefix(&self.base).unwrap()
-    }
-
-    // find closest parent among self.locations
-    fn find_parent(&self, path: &PathBuf, parent: usize, descendants: (usize, usize)) -> &Location {
-        let (mut from, to) = descendants;
-        while from <= to && from < self.locations.len() {
-            if self.locations[from].path() == path {
-                return &self.locations[from];
-            }
-            from += 1;
-        }
-        &self.locations[parent]
-    }
+    ParentFromTo { parent, from, to }
 }
 
-impl Iterator for DirIterator {
-    type Item = DirEntryWithMeta;
+fn relative<'a>(base: &PathBuf, path: &'a PathBuf) -> &'a Path {
+    path.strip_prefix(&base).unwrap()
+}
 
-    fn next(&mut self) -> Option<DirEntryWithMeta> {
-        let (path, meta) = loop {
-            let (path, parent, descendants) = loop {
-                if self.stack.is_empty() {
-                    return None;
-                }
+fn find_parent<'a>(path: &PathBuf, locations: &'a Locations, pft: &ParentFromTo) -> &'a Location {
+    let parent = pft.parent;
+    let mut from = pft.from;
+    let to = pft.to;
 
-                let dir = self.stack.last_mut();
-
-                let dir = dir.unwrap();
-                let entry = dir.entries.next();
-
-                // entries exhausted
-                if let None = entry {
-                    self.stack.pop();
-                } else {
-                    let path = entry.unwrap().path();
-                    break (path, dir.parent, dir.descendants);
-                }
-            };
-
-            // don't cross the filesystem boundary
-            let meta = path.symlink_metadata().ok()?;
-            if meta.is_dir() && self.dev == meta.dev() {
-                self.push(&path);
-            }
-
-            if self.find_parent(&path, parent, descendants).is_exclude() {
-                log::trace!("Not reporting (excluded): {:?}", path);
-                continue;
-            }
-
-            // check restriction and crossing the filesystem boundary
-            if path.starts_with(&self.restrict) && self.dev == meta.dev() {
-                break (path,meta);
-            }
-        };
-
-        Some(DirEntryWithMeta {
-                path: self.relative(&path).to_str().unwrap().to_string(),
-                target: path.read_link().map_or(None, |p| Some(p.to_str().unwrap().to_string())),
-                size: meta.size(),
-                mtime: meta.mtime(),
-                ino: meta.ino(),
-                mode: meta.mode(), })
+    while from <= to && from < locations.len() {
+        if locations[from].path() == path {
+            return &locations[from];
+        }
+        from += 1;
     }
+    &locations[parent]
+}
+
+async fn scan_dir(path: PathBuf, locations: &Locations, restrict: &PathBuf, base: &PathBuf, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
+    // check the restriction
+    if !path.starts_with(restrict) && !restrict.starts_with(&path) {
+        log::trace!("Skipping (restriction): {:?} vs {:?}", path, restrict);
+        return Ok(());
+    }
+
+    let pft = narrow_parent_from_to(pft, &path, &locations);
+
+    // no need to descend if we are in the exclude regime and there are no descendants
+    if locations[pft.parent].is_exclude() && pft.from > pft.to {
+        log::trace!("Skipping excluded: {:?}", path);
+        return Ok(());
+    }
+
+    // read the directory
+    use tokio::fs;
+    let mut child_dirs = Vec::new();
+
+    let _sp = s.acquire().await;
+    let mut dir = fs::read_dir(path).await.expect("Couldn't read the directory");
+    while let Some(child) = dir.next_entry().await.expect("Couldn't read the next directory entry") {
+        let path = child.path();
+        let meta = fs::symlink_metadata(&path).await.expect("Couldn't get metadata");
+
+        if meta.is_dir() && dev == meta.dev() {
+            let path = path.clone();
+            child_dirs.push(path);
+        }
+
+        if find_parent(&path, &locations, &pft).is_exclude() {
+            log::trace!("Not reporting (excluded): {:?}", path);
+            continue;
+        }
+
+        // check restriction and crossing the filesystem boundary
+        if path.starts_with(&restrict) && dev == meta.dev() {
+            tx.send(DirEntryWithMeta {
+                    path: relative(&base, &path).to_str().unwrap().to_string(),
+                    target: fs::read_link(path).await.map_or(None, |p| Some(p.to_str().unwrap().to_string())),
+                    size: meta.size(),
+                    mtime: meta.mtime(),
+                    ino: meta.ino(),
+                    mode: meta.mode(), }).await.expect("Couldn't send result through the channel")
+        }
+    }
+
+    scan_children(child_dirs, &locations, &restrict, &base, pft, dev, tx, s.clone())?;
+
+    Ok(())
+}
+
+fn scan_children(children: Vec<PathBuf>, locations: &Locations, restrict: &PathBuf, base: &PathBuf, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
+    for path in children {
+        let locations = locations.clone();
+        let restrict = restrict.clone();
+        let base = base.clone();
+        let pft = pft.clone();
+        let tx = tx.clone();
+        let s = s.clone();
+        tokio::spawn(async move {
+            scan_dir(path, &locations, &restrict, &base, pft, dev, tx, s).await
+        });
+    }
+    Ok(())
 }
 
 /// Send all [directory entries](DirEntryWithMeta) into the channel, given via its [Sender](mpsc::Sender) `tx`.
@@ -244,9 +198,14 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &
 
     log::info!("Going to scan: {}", restrict.display());
 
-    for e in DirIterator::create(base, restrict, locations) {
-        tx.send(e).await?;
-    }
+    let dev = base.symlink_metadata().ok().unwrap().dev();
+    let mut locations: Locations = locations.iter().map(|l| l.prefix(&base)).collect();
+    locations.sort();
+
+    let s = Arc::new(Semaphore::new(64));
+
+    let path = base.clone();
+    scan_dir(path, &locations, &restrict, &base, ParentFromTo { parent: 0, from: 0, to: locations.len() - 1 }, dev, tx, s).await?;
 
     Ok(())
 }

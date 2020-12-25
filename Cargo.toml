@@ -9,13 +9,13 @@ description = "bi-directional synchronization"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap  = "2.33.2"
-colored = "2"
-shellexpand = "2.0.0"
-color-eyre = "0.5.1"
+clap  = "2.33.3"
+colored = "2.0.0"
+shellexpand = "2.1.0"
+color-eyre = "0.5.10"
 savefile = "0.7.4"
 savefile-derive = "0.7.4"
 log = "0.4.11"
-env_logger = "0.7.1"
+env_logger = "0.8.2"
 machine-uid = "0.2.0"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.0.1", features = ["full"] }

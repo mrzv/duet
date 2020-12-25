@@ -288,7 +288,7 @@ async fn walk(path: &str) -> Result<()> {
 
     let path = path.to_string();
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = mpsc::channel(1024);
     tokio::spawn(async move {
         scan::scan(path, "", &locations, tx).await
     });
