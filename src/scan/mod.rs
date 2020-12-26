@@ -116,9 +116,9 @@ fn find_parent<'a>(path: &PathBuf, locations: &'a Locations, pft: &ParentFromTo)
     &locations[parent]
 }
 
-async fn scan_dir(path: PathBuf, locations: &Locations, restrict: &PathBuf, base: &PathBuf, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
+async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
     // check the restriction
-    if !path.starts_with(restrict) && !restrict.starts_with(&path) {
+    if !path.starts_with(&*restrict) && !restrict.starts_with(&path) {
         log::trace!("Skipping (restriction): {:?} vs {:?}", path, restrict);
         return Ok(());
     }
@@ -152,9 +152,9 @@ async fn scan_dir(path: PathBuf, locations: &Locations, restrict: &PathBuf, base
         }
 
         // check restriction and crossing the filesystem boundary
-        if path.starts_with(&restrict) && dev == meta.dev() {
+        if path.starts_with(&*restrict) && dev == meta.dev() {
             tx.send(DirEntryWithMeta {
-                    path: relative(&base, &path).to_str().unwrap().to_string(),
+                    path: relative(&*base, &path).to_str().unwrap().to_string(),
                     target: fs::read_link(path).await.map_or(None, |p| Some(p.to_str().unwrap().to_string())),
                     size: meta.size(),
                     mtime: meta.mtime(),
@@ -163,12 +163,12 @@ async fn scan_dir(path: PathBuf, locations: &Locations, restrict: &PathBuf, base
         }
     }
 
-    scan_children(child_dirs, &locations, &restrict, &base, pft, dev, tx, s.clone())?;
+    scan_children(child_dirs, locations, restrict, base, pft, dev, tx, s.clone())?;
 
     Ok(())
 }
 
-fn scan_children(children: Vec<PathBuf>, locations: &Locations, restrict: &PathBuf, base: &PathBuf, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
+fn scan_children(children: Vec<PathBuf>, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
     for path in children {
         let locations = locations.clone();
         let restrict = restrict.clone();
@@ -177,7 +177,7 @@ fn scan_children(children: Vec<PathBuf>, locations: &Locations, restrict: &PathB
         let tx = tx.clone();
         let s = s.clone();
         tokio::spawn(async move {
-            scan_dir(path, &locations, &restrict, &base, pft, dev, tx, s).await
+            scan_dir(path, locations, restrict, base, pft, dev, tx, s).await
         });
     }
     Ok(())
@@ -193,19 +193,21 @@ fn scan_children(children: Vec<PathBuf>, locations: &Locations, restrict: &PathB
 /// * `tx` - [Sender](mpsc::Sender) of the channel, where to send the [directory entries](DirEntryWithMeta)
 pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &Locations, tx: mpsc::Sender<DirEntryWithMeta>) -> Result<()> {
     let base = PathBuf::from(base.as_ref());
-    let mut restrict = PathBuf::from(&base);
-    restrict.push(path);
+    let mut restrict = Arc::new(PathBuf::from(&base));
+    (*Arc::get_mut(&mut restrict).unwrap()).push(path);
+    let base = Arc::new(base);
 
     log::info!("Going to scan: {}", restrict.display());
 
     let dev = base.symlink_metadata().ok().unwrap().dev();
-    let mut locations: Locations = locations.iter().map(|l| l.prefix(&base)).collect();
-    locations.sort();
+    let mut locations: Arc<Locations> = Arc::new(locations.iter().map(|l| l.prefix(&base)).collect());
+    (*Arc::get_mut(&mut locations).unwrap()).sort();
 
     let s = Arc::new(Semaphore::new(64));
 
-    let path = base.clone();
-    scan_dir(path, &locations, &restrict, &base, ParentFromTo { parent: 0, from: 0, to: locations.len() - 1 }, dev, tx, s).await?;
+    let path = (*base).clone();
+    let to = locations.len() - 1;
+    scan_dir(path, locations, restrict, base, ParentFromTo { parent: 0, from: 0, to: to }, dev, tx, s).await?;
 
     Ok(())
 }
