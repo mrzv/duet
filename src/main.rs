@@ -226,6 +226,7 @@ fn get_remote_changes(base: &str, path: &str, locations: &Locations, local_id: &
         .arg("server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("Failed to spawn child process");
 
