@@ -1,5 +1,5 @@
 use color_eyre::eyre::Result;
-use clap::{clap_app,crate_version,crate_authors};
+use clap::{clap_app,crate_version,crate_authors,ArgMatches};
 use colored::*;
 
 use tokio::sync::mpsc;
@@ -59,36 +59,26 @@ pub async fn main() -> Result<()> {
     ).get_matches();
 
     if let Some(matches) = matches.subcommand_matches("sync") {
-        let profile = matches.value_of("profile").unwrap();
-        let dry_run = matches.is_present("dry_run");
-        let path = matches.value_of("path").unwrap_or("");
-
-        return sync(profile, path, dry_run).await;
+        return sync(matches).await;
     } else if let Some(matches) = matches.subcommand_matches("snapshot") {
-        let profile = matches.value_of("profile").unwrap();
-        let statefile = matches.value_of("state");
-        return snapshot(profile, statefile).await;
+        return snapshot(matches).await;
     } else if let Some(matches) = matches.subcommand_matches("inspect") {
-        let statefile = matches.value_of("state").unwrap();
-        return inspect(statefile);
+        return inspect(matches);
     } else if let Some(matches) = matches.subcommand_matches("changes") {
-        let profile = matches.value_of("profile").unwrap();
-        let statefile = matches.value_of("state");
-        return changes(profile, statefile).await;
+        return changes(matches).await;
     } else if let Some(matches) = matches.subcommand_matches("info") {
-        let profile = matches.value_of("profile").unwrap();
-        return info(profile);
+        return info(matches);
     } else if let Some(_matches) = matches.subcommand_matches("server") {
         return server().await;
     } else if let Some(matches) = matches.subcommand_matches("walk") {
-        let path = matches.value_of("path").unwrap();
-        return walk(path).await;
+        return walk(matches).await;
     }
 
     Ok(())
 }
 
-fn inspect(statefile: &str) -> Result<()> {
+fn inspect(matches: &ArgMatches<'_>) -> Result<()> {
+    let statefile = matches.value_of("state").unwrap();
     let entries: Entries = old_entries(statefile);
     for e in entries {
         println!("{:?}", e);
@@ -129,7 +119,10 @@ async fn scan_entries(base: &str, path: &str, locations: &Locations) -> Result<E
     Ok(entries)
 }
 
-async fn snapshot(name: &str, statefile: Option<&str>) -> Result<()> {
+async fn snapshot(matches: &ArgMatches<'_>) -> Result<()> {
+    let name = matches.value_of("profile").unwrap();
+    let statefile = matches.value_of("state");
+
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
@@ -146,7 +139,10 @@ async fn snapshot(name: &str, statefile: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn changes(name: &str, statefile: Option<&str>) -> Result<()> {
+async fn changes(matches: &ArgMatches<'_>) -> Result<()> {
+    let name = matches.value_of("profile").unwrap();
+    let statefile = matches.value_of("state");
+
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
@@ -166,12 +162,17 @@ async fn changes(name: &str, statefile: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn info(name: &str) -> Result<()> {
+fn info(matches: &ArgMatches<'_>) -> Result<()> {
+    let name = matches.value_of("profile").unwrap();
     println!("Profile {} located at {}", name.yellow(), profile::location(name).to_str().unwrap());
     Ok(())
 }
 
-async fn sync(name: &str, path: &str, dry_run: bool) -> Result<()> {
+async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
+    let name = matches.value_of("profile").unwrap();
+    let dry_run = matches.is_present("dry_run");
+    let path = matches.value_of("path").unwrap_or("");
+
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.yellow());
 
@@ -282,7 +283,9 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, stat
     Ok((all_old_entries, changes))
 }
 
-async fn walk(path: &str) -> Result<()> {
+async fn walk(matches: &ArgMatches<'_>) -> Result<()> {
+    let path = matches.value_of("path").unwrap();
+
     use std::path::PathBuf;
     let locations = vec![scan::location::Location::Include(PathBuf::from("."))];
 
