@@ -2,13 +2,13 @@ use std::cmp::Ordering;
 use std::fmt;
 use colored::*;
 
-use savefile_derive::Savefile;
+use serde::{Serialize,Deserialize};
 
 use crate::utils::{match_sorted,MatchSorted};
 
 use super::DirEntryWithMeta;
 
-#[derive(Debug, Clone, Savefile)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Change {
     Added(DirEntryWithMeta),
     Removed(DirEntryWithMeta),

@@ -1,9 +1,9 @@
 use std::path::{PathBuf};
 use std::cmp::Ordering;
 use std::fmt;
-use savefile_derive::Savefile;
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Clone, Savefile)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Location {
     Include(PathBuf),
     Exclude(PathBuf),

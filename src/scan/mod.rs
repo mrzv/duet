@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 
 use std::os::unix::fs::MetadataExt;
 
-use savefile_derive::Savefile;
+use serde::{Serialize,Deserialize};
 
 use color_eyre::eyre::Result;
 
@@ -21,7 +21,7 @@ pub mod change;
 use location::{Locations,Location};
 pub use change::{changes,Change};
 
-#[derive(Debug,Clone,Savefile)]
+#[derive(Debug,Clone,Serialize,Deserialize)]
 pub struct DirEntryWithMeta {
     path:   String,
     size:   u64,

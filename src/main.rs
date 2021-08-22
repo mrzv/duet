@@ -11,6 +11,10 @@ mod actions;
 use actions::Action;
 use scan::location::{Locations};
 
+use std::fs::{File,OpenOptions};
+use std::io::{BufWriter,BufReader};
+use bincode::{serialize_into,deserialize_from};
+
 type Entries = Vec<scan::DirEntryWithMeta>;
 type Changes = Vec<scan::Change>;
 type Actions = Vec<Action>;
@@ -90,7 +94,8 @@ fn old_entries(fname: &str) -> Entries {
     let entries: Entries =
         if std::path::Path::new(fname).exists() {
             log::debug!("Loading: {}", fname);
-            savefile::load_file(fname, 0).unwrap()
+            let mut f = BufReader::new(File::open(fname).unwrap());
+            deserialize_from(f).unwrap()
         } else {
             Vec::new()
         };
@@ -137,7 +142,8 @@ async fn snapshot(matches: &ArgMatches<'_>) -> Result<()> {
     } else {
         String::from(profile::local_state(name).to_str().unwrap())
     };
-    savefile::save_file(&statefile, 0, &current_entries).unwrap();
+    let mut f = BufWriter::new(File::create(statefile).unwrap());
+    serialize_into(f, &current_entries)?;
     Ok(())
 }
 
@@ -203,7 +209,8 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         a.apply();
     }
 
-    savefile::save_file(&local_state, 0, &local_all_old).unwrap();
+    let mut f = BufWriter::new(File::create(local_state).unwrap());
+    serialize_into(f, &local_all_old)?;
     Ok(())
 }
 
@@ -219,7 +226,6 @@ fn local_id(name: &str) -> String {
 
 fn get_remote_changes(base: &str, path: &str, locations: &Locations, local_id: &str) -> Result<Changes> {
     use std::process::{Command, Stdio};
-    use savefile::{save,load};
 
     // launch server
     let mut server = Command::new("target/debug/duet")       // TODO: need a better way to find the command
@@ -230,34 +236,34 @@ fn get_remote_changes(base: &str, path: &str, locations: &Locations, local_id: &
         .spawn()
         .expect("Failed to spawn child process");
 
-    let server_in = server.stdin.as_mut().expect("Failed to open stdin");
-    let server_out = server.stdout.as_mut().expect("Failed to read stdout");
+    //let server_in = server.stdin.as_mut().expect("Failed to open stdin");
+    //let server_out = server.stdout.as_mut().expect("Failed to read stdout");
 
-    save(server_in, 0, &String::from(base)).expect("Can't send base to the server");
-    save(server_in, 0, &String::from(path)).expect("Can't send path to the server");
-    save(server_in, 0, locations).expect("Can't send locations to the server");
-    save(server_in, 0, &String::from(local_id)).expect("Can't send local_id to the server");
+    //save(server_in, 0, &String::from(base)).expect("Can't send base to the server");
+    //save(server_in, 0, &String::from(path)).expect("Can't send path to the server");
+    //save(server_in, 0, locations).expect("Can't send locations to the server");
+    //save(server_in, 0, &String::from(local_id)).expect("Can't send local_id to the server");
 
-    let changes: Changes = load(server_out, 0).expect("Failed to load changes");
+    //let changes: Changes = load(server_out, 0).expect("Failed to load changes");
+    let changes: Changes = Vec::new();
 
     Ok(changes)
 }
 
 async fn server() -> Result<()> {
     use std::io::{self};
-    use savefile::{save,load};
 
     let stdin = &mut io::stdin();
 
-    let base: String = load(stdin, 0).expect("Failed to load base");
-    let path: String = load(stdin, 0).expect("Failed to load path");
-    let locations: Locations = load(stdin, 0).expect("Failed to load locations");
-    let remote_id: String = load(stdin, 0).expect("Failed to load path");
+    //let base: String = load(stdin, 0).expect("Failed to load base");
+    //let path: String = load(stdin, 0).expect("Failed to load path");
+    //let locations: Locations = load(stdin, 0).expect("Failed to load locations");
+    //let remote_id: String = load(stdin, 0).expect("Failed to load path");
 
-    let (_all_old, changes) = old_and_changes(&base, &path, &locations, Some(profile::remote_state(&remote_id).to_str().unwrap())).await?;
+    //let (_all_old, changes) = old_and_changes(&base, &path, &locations, Some(profile::remote_state(&remote_id).to_str().unwrap())).await?;
 
-    let stdout = &mut io::stdout();
-    save(stdout, 0, &changes).expect("Can't send changes to the client");
+    //let stdout = &mut io::stdout();
+    //save(stdout, 0, &changes).expect("Can't send changes to the client");
 
     Ok(())
 }
@@ -269,7 +275,8 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, stat
         if let Some(f) = statefile {
             if std::path::Path::new(f).exists() {
                 log::debug!("Loading: {}", f);
-                savefile::load_file(f, 0).unwrap()
+                let mut f = BufReader::new(File::open(f).unwrap());
+                deserialize_from(f).unwrap()
             } else {
                 Vec::new()
             }
