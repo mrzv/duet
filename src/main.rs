@@ -11,9 +11,13 @@ mod actions;
 use actions::Action;
 use scan::location::{Locations};
 
-use std::fs::{File,OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter,BufReader};
 use bincode::{serialize_into,deserialize_from};
+
+use essrpc::essrpc;
+use essrpc::transports::{BincodeTransport,ReadWrite};
+use essrpc::{RPCClient, RPCError, RPCErrorKind, RPCServer};
 
 type Entries = Vec<scan::DirEntryWithMeta>;
 type Changes = Vec<scan::Change>;
@@ -94,7 +98,7 @@ fn old_entries(fname: &str) -> Entries {
     let entries: Entries =
         if std::path::Path::new(fname).exists() {
             log::debug!("Loading: {}", fname);
-            let mut f = BufReader::new(File::open(fname).unwrap());
+            let f = BufReader::new(File::open(fname).unwrap());
             deserialize_from(f).unwrap()
         } else {
             Vec::new()
@@ -142,7 +146,7 @@ async fn snapshot(matches: &ArgMatches<'_>) -> Result<()> {
     } else {
         String::from(profile::local_state(name).to_str().unwrap())
     };
-    let mut f = BufWriter::new(File::create(statefile).unwrap());
+    let f = BufWriter::new(File::create(statefile).unwrap());
     serialize_into(f, &current_entries)?;
     Ok(())
 }
@@ -209,7 +213,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         a.apply();
     }
 
-    let mut f = BufWriter::new(File::create(local_state).unwrap());
+    let f = BufWriter::new(File::create(local_state).unwrap());
     serialize_into(f, &local_all_old)?;
     Ok(())
 }
@@ -236,34 +240,63 @@ fn get_remote_changes(base: &str, path: &str, locations: &Locations, local_id: &
         .spawn()
         .expect("Failed to spawn child process");
 
-    //let server_in = server.stdin.as_mut().expect("Failed to open stdin");
-    //let server_out = server.stdout.as_mut().expect("Failed to read stdout");
+    eprintln!("launched server");
 
-    //save(server_in, 0, &String::from(base)).expect("Can't send base to the server");
-    //save(server_in, 0, &String::from(path)).expect("Can't send path to the server");
-    //save(server_in, 0, locations).expect("Can't send locations to the server");
-    //save(server_in, 0, &String::from(local_id)).expect("Can't send local_id to the server");
+    let server_in = server.stdin.as_mut().expect("Failed to open stdin");
+    let server_out = server.stdout.as_mut().expect("Failed to read stdout");
 
-    //let changes: Changes = load(server_out, 0).expect("Failed to load changes");
-    let changes: Changes = Vec::new();
+    let server_io = ReadWrite::new(server_out, server_in);
+
+    let remote = DuetServerRPCClient::new(BincodeTransport::new(server_io));
+
+    let changes: Changes = remote.changes(base.to_string(), path.to_string(), locations.to_vec(), local_id.to_string())?;
 
     Ok(changes)
+}
+
+#[essrpc]
+pub trait DuetServer {
+    fn changes(&self, base: String, path: String, locations: Locations, remote_id: String) -> Result<Changes, RPCError>;
+}
+
+struct DuetServerImpl;
+
+impl DuetServerImpl {
+    fn new() -> Self {
+        DuetServerImpl {}
+    }
+}
+
+impl DuetServer for DuetServerImpl {
+    fn changes(&self, base: String, path: String, locations: Locations, remote_id: String) -> Result<Changes, RPCError> {
+        let future = async move {
+            let result = old_and_changes(&base, &path, &locations, Some(profile::remote_state(&remote_id).to_str().unwrap())).await;
+            match result {
+                Ok((_all_old, changes)) => Ok(changes),
+                Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in getting changes from the server"))
+            }
+        };
+        use futures::{executor::block_on};
+        let changes = block_on(future)?;
+        Ok(changes)
+    }
 }
 
 async fn server() -> Result<()> {
     use std::io::{self};
 
-    let stdin = &mut io::stdin();
+    let stdin = io::stdin();
+    let stdout = io::stdout();
 
-    //let base: String = load(stdin, 0).expect("Failed to load base");
-    //let path: String = load(stdin, 0).expect("Failed to load path");
-    //let locations: Locations = load(stdin, 0).expect("Failed to load locations");
-    //let remote_id: String = load(stdin, 0).expect("Failed to load path");
+    let stdio = ReadWrite::new(stdin, stdout);
 
-    //let (_all_old, changes) = old_and_changes(&base, &path, &locations, Some(profile::remote_state(&remote_id).to_str().unwrap())).await?;
+    eprintln!("in server()");
 
-    //let stdout = &mut io::stdout();
-    //save(stdout, 0, &changes).expect("Can't send changes to the client");
+    let mut serve = DuetServerRPCServer::new(DuetServerImpl::new(), BincodeTransport::new(stdio));
+    match serve.serve() {
+        Ok(_) => panic!("Expected EOF error"),
+        Err(e) => assert_eq!(e.kind, RPCErrorKind::TransportEOF),
+    };
 
     Ok(())
 }
@@ -275,7 +308,7 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, stat
         if let Some(f) = statefile {
             if std::path::Path::new(f).exists() {
                 log::debug!("Loading: {}", f);
-                let mut f = BufReader::new(File::open(f).unwrap());
+                let f = BufReader::new(File::open(f).unwrap());
                 deserialize_from(f).unwrap()
             } else {
                 Vec::new()
