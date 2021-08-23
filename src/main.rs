@@ -18,6 +18,7 @@ use bincode::{serialize_into,deserialize_from};
 use essrpc::essrpc;
 use essrpc::transports::{BincodeTransport,ReadWrite};
 use essrpc::{RPCClient, RPCError, RPCErrorKind, RPCServer};
+use std::process::{Command, Stdio, Child, ChildStdin, ChildStdout};
 
 type Entries = Vec<scan::DirEntryWithMeta>;
 type Changes = Vec<scan::Change>;
@@ -195,7 +196,11 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
 
     let local_state = profile::local_state(name).to_string_lossy().into_owned();
     let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(&local_state)).await?;
-    let remote_changes = get_remote_changes(&remote_base, &path, &prf.locations, &local_id).expect("Couldn't get remote changes");
+
+    let mut server = launch_server();
+    let remote = get_remote(&mut server);
+
+    let remote_changes = remote.changes(remote_base, path.to_string(), prf.locations, local_id).expect("Couldn't get remote changes");
 
     let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
                                 .filter_map(|(lc,rc)| Action::create(lc,rc))
@@ -228,11 +233,9 @@ fn local_id(name: &str) -> String {
     format!("{:x}", s.finish())
 }
 
-fn get_remote_changes(base: &str, path: &str, locations: &Locations, local_id: &str) -> Result<Changes> {
-    use std::process::{Command, Stdio};
-
+fn launch_server() -> Child {
     // launch server
-    let mut server = Command::new("target/debug/duet")       // TODO: need a better way to find the command
+    let server = Command::new("target/debug/duet")       // TODO: need a better way to find the command
         .arg("server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -242,16 +245,17 @@ fn get_remote_changes(base: &str, path: &str, locations: &Locations, local_id: &
 
     eprintln!("launched server");
 
+    server
+}
+
+fn get_remote(server: &mut Child) -> DuetServerRPCClient<BincodeTransport<ReadWrite<&mut ChildStdout, &mut ChildStdin>>> {
     let server_in = server.stdin.as_mut().expect("Failed to open stdin");
     let server_out = server.stdout.as_mut().expect("Failed to read stdout");
 
     let server_io = ReadWrite::new(server_out, server_in);
 
     let remote = DuetServerRPCClient::new(BincodeTransport::new(server_io));
-
-    let changes: Changes = remote.changes(base.to_string(), path.to_string(), locations.to_vec(), local_id.to_string())?;
-
-    Ok(changes)
+    remote
 }
 
 #[essrpc]
