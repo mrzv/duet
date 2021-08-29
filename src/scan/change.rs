@@ -23,6 +23,14 @@ impl Change {
             Change::Modified(dir1,dir2) => { assert_eq!(dir1.path, dir2.path); &dir2.path},
         }
     }
+
+    pub fn is_dir(&self) -> bool {
+        match self {
+            Change::Added(e)    => e.is_dir(),
+            Change::Removed(e)  => e.is_dir(),
+            Change::Modified(_e1,e2) => e2.is_dir(),
+        }
+    }
 }
 
 pub fn same(x: &Change, y: &Change) -> bool {
@@ -65,7 +73,7 @@ impl fmt::Display for Change {
         match &self {
             Change::Added(_)    => write!(f, "+ {}", self.path().green()),
             Change::Removed(_)  => write!(f, "- {}", self.path().red()),
-            Change::Modified(_,_) => write!(f, "M {}", self.path()),
+            Change::Modified(_,_) => write!(f, "M {}", self.path().yellow()),
         }
     }
 }

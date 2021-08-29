@@ -8,8 +8,10 @@ mod profile;
 mod scan;
 mod utils;
 mod actions;
-use actions::Action;
+mod sync;
+use actions::{Action,num_conflicts,reverse};
 use scan::location::{Locations};
+use scan::{Change,DirEntryWithMeta};
 
 use std::fs::File;
 use std::io::{BufWriter,BufReader};
@@ -20,8 +22,8 @@ use essrpc::transports::{BincodeTransport,ReadWrite};
 use essrpc::{RPCClient, RPCError, RPCErrorKind, RPCServer};
 use std::process::{Command, Stdio, Child, ChildStdin, ChildStdout};
 
-type Entries = Vec<scan::DirEntryWithMeta>;
-type Changes = Vec<scan::Change>;
+type Entries = Vec<DirEntryWithMeta>;
+type Changes = Vec<Change>;
 type Actions = Vec<Action>;
 
 #[tokio::main]
@@ -38,6 +40,8 @@ pub async fn main() -> Result<()> {
             (@arg profile: +required "profile to synchronize")
             (@arg path:              "path to synchronize")
             (@arg dry_run: -n        "don't apply changes")
+            (@arg batch: -b          "run as a batch (abort on conflict)")
+            (@arg force: -f          "in batch mode, apply what's possible, even if there are conflicts")
         )
         (@subcommand snapshot =>
             (about: "take snapshot")
@@ -136,7 +140,7 @@ async fn snapshot(matches: &ArgMatches<'_>) -> Result<()> {
     let statefile = matches.value_of("state");
 
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
-    println!("Using profile: {}", name.yellow());
+    println!("Using profile: {}", name.cyan());
 
     let local_base = shellexpand::full(&prf.local)?.to_string();
 
@@ -157,7 +161,7 @@ async fn changes(matches: &ArgMatches<'_>) -> Result<()> {
     let statefile = matches.value_of("state");
 
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
-    println!("Using profile: {}", name.yellow());
+    println!("Using profile: {}", name.cyan());
 
     let local_base = shellexpand::full(&prf.local)?.to_string();
 
@@ -184,10 +188,12 @@ fn info(matches: &ArgMatches<'_>) -> Result<()> {
 async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let name = matches.value_of("profile").unwrap();
     let dry_run = matches.is_present("dry_run");
+    let batch = matches.is_present("batch");
+    let force = matches.is_present("force");
     let path = matches.value_of("path").unwrap_or("");
 
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
-    println!("Using profile: {}", name.yellow());
+    println!("Using profile: {}", name.cyan());
 
     let local_id = local_id(name);
 
@@ -195,28 +201,96 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let remote_base = shellexpand::full(&prf.remote)?.to_string();
 
     let local_state = profile::local_state(name).to_string_lossy().into_owned();
-    let (local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(&local_state)).await?;
+    let (mut local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(&local_state)).await?;
 
     let mut server = launch_server();
-    let remote = get_remote(&mut server);
+    let mut remote = get_remote(&mut server);
+    remote.set_base(remote_base)?;
 
-    let remote_changes = remote.changes(remote_base, path.to_string(), prf.locations, local_id).expect("Couldn't get remote changes");
+    let remote_changes = remote.changes(path.to_string(), prf.locations, local_id).expect("Couldn't get remote changes");
 
     let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
                                 .filter_map(|(lc,rc)| Action::create(lc,rc))
                                 .collect();
-    for a in &actions {
-        println!("{}", a);
+
+    if actions.is_empty() {
+        println!("No changes detected");
+        return Ok(())
     }
 
-    if dry_run {
-        return Ok(());
+    let num_conflicts = num_conflicts(&actions);
+    if dry_run || (batch && num_conflicts > 0 && !force) {
+        for a in &actions {
+            println!("{}", a);
+        }
+        if !dry_run && num_conflicts > 0 {
+            println!("{} conflicts found; {}\n", num_conflicts, "aborting".bright_red());
+        }
+        return Ok(())
     }
 
-    // apply changes
-    for a in &actions {
-        a.apply();
-    }
+    let actions = {
+        if batch && force {
+            for a in &actions {
+                println!("{}", a);
+            }
+            actions
+        } else {
+            // not batch
+            let mut resolved_actions: Actions = Vec::new();
+            for a in &actions {
+                println!("{}", a);
+                if let Action::Conflict(lc,rc) = a {
+                    let choice = loop {
+                        println!("l = update local, r = update remote, c = keep conflict");
+                        let choice: String = text_io::read!("{}\n");
+                        if choice == "l" || choice == "r" || choice == "c" {
+                            break choice;
+                        } else {
+                            println!("Unrecognized choice: {}", choice);
+                        }
+                    };
+                    if choice == "l" {
+                        if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
+                            resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
+                        } else {
+                            resolved_actions.push(Action::Local(lc.clone()));
+                        }
+                    } else if choice == "r" {
+                        if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
+                            resolved_actions.push(Action::Remote(Change::Modified(rc.clone(), lc.clone())));
+                        } else {
+                            resolved_actions.push(Action::Remote(rc.clone()));
+                        }
+                    } else if choice == "c" {
+                        resolved_actions.push(a.clone());
+                    }
+                    println!("{}", resolved_actions.last().unwrap());
+                } else {
+                    resolved_actions.push(a.clone());
+                }
+            }
+            // resolve conflicts
+            resolved_actions
+        }
+    };
+
+    let actions: Actions = actions.into_iter().filter(|a| !a.is_conflict()).collect();
+    let remote_actions: Actions = reverse(&actions);
+    remote.set_actions(remote_actions)?;
+
+    let local_signatures  = sync::get_signatures(&local_base, &actions).expect("couldn't get local signatures");
+    let remote_signatures = remote.get_signatures().expect("couldn't get remote signatures");
+    println!("{} local signatures; {} remote signatures\n", local_signatures.len(), remote_signatures.len());
+
+    let local_detailed_changes  = sync::get_detailed_changes(&local_base, &actions, &remote_signatures).expect("couldn't get local detailed changes");
+    let remote_detailed_changes = remote.get_detailed_changes(local_signatures).expect("couldn't get remote detailed changes");
+
+    // updates local_all_old to be the new state
+    sync::apply_detailed_changes(&local_base, &actions, &remote_detailed_changes, &mut local_all_old)?;
+    remote.apply_detailed_changes(local_detailed_changes)?;
+
+    remote.save_state()?;
 
     let f = BufWriter::new(File::create(local_state).unwrap());
     serialize_into(f, &local_all_old)?;
@@ -243,7 +317,7 @@ fn launch_server() -> Child {
         .spawn()
         .expect("Failed to spawn child process");
 
-    eprintln!("launched server");
+    log::trace!("launched server");
 
     server
 }
@@ -258,31 +332,100 @@ fn get_remote(server: &mut Child) -> DuetServerRPCClient<BincodeTransport<ReadWr
     remote
 }
 
+use sync::{SignatureWithPath,ChangeDetails};
+
 #[essrpc]
 pub trait DuetServer {
-    fn changes(&self, base: String, path: String, locations: Locations, remote_id: String) -> Result<Changes, RPCError>;
+    fn set_base(&mut self, base: String) -> Result<(), RPCError>;
+    fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError>;
+    fn changes(&mut self, path: String, locations: Locations, remote_id: String) -> Result<Changes, RPCError>;
+    fn get_signatures(&self) -> Result<Vec<SignatureWithPath>, RPCError>;
+    fn get_detailed_changes(&self, signatures: Vec<SignatureWithPath>) -> Result<Vec<sync::ChangeDetails>, RPCError>;
+    fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError>;
+    fn save_state(&self) -> Result<(), RPCError>;
 }
 
-struct DuetServerImpl;
+struct DuetServerImpl
+{
+    base:       String,
+    remote_id:  String,
+    all_old:    Entries,
+    actions:    Actions,
+}
 
 impl DuetServerImpl {
     fn new() -> Self {
-        DuetServerImpl {}
+        DuetServerImpl {
+            base:       "".to_string(),
+            remote_id:  "".to_string(),
+            all_old:    Vec::new(),
+            actions:    Vec::new(),
+        }
     }
 }
 
 impl DuetServer for DuetServerImpl {
-    fn changes(&self, base: String, path: String, locations: Locations, remote_id: String) -> Result<Changes, RPCError> {
+    fn set_base(&mut self, base: String) -> Result<(), RPCError> {
+        self.base = base;
+        Ok(())
+    }
+
+    fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError> {
+        self.actions = actions;
+        Ok(())
+    }
+
+    fn changes(&mut self, path: String, locations: Locations, remote_id: String) -> Result<Changes, RPCError> {
+        log::debug!("remote id = {}", remote_id);
+        self.remote_id = remote_id;
         let future = async move {
-            let result = old_and_changes(&base, &path, &locations, Some(profile::remote_state(&remote_id).to_str().unwrap())).await;
+            let result = old_and_changes(&self.base, &path, &locations, Some(profile::remote_state(&self.remote_id).to_str().unwrap())).await;
             match result {
-                Ok((_all_old, changes)) => Ok(changes),
+                Ok((all_old, changes)) => {
+                    self.all_old = all_old;
+                    Ok(changes)
+                },
                 Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in getting changes from the server"))
             }
         };
         use futures::{executor::block_on};
         let changes = block_on(future)?;
         Ok(changes)
+    }
+
+    fn get_signatures(&self) -> Result<Vec<SignatureWithPath>, RPCError> {
+        let result = sync::get_signatures(&self.base, &self.actions);
+        match result {
+            Ok(signatures) => Ok(signatures),
+            Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in getting signatures from the server"))
+        }
+    }
+
+    fn get_detailed_changes(&self, signatures: Vec<SignatureWithPath>) -> Result<Vec<sync::ChangeDetails>, RPCError> {
+        let result = sync::get_detailed_changes(&self.base, &self.actions, &signatures);
+        match result {
+            Ok(details) => Ok(details),
+            Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in getting detailed changes from the server"))
+        }
+    }
+
+    fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError> {
+        let result = sync::apply_detailed_changes(&self.base, &self.actions, &details, &mut self.all_old);
+        match result {
+            Ok(()) => Ok(()),
+            Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in applying detailed changes on the server"))
+        }
+    }
+
+    fn save_state(&self) -> Result<(), RPCError> {
+        let remote_state = profile::remote_state(&self.remote_id);
+        log::info!("Saving remote state {} with {} entries", remote_state.to_str().unwrap(), &self.all_old.len());
+        let f = BufWriter::new(File::create(remote_state).unwrap());
+        let result = serialize_into(f, &self.all_old);
+        match result {
+            Ok(()) => Ok(()),
+            Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in saving remote state on the server"))
+        }
     }
 }
 
@@ -294,7 +437,7 @@ async fn server() -> Result<()> {
 
     let stdio = ReadWrite::new(stdin, stdout);
 
-    eprintln!("in server()");
+    log::trace!("in server()");
 
     let mut serve = DuetServerRPCServer::new(DuetServerImpl::new(), BincodeTransport::new(stdio));
     match serve.serve() {

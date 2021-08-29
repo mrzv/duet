@@ -29,12 +29,14 @@ pub struct DirEntryWithMeta {
     ino:    u64,
     mode:   u32,
     target: Option<String>,
+    is_dir: bool,
+    // TODO: uid and gid
 }
 
 impl DirEntryWithMeta {
     fn same(&self, other: &Self) -> bool {
         assert_eq!(self.path, other.path);
-        self.size == other.size && self.mtime == other.mtime && self.ino == other.ino && self.mode == other.mode && self.target == other.target
+        self.same_contents(other) && self.mode == other.mode && self.target == other.target && self.is_dir == other.is_dir
     }
 
     pub fn starts_with(&self, path: &str) -> bool {
@@ -43,6 +45,34 @@ impl DirEntryWithMeta {
 
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    pub fn target(&self) -> &Option<String> {
+        &self.target
+    }
+
+    pub fn same_contents(&self, other: &Self) -> bool {
+        self.size == other.size && self.mtime == other.mtime && self.ino == other.ino
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.target.is_some()
+    }
+
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    pub fn mtime(&self) -> i64 {
+        self.mtime
+    }
+
+    pub fn set_ino(&mut self, ino: u64) {
+        self.ino = ino;
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.is_dir
     }
 }
 
@@ -159,7 +189,9 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
                     size: meta.size(),
                     mtime: meta.mtime(),
                     ino: meta.ino(),
-                    mode: meta.mode(), }).await.expect("Couldn't send result through the channel")
+                    mode: meta.mode(),
+                    is_dir: meta.is_dir(),
+            }).await.expect("Couldn't send result through the channel")
         }
     }
 
