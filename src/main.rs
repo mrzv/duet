@@ -218,29 +218,30 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         return Ok(())
     }
 
+    for a in &actions {
+        println!("{}", a);
+    }
+
+    if dry_run {
+        return Ok(())
+    }
+
     let num_conflicts = num_conflicts(&actions);
-    if dry_run || (batch && num_conflicts > 0 && !force) {
-        for a in &actions {
-            println!("{}", a);
-        }
-        if !dry_run && num_conflicts > 0 {
-            println!("{} conflicts found; {}\n", num_conflicts, "aborting".bright_red());
-        }
+    if batch && num_conflicts > 0 && !force {
+        println!("{} conflicts found; {}\n", num_conflicts, "aborting".bright_red());
         return Ok(())
     }
 
     let actions = {
         if batch && force {
-            for a in &actions {
-                println!("{}", a);
-            }
             actions
         } else {
             // not batch
+            println!("Resolve conflicts:");
             let mut resolved_actions: Actions = Vec::new();
             for a in &actions {
-                println!("{}", a);
                 if let Action::Conflict(lc,rc) = a {
+                    println!("{}", a);
                     let choice = loop {
                         println!("l = update local, r = update remote, c = keep conflict");
                         let choice: String = text_io::read!("{}\n");
@@ -274,6 +275,18 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
             resolved_actions
         }
     };
+
+    if !batch {
+        loop {
+            println!("Proceed? (y/N)");
+            let choice: String = text_io::read!("{}\n");
+            if choice == "y" || choice == "Y" {
+                break;
+            } else if choice == "" || choice == "n" || choice == "N" {
+                return Ok(());
+            }
+        }
+    }
 
     let actions: Actions = actions.into_iter().filter(|a| !a.is_conflict()).collect();
     let remote_actions: Actions = reverse(&actions);
