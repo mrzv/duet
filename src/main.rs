@@ -233,7 +233,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     }
 
     let actions = {
-        if batch && force {
+        if num_conflicts == 0 || (batch && force) {
             actions
         } else {
             // not batch
@@ -277,14 +277,10 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     };
 
     if !batch {
-        loop {
-            println!("Proceed? (y/N)");
-            let choice: String = text_io::read!("{}\n");
-            if choice == "y" || choice == "Y" {
-                break;
-            } else if choice == "" || choice == "n" || choice == "N" {
-                return Ok(());
-            }
+        use dialoguer::Confirm;
+
+        if !Confirm::new().with_prompt("Do you want to continue?").interact()? {
+            return Ok(());
         }
     }
 
