@@ -256,6 +256,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "colored",
+ "console",
  "dialoguer",
  "env_logger",
  "essrpc",

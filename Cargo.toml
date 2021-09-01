@@ -27,3 +27,4 @@ rustsync = { path = "../Upstream/rustsync" }
 filetime = "0.2.15"
 text_io = "0.1.9"
 dialoguer = "0.8.0"
+console = "0.14.1"

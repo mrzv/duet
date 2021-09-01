@@ -237,6 +237,8 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
             actions
         } else {
             // not batch
+            use console::Term;
+            let term = Term::stdout();
             println!("Resolve conflicts:");
             let mut resolved_actions: Actions = Vec::new();
             for a in &actions {
@@ -244,28 +246,27 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
                     println!("{}", a);
                     let choice = loop {
                         println!("l = update local, r = update remote, c = keep conflict");
-                        let choice: String = text_io::read!("{}\n");
-                        if choice == "l" || choice == "r" || choice == "c" {
+                        let choice = term.read_char()?;
+                        if choice == 'l' || choice == 'r' || choice == 'c' {
                             break choice;
-                        } else {
-                            println!("Unrecognized choice: {}", choice);
                         }
                     };
-                    if choice == "l" {
+                    if choice == 'l' {
                         if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
                             resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
                         } else {
                             resolved_actions.push(Action::Local(rc.clone()));
                         }
-                    } else if choice == "r" {
+                    } else if choice == 'r' {
                         if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
                             resolved_actions.push(Action::Remote(Change::Modified(rc.clone(), lc.clone())));
                         } else {
                             resolved_actions.push(Action::Remote(lc.clone()));
                         }
-                    } else if choice == "c" {
+                    } else if choice == 'c' {
                         resolved_actions.push(a.clone());
                     }
+                    term.clear_last_lines(2)?;
                     println!("{}", resolved_actions.last().unwrap());
                 } else {
                     resolved_actions.push(a.clone());
