@@ -254,13 +254,13 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
                         if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
                             resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
                         } else {
-                            resolved_actions.push(Action::Local(lc.clone()));
+                            resolved_actions.push(Action::Local(rc.clone()));
                         }
                     } else if choice == "r" {
                         if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
                             resolved_actions.push(Action::Remote(Change::Modified(rc.clone(), lc.clone())));
                         } else {
-                            resolved_actions.push(Action::Remote(rc.clone()));
+                            resolved_actions.push(Action::Remote(lc.clone()));
                         }
                     } else if choice == "c" {
                         resolved_actions.push(a.clone());
