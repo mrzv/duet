@@ -292,7 +292,9 @@ dependencies = [
 
 [[package]]
 name = "essrpc"
-version = "0.3.0"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb25e933ca17d4e6904f14e1a695fa10fa38bb73f9c10518519a701297322e6c"
 dependencies = [
  "bincode",
  "essrpc_macros",
@@ -303,6 +305,8 @@ dependencies = [
 [[package]]
 name = "essrpc_macros"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d678069d233b749a5db7fe2b292f5cc41309f3a6113c0d137fcdd52392d74aac"
 dependencies = [
  "proc-macro2",
  "quote",
