@@ -34,6 +34,14 @@ impl Action {
         }
     }
 
+    pub fn is_identical(&self) -> bool {
+        if let Action::Identical(_,_) = self {
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn path(&self) -> &String {
         match self {
             Action::Local(l) => l.path(),

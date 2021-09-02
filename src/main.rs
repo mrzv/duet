@@ -42,6 +42,7 @@ pub async fn main() -> Result<()> {
             (@arg dry_run: -n        "don't apply changes")
             (@arg batch: -b          "run as a batch (abort on conflict)")
             (@arg force: -f          "in batch mode, apply what's possible, even if there are conflicts")
+            (@arg verbose: -v        "verbose output")
         )
         (@subcommand snapshot =>
             (about: "take snapshot")
@@ -190,6 +191,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let dry_run = matches.is_present("dry_run");
     let batch = matches.is_present("batch");
     let force = matches.is_present("force");
+    let verbose = matches.is_present("verbose");
     let path = matches.value_of("path").unwrap_or("");
 
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
@@ -218,8 +220,17 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         return Ok(())
     }
 
+    let mut num_identical = 0;
     for a in &actions {
-        println!("{}", a);
+        if verbose || !a.is_identical() {
+            println!("{}", a);
+        }
+        if a.is_identical() {
+            num_identical += 1;
+        }
+    }
+    if !verbose && num_identical > 0 {
+        println!("Skipped {} identical changes (use --verbose to show all)", num_identical);
     }
 
     if dry_run {
