@@ -1,4 +1,5 @@
 use std::fmt;
+use colored::*;
 use serde::{Serialize,Deserialize};
 use super::scan::change::{Change,same};
 
@@ -79,7 +80,7 @@ impl fmt::Display for Action {
             // local action means remote change, and remote action means local change
             Action::Local(l)        => write!(f, "<---- {}", l),
             Action::Remote(r)       => write!(f, "----> {}", r),
-            Action::Conflict(l,_r)  => write!(f, "<---> {}", l),
+            Action::Conflict(l,_r)  => write!(f, "{} {}", "<--->".bright_red(), l),
             Action::Identical(l,_)  => write!(f, "--I-- {}", l),
         }
     }
