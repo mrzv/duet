@@ -1,5 +1,5 @@
 use color_eyre::eyre::Result;
-use clap::{clap_app,crate_version,crate_authors,ArgMatches};
+use clap::{clap_app,crate_version,crate_authors,ArgMatches,AppSettings};
 use colored::*;
 
 use tokio::sync::mpsc;
@@ -44,31 +44,37 @@ pub async fn main() -> Result<()> {
             (@arg force: -f          "in batch mode, apply what's possible, even if there are conflicts")
             (@arg verbose: -v        "verbose output")
         )
+        (@subcommand server =>
+            (about: "run server-side code")
+            (setting: AppSettings::Hidden)
+        )
+        // testing/debugging
         (@subcommand snapshot =>
             (about: "take snapshot")
             (@arg profile: +required "profile to snapshot")
             (@arg state:             "state file to save snapshot")
+            (setting: AppSettings::Hidden)
         )
         (@subcommand inspect =>
             (about: "inspect a state file")
             (@arg state: +required "statefile to show")
+            (setting: AppSettings::Hidden)
         )
         (@subcommand changes =>
             (about: "show changes compared to a given state")
             (@arg profile: +required "profile to compare")
             (@arg state:             "state file to compare")
+            (setting: AppSettings::Hidden)
         )
         (@subcommand info =>
             (about: "show info about a profile")
             (@arg profile: +required "profile to compare")
+            (setting: AppSettings::Hidden)
         )
-        (@subcommand server =>
-            (about: "run server-side code")
-        )
-        // testing/debugging
         (@subcommand walk =>
             (about: "walk a directory")
             (@arg path: +required  "path to walk")
+            (setting: AppSettings::Hidden)
         )
     ).get_matches();
 
