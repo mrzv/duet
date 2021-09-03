@@ -262,9 +262,9 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
                 if let Action::Conflict(lc,rc) = a {
                     println!("{}", a);
                     let choice = loop {
-                        println!("l = update local, r = update remote, c = keep conflict");
+                        println!("l = update local, r = update remote, c = keep conflict, a = abort");
                         let choice = term.read_char()?;
-                        if choice == 'l' || choice == 'r' || choice == 'c' {
+                        if ['l', 'r', 'c', 'a'].contains(&choice) {
                             break choice;
                         }
                     };
@@ -282,6 +282,9 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
                         }
                     } else if choice == 'c' {
                         resolved_actions.push(a.clone());
+                    } else if choice == 'a' {
+                        term.clear_last_lines(1)?;
+                        return Ok(())
                     }
                     term.clear_last_lines(2)?;
                     println!("{}", resolved_actions.last().unwrap());
