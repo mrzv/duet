@@ -74,6 +74,10 @@ impl DirEntryWithMeta {
     pub fn is_dir(&self) -> bool {
         self.is_dir
     }
+
+    pub fn is_file(&self) -> bool {
+        !(self.is_dir || self.is_symlink())
+    }
 }
 
 impl PartialEq for DirEntryWithMeta {

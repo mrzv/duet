@@ -23,7 +23,7 @@ pub fn get_signatures(base: &str, actions: &Vec<Action>) -> Result<Vec<Signature
     let mut signatures: Vec<SignatureWithPath> = Vec::new();
     for action in actions {
         if let Action::Local(Change::Modified(e1, e2)) = action {
-            if !e1.same_contents(&e2) && !e2.is_dir() && !e2.is_symlink() {
+            if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
                 let f = fs::File::open(base_path.join(e1.path()))?;
                 let block = [0; WINDOW];
                 let sig = signature(f, block)?;
@@ -52,19 +52,22 @@ pub fn get_detailed_changes(base: &str, actions: &Vec<Action>, signatures: &Vec<
             match change {
                 Change::Removed(_) => {},
                 Change::Added(e) => {
-                    if !e.is_dir() && !e.is_symlink() {
+                    if e.is_file() {
                         log::debug!("Getting detail for adding {}", e.path());
                         let v = fs::read(base_path.join(e.path()))?;
                         details.push(ChangeDetails::Contents(v));
                     }
                 },
                 Change::Modified(e1,e2) => {
-                    if !e1.same_contents(&e2) && !e2.is_dir() && !e2.is_symlink() {
+                    if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
                         let block = [0; WINDOW];
                         let f = fs::File::open(base_path.join(e1.path()))?;
                         let sig = &sig_iter.next().unwrap().1;
                         let delta = compare(sig, f, block)?;
                         details.push(ChangeDetails::Diff(delta))
+                    } else if !e1.is_file() && e2.is_file() {
+                        let v = fs::read(base_path.join(e2.path()))?;
+                        details.push(ChangeDetails::Contents(v));
                     } // else: permissions or target change
                 }
             }
@@ -80,7 +83,6 @@ pub fn get_detailed_changes(base: &str, actions: &Vec<Action>, signatures: &Vec<
 //    - as a result, the next sync, we get a conflict on the directory
 //  - the correct solution is probably to auto-resolve a directory conflict that stems from
 //    differing mtimes
-//  - currently doesn't
 
 pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<ChangeDetails>, all_old: &mut Vec<Entry>) -> Result<()> {
     let base_path = Path::new(base);
@@ -88,6 +90,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
     let mut details_iter = details.iter();
     let mut new_entries: Vec<Entry> = Vec::new();
     let mut old_iter = all_old.iter().peekable();
+    let mut leftover_details: Vec<&ChangeDetails> = Vec::new();
 
     for action in actions {
         let path = action.path();
@@ -126,52 +129,74 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                     },
                     Change::Added(e) => {
                         let filename = base_path.join(e.path());
-                        let new_entry =
-                            if let Some(p) = e.target() {
-                                std::os::unix::fs::symlink(p, &filename).expect(format!("failed to create symlink {:?} {:?}", p, filename).as_str());
-                                update_meta(&filename, e).expect(format!("failed to update metadata for {:?}", filename).as_str())
-                            } else if e.is_dir() {
-                                fs::create_dir(&filename).expect(format!("failed to create directory {:?}", filename).as_str());
-                                update_meta(&filename, e).expect(format!("failed to update metadata for {:?}", filename).as_str())
-                            } else {
-                                log::debug!("Adding {}", e.path());
-                                let detail = &details_iter.next().unwrap();
-                                let mut f = fs::File::create(&filename)?;
-                                match detail {
-                                    ChangeDetails::Contents(v) => {
-                                        f.write_all(v)?;
-                                    },
-                                    _ => { return Err(eyre!("mismatch when adding {}, expected Contents, but not found", e.path())); }
-                                }
-                                update_meta(&filename, e).expect(format!("failed to update metadata for {:?}", filename).as_str())
-                            };
-                        new_entries.push(new_entry);
+                        if let Some(p) = e.target() {
+                            std::os::unix::fs::symlink(p, &filename).expect(format!("failed to create symlink {:?} {:?}", p, filename).as_str());
+                            new_entries.push(update_meta(&filename, e).expect(format!("failed to update metadata for {:?}", filename).as_str()));
+                        } else if e.is_dir() {
+                            fs::create_dir(&filename).expect(format!("failed to create directory {:?}", filename).as_str());
+                            // new entry gets updated in the second pass, after all the updates in
+                            // the directory are finished
+                        } else {
+                            log::debug!("Adding {}", e.path());
+                            let detail = &details_iter.next().unwrap();
+                            create_file(&filename, &detail).expect(format!("failed to create file {:?}", filename).as_str());
+                            new_entries.push(update_meta(&filename, e).expect(format!("failed to update metadata for {:?}", filename).as_str()));
+                        }
                     },
                     Change::Modified(e1,e2) => {
                         let filename = base_path.join(e2.path());
-                        let new_entry =
-                            if !e1.same_contents(&e2) && !e2.is_dir() && !e2.is_symlink() {
-                                let detail = &details_iter.next().unwrap();
-                                match detail {
-                                    ChangeDetails::Diff(delta) => {
-                                        let block = [0; WINDOW];
-                                        let mut updated = Vec::new();
-                                        restore_seek(&mut updated, fs::File::open(&filename)?, block, &delta)?;
-                                        let mut f = fs::File::create(&filename)?;
-                                        f.write_all(&updated)?;
-                                        update_meta(&filename, e2)?
-                                    },
-                                    _ => { return Err(eyre!("mismatch when adding {}, expected Diff, but not found", e1.path())) }
+                        if e1.is_file() {
+                            if e2.is_file() {
+                                if !e1.same_contents(&e2) {
+                                    let detail = &details_iter.next().unwrap();
+                                    match detail {
+                                        ChangeDetails::Diff(delta) => {
+                                            let block = [0; WINDOW];
+                                            let mut updated = Vec::new();
+                                            restore_seek(&mut updated, fs::File::open(&filename)?, block, &delta)?;
+                                            let mut f = fs::File::create(&filename)?;
+                                            f.write_all(&updated)?;
+                                        },
+                                        _ => { return Err(eyre!("mismatch when adding {}, expected Diff, but not found", e1.path())) }
+                                    }
                                 }
-                            } else {
-                                // TODO: won't work if we go from a directory to a symlink
+                                new_entries.push(update_meta(&filename, e2)?);
+                            } else {    // e2 not a file
+                                // remove the file
+                                fs::remove_file(&filename).expect(format!("failed to remove file {:?}", filename).as_str());
                                 if let Some(p) = e2.target() {
-                                    fs::remove_file(&filename).expect(format!("failed to remove file {:?} when updating symlink", filename).as_str());
                                     std::os::unix::fs::symlink(p, &filename).expect(format!("failed to create symlink {:?} {:?}", p, filename).as_str());
+                                    new_entries.push(update_meta(&filename, e2)?);
+                                } else if e2.is_dir() {
+                                    fs::create_dir(&filename).expect(format!("failed to create directory {:?}", filename).as_str());
+                                } else {
+                                    panic!("Exhausted possibilities for the new entry");
                                 }
-                                update_meta(&filename, e2).expect(format!("failed to update metadata for {:?}", filename).as_str())
-                            };
-                        new_entries.push(new_entry);
+                            }
+                        } else if e1.is_symlink() {
+                            // remove the symlink
+                            fs::remove_file(&filename).expect(format!("failed to remove file {:?}", filename).as_str());
+                            if e2.is_file() {
+                                let detail = &details_iter.next().unwrap();
+                                create_file(&filename, &detail).expect(format!("failed to create file {:?}", filename).as_str());
+                                new_entries.push(update_meta(&filename, e2)?);
+                            } else if let Some(p) = e2.target() {
+                                std::os::unix::fs::symlink(p, &filename).expect(format!("failed to create symlink {:?} {:?}", p, filename).as_str());
+                                new_entries.push(update_meta(&filename, e2)?);
+                            } else if e2.is_dir() {
+                                fs::create_dir(&filename).expect(format!("failed to create directory {:?}", filename).as_str());
+                                // new entry gets updated in the second pass, after all the updates in
+                                // the directory are finished
+                            }
+                        } else if e1.is_dir() {
+                            if e2.is_file() {
+                                // need to save the file contents for after we remove the directory
+                                let detail = &details_iter.next().unwrap();
+                                leftover_details.push(detail);
+                            }
+                        } else {
+                            panic!("Exhausted possibilities for the old entry");
+                        }
                     }
                 }
             },
@@ -204,6 +229,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
     // TODO: think how directory removal interacts with "ignore", if we ever implement it
 
     // second pass, in reverse order, to remove directories and update their metadata
+    let mut details_iter = leftover_details.iter().rev();
     for action in actions.iter().rev() {
         if let Action::Local(change) = action {
             if !change.is_dir() {
@@ -216,11 +242,20 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                 },
                 Change::Added(e) => {
                     let dirname = base_path.join(e.path());
-                    update_meta(&dirname, e)?;
+                    new_entries.push(update_meta(&dirname, e)?);
                 },
-                Change::Modified(_e1,e2) => {
+                Change::Modified(e1,e2) => {
                     let dirname = base_path.join(e2.path());
-                    update_meta(&dirname, e2)?;
+                    if e1.is_dir() && !e2.is_dir() {
+                        fs::remove_dir(&dirname).expect(format!("failed to remove directory {:?}", dirname).as_str());
+                        if let Some(p) = e2.target() {
+                            std::os::unix::fs::symlink(p, &dirname).expect(format!("failed to create symlink {:?} {:?}", p, dirname).as_str());
+                        } else if e2.is_file() {
+                            let detail = details_iter.next().unwrap();
+                            create_file(&dirname, &detail).expect(format!("failed to create file {:?}", dirname).as_str());
+                        }
+                    }
+                    new_entries.push(update_meta(&dirname, e2)?);
                 },
             }
         }
@@ -230,10 +265,22 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
     for e in old_iter {
         new_entries.push(e.clone());
     }
+    new_entries.sort();     // directory -> file or symlink will be out of order, so need to sort them
 
     std::mem::swap(all_old, &mut new_entries);
 
     Ok(())
+}
+
+fn create_file(filename: &Path, detail: &ChangeDetails) -> Result<()> {
+    let mut f = fs::File::create(&filename)?;
+    match detail {
+        ChangeDetails::Contents(v) => {
+            f.write_all(v)?;
+            Ok(())
+        },
+        _ => { Err(eyre!("mismatch when adding {}, expected Contents, but not found", filename.display())) }
+    }
 }
 
 fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {

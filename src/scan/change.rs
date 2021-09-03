@@ -28,7 +28,7 @@ impl Change {
         match self {
             Change::Added(e)    => e.is_dir(),
             Change::Removed(e)  => e.is_dir(),
-            Change::Modified(_e1,e2) => e2.is_dir(),
+            Change::Modified(e1,e2) => e1.is_dir() || e2.is_dir(),
         }
     }
 }
