@@ -76,14 +76,6 @@ pub fn get_detailed_changes(base: &str, actions: &Vec<Action>, signatures: &Vec<
     Ok(details)
 }
 
-// TODO:
-//  - bi-directional changes to a directory:
-//    - when files change in both directions, we get a conflict on the directory
-//    - even when the user resolves the conflict, only one side gets updated
-//    - as a result, the next sync, we get a conflict on the directory
-//  - the correct solution is probably to auto-resolve a directory conflict that stems from
-//    differing mtimes
-
 pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<ChangeDetails>, all_old: &mut Vec<Entry>) -> Result<()> {
     let base_path = Path::new(base);
     log::debug!("details.len() = {}", details.len());

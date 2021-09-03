@@ -38,11 +38,13 @@ pub fn same(x: &Change, y: &Change) -> bool {
         (Change::Removed(_), Change::Removed(_)) => true,
         (Change::Added(d1), Change::Added(d2)) => {
             assert_eq!(d1.path, d2.path);
-            d1.size == d2.size && d1.mtime == d2.mtime && d1.mode == d2.mode && d1.target == d2.target && d1.is_dir == d2.is_dir
+            d1.size == d2.size && d1.mode == d2.mode && d1.target == d2.target && d1.is_dir == d2.is_dir
+                && (d1.is_dir || d1.mtime == d2.mtime)
         },
         (Change::Modified(_,d1), Change::Modified(_,d2)) => {
             assert_eq!(d1.path, d2.path);
-            d1.size == d2.size && d1.mtime == d2.mtime && d1.mode == d2.mode && d1.target == d2.target && d1.is_dir == d2.is_dir
+            d1.size == d2.size && d1.mode == d2.mode && d1.target == d2.target && d1.is_dir == d2.is_dir
+                && (d1.is_dir || d1.mtime == d2.mtime)
         },
         _ => false,
     }
