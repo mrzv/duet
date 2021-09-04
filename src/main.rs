@@ -327,7 +327,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
 
     let local_signatures  = sync::get_signatures(&local_base, &actions).expect("couldn't get local signatures");
     let remote_signatures = remote.get_signatures().expect("couldn't get remote signatures");
-    println!("{} local signatures; {} remote signatures", local_signatures.len(), remote_signatures.len());
+    log::debug!("{} local signatures; {} remote signatures", local_signatures.len(), remote_signatures.len());
 
     let local_detailed_changes  = sync::get_detailed_changes(&local_base, &actions, &remote_signatures).expect("couldn't get local detailed changes");
     let remote_detailed_changes = remote.get_detailed_changes(local_signatures).expect("couldn't get remote detailed changes");
