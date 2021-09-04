@@ -79,10 +79,10 @@ impl fmt::Display for Action {
         match &self {
             // actions are reversed:
             // local action means remote change, and remote action means local change
-            Action::Local(l)        => write!(f, "<---- {}", l),
-            Action::Remote(r)       => write!(f, "----> {}", r),
-            Action::Conflict(l,_r)  => write!(f, "{} {}", "<--->".bright_red(), l),
-            Action::Identical(l,_)  => write!(f, "--I-- {}", l),
+            Action::Local(l)        => write!(f, "  <---- {} {}", l, l.path().display()),
+            Action::Remote(r)       => write!(f, "{} ---->   {}", r, r.path().display()),
+            Action::Conflict(l,r)   => write!(f, "{} {} {} {}", l, "<--->".bright_red(), r, l.path().display()),
+            Action::Identical(l,r)  => write!(f, "{} --I-- {} {}", l, r, l.path().display()),
         }
     }
 }

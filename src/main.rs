@@ -1,4 +1,4 @@
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result,eyre};
 use clap::{clap_app,crate_version,crate_authors,ArgMatches,AppSettings};
 use colored::*;
 
@@ -180,7 +180,7 @@ async fn changes(matches: &ArgMatches<'_>) -> Result<()> {
     let (_, changes) = old_and_changes(&local_base, "", &prf.locations, Some(&statefile)).await?;
 
     for c in changes {
-        println!("{}", c);
+        println!("{} {}", c, c.path().display());
     }
 
     Ok(())
@@ -266,18 +266,29 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
                         println!("l = update local, r = update remote, c = keep conflict, a = abort");
                         let choice = term.read_char()?;
 
-                        // TODO: fix the resolution; need more elaborate matching
                         if choice == 'l' {
                             if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
                                 resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
+                            } else if let (Change::Removed(_lc), Change::Modified(_,rc)) = (lc, rc) {
+                                resolved_actions.push(Action::Local(Change::Added(rc.clone())));
+                            } else if let (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) = (lc, rc) {
+                                resolved_actions.push(Action::Local(Change::Modified(ln.clone(),rn.clone())));
+                            } else if let (Change::Modified(_,_), Change::Removed(rc)) = (lc, rc) {
+                                resolved_actions.push(Action::Local(Change::Removed(rc.clone())));
                             } else {
-                                resolved_actions.push(Action::Local(rc.clone()));
+                                return Err(eyre!("unrecognized possibility during conflict resolution"))
                             }
                         } else if choice == 'r' {
                             if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
                                 resolved_actions.push(Action::Remote(Change::Modified(rc.clone(), lc.clone())));
+                            } else if let (Change::Modified(_,lc), Change::Removed(_rc)) = (lc, rc) {
+                                resolved_actions.push(Action::Remote(Change::Added(lc.clone())));
+                            } else if let (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) = (lc, rc) {
+                                resolved_actions.push(Action::Remote(Change::Modified(rn.clone(),ln.clone())));
+                            } else if let (Change::Removed(lc), Change::Modified(_,_)) = (lc, rc) {
+                                resolved_actions.push(Action::Remote(Change::Removed(lc.clone())));
                             } else {
-                                resolved_actions.push(Action::Remote(lc.clone()));
+                                return Err(eyre!("unrecognized possibility during conflict resolution"))
                             }
                         } else if choice == 'c' {
                             resolved_actions.push(a.clone());

@@ -74,9 +74,9 @@ impl Eq for Change { }
 impl fmt::Display for Change {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self {
-            Change::Added(_)    => write!(f, "{} {}", "+".green(), self.path().display()),
-            Change::Removed(_)  => write!(f, "{} {}", "-".red(), self.path().display()),
-            Change::Modified(_,_) => write!(f, "{} {}", "M".yellow(), self.path().display()),
+            Change::Added(_)      => write!(f, "{}", "+".green()),
+            Change::Removed(_)    => write!(f, "{}", "-".red()),
+            Change::Modified(_,_) => write!(f, "{}", "M".yellow()),
         }
     }
 }
