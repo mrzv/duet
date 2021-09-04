@@ -218,7 +218,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
 
     let remote_changes = remote.changes(path.to_string(), prf.locations, prf.ignore, local_id).expect("Couldn't get remote changes");
 
-    let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
+    let mut actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
                                 .filter_map(|(lc,rc)| Action::create(lc,rc))
                                 .collect();
 
@@ -250,77 +250,68 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         return Ok(())
     }
 
-    let actions = {
-        if num_conflicts == 0 || (batch && force) {
-            actions
-        } else {
-            // not batch
-            use console::Term;
-            let term = Term::stdout();
-            println!("Resolve conflicts:");
-            let mut resolved_actions: Actions = Vec::new();
-            for a in &actions {
-                if let Action::Conflict(lc,rc) = a {
-                    println!("{}", a);
+    if !(num_conflicts == 0 || (batch && force)) {
+        // not batch
+        use console::Term;
+        let term = Term::stdout();
+        println!("Resolve conflicts:");
+        for a in &mut actions {
+            if let Action::Conflict(lc,rc) = &a {
+                println!("{}", a);
 
-                    loop {
-                        println!("l = update local, r = update remote, c = keep conflict, a = abort");
-                        let choice = term.read_char()?;
+                loop {
+                    println!("l = update local, r = update remote, c = keep conflict, a = abort");
+                    let choice = term.read_char()?;
 
-                        if choice == 'l' {
-                            match (lc,rc) {
-                                (Change::Added(lc), Change::Added(rc)) => {
-                                    resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
-                                },
-                                (Change::Removed(_lc), Change::Modified(_,rc)) => {
-                                    resolved_actions.push(Action::Local(Change::Added(rc.clone())));
-                                },
-                                (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
-                                    resolved_actions.push(Action::Local(Change::Modified(ln.clone(),rn.clone())));
-                                },
-                                (Change::Modified(_,ln), Change::Removed(_rc)) => {
-                                    resolved_actions.push(Action::Local(Change::Removed(ln.clone())));
-                                },
-                                _ => unreachable!()
-                            }
-                        } else if choice == 'r' {
-                            match (lc,rc) {
-                                (Change::Added(lc), Change::Added(rc)) => {
-                                    resolved_actions.push(Action::Remote(Change::Modified(rc.clone(), lc.clone())));
-                                },
-                                (Change::Modified(_,lc), Change::Removed(_rc)) => {
-                                    resolved_actions.push(Action::Remote(Change::Added(lc.clone())));
-                                },
-                                (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
-                                    resolved_actions.push(Action::Remote(Change::Modified(rn.clone(),ln.clone())));
-                                },
-                                (Change::Removed(_lc), Change::Modified(_,rn)) => {
-                                    resolved_actions.push(Action::Remote(Change::Removed(rn.clone())));
-                                },
-                                _ => unreachable!()
-                            }
-                        } else if choice == 'c' {
-                            resolved_actions.push(a.clone());
-                        } else if choice == 'a' {
-                            term.clear_last_lines(1)?;
-                            return Ok(())
-                        } else {
-                            // didn't recognize the choice, try again
-                            term.clear_last_lines(1)?;
-                            continue;
+                    if choice == 'l' {
+                        match (lc,rc) {
+                            (Change::Added(lc), Change::Added(rc)) => {
+                                *a = Action::Local(Change::Modified(lc.clone(), rc.clone()));
+                            },
+                            (Change::Removed(_lc), Change::Modified(_,rc)) => {
+                                *a = Action::Local(Change::Added(rc.clone()));
+                            },
+                            (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
+                                *a = Action::Local(Change::Modified(ln.clone(),rn.clone()));
+                            },
+                            (Change::Modified(_,ln), Change::Removed(_rc)) => {
+                                *a = Action::Local(Change::Removed(ln.clone()));
+                            },
+                            _ => unreachable!()
                         }
-                        term.clear_last_lines(2)?;
-                        println!("{}", resolved_actions.last().unwrap());
-                        break;
+                    } else if choice == 'r' {
+                        match (lc,rc) {
+                            (Change::Added(lc), Change::Added(rc)) => {
+                                *a = Action::Remote(Change::Modified(rc.clone(), lc.clone()));
+                            },
+                            (Change::Modified(_,lc), Change::Removed(_rc)) => {
+                                *a = Action::Remote(Change::Added(lc.clone()));
+                            },
+                            (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
+                                *a = Action::Remote(Change::Modified(rn.clone(),ln.clone()));
+                            },
+                            (Change::Removed(_lc), Change::Modified(_,rn)) => {
+                                *a = Action::Remote(Change::Removed(rn.clone()));
+                            },
+                            _ => unreachable!()
+                        }
+                    } else if choice == 'c' {
+                        // keep as is
+                    } else if choice == 'a' {
+                        term.clear_last_lines(1)?;
+                        return Ok(())
+                    } else {
+                        // didn't recognize the choice, try again
+                        term.clear_last_lines(1)?;
+                        continue;
                     }
-                } else {
-                    resolved_actions.push(a.clone());
+                    term.clear_last_lines(2)?;
+                    println!("{}", a);
+                    break;
                 }
             }
-            // resolve conflicts
-            resolved_actions
         }
-    };
+    }
 
     if !batch {
         use dialoguer::Confirm;
