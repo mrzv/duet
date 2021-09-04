@@ -23,7 +23,7 @@ pub use change::{changes,Change};
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
 pub struct DirEntryWithMeta {
-    path:   String,
+    path:   PathBuf,
     size:   u64,
     mtime:  i64,
     ino:    u64,
@@ -40,11 +40,11 @@ impl DirEntryWithMeta {
             && (self.is_dir || self.same_contents(other))
     }
 
-    pub fn starts_with(&self, path: &str) -> bool {
+    pub fn starts_with<P: AsRef<Path>>(&self, path: P) -> bool {
         self.path.starts_with(path)
     }
 
-    pub fn path(&self) -> &str {
+    pub fn path(&self) -> &PathBuf {
         &self.path
     }
 
@@ -189,7 +189,7 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
         // check restriction and crossing the filesystem boundary
         if path.starts_with(&*restrict) && dev == meta.dev() {
             tx.send(DirEntryWithMeta {
-                    path: relative(&*base, &path).to_str().unwrap().to_string(),
+                    path: relative(&*base, &path).to_path_buf(),
                     target: fs::read_link(path).await.map_or(None, |p| Some(p.to_str().unwrap().to_string())),
                     size: meta.size(),
                     mtime: meta.mtime(),

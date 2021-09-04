@@ -16,7 +16,7 @@ use rustsync::{signature,compare,restore_seek};
 const WINDOW: usize = 1024;       // TODO: figure out appropriate window size
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SignatureWithPath(String, Signature);
+pub struct SignatureWithPath(PathBuf, Signature);
 
 pub fn get_signatures(base: &str, actions: &Vec<Action>) -> Result<Vec<SignatureWithPath>> {
     let base_path = Path::new(base);
@@ -27,7 +27,7 @@ pub fn get_signatures(base: &str, actions: &Vec<Action>) -> Result<Vec<Signature
                 let f = fs::File::open(base_path.join(e1.path()))?;
                 let block = [0; WINDOW];
                 let sig = signature(f, block)?;
-                signatures.push(SignatureWithPath(e1.path().to_string(), sig));
+                signatures.push(SignatureWithPath(e1.path().clone(), sig));
             }
         }
     }
@@ -53,7 +53,7 @@ pub fn get_detailed_changes(base: &str, actions: &Vec<Action>, signatures: &Vec<
                 Change::Removed(_) => {},
                 Change::Added(e) => {
                     if e.is_file() {
-                        log::debug!("Getting detail for adding {}", e.path());
+                        log::debug!("Getting detail for adding {}", e.path().display());
                         let v = fs::read(base_path.join(e.path()))?;
                         details.push(ChangeDetails::Contents(v));
                     }
@@ -105,7 +105,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
             }
         }
 
-        log::debug!("applying detailed change to {}", action.path());
+        log::debug!("applying detailed change to {}", action.path().display());
         match action {
             Action::Local(change) => {
                 match change {
@@ -129,7 +129,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                             // new entry gets updated in the second pass, after all the updates in
                             // the directory are finished
                         } else {
-                            log::debug!("Adding {}", e.path());
+                            log::debug!("Adding {}", e.path().display());
                             let detail = &details_iter.next().unwrap();
                             create_file(&filename, &detail).expect(format!("failed to create file {:?}", filename).as_str());
                             new_entries.push(update_meta(&filename, e).expect(format!("failed to update metadata for {:?}", filename).as_str()));
@@ -149,7 +149,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                                             let mut f = fs::File::create(&filename)?;
                                             f.write_all(&updated)?;
                                         },
-                                        _ => { return Err(eyre!("mismatch when adding {}, expected Diff, but not found", e1.path())) }
+                                        _ => { return Err(eyre!("mismatch when adding {}, expected Diff, but not found", e1.path().display())) }
                                     }
                                 }
                                 new_entries.push(update_meta(&filename, e2)?);

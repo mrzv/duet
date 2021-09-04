@@ -261,6 +261,8 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
             for a in &actions {
                 if let Action::Conflict(lc,rc) = a {
                     println!("{}", a);
+
+                    // TODO: simplify the loop
                     let choice = loop {
                         println!("l = update local, r = update remote, c = keep conflict, a = abort");
                         let choice = term.read_char()?;
@@ -268,6 +270,8 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
                             break choice;
                         }
                     };
+
+                    // TODO: fix the resolution; need more elaborate matching
                     if choice == 'l' {
                         if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
                             resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
@@ -517,7 +521,7 @@ async fn walk(matches: &ArgMatches<'_>) -> Result<()> {
     });
 
     while let Some(e) = rx.recv().await {
-        println!("{}", e.path());
+        println!("{}", e.path().display());
     }
     Ok(())
 }

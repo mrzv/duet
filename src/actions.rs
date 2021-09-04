@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::{PathBuf};
 use colored::*;
 use serde::{Serialize,Deserialize};
 use super::scan::change::{Change,same};
@@ -43,7 +44,7 @@ impl Action {
         }
     }
 
-    pub fn path(&self) -> &String {
+    pub fn path(&self) -> &PathBuf {
         match self {
             Action::Local(l) => l.path(),
             Action::Remote(r) => r.path(),

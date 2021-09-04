@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt;
+use std::path::{PathBuf};
 use colored::*;
 
 use serde::{Serialize,Deserialize};
@@ -16,7 +17,7 @@ pub enum Change {
 }
 
 impl Change {
-    pub fn path(&self) -> &String {
+    pub fn path(&self) -> &PathBuf {
         match self {
             Change::Added(dir)    => &dir.path,
             Change::Removed(dir)  => &dir.path,
@@ -73,9 +74,9 @@ impl Eq for Change { }
 impl fmt::Display for Change {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self {
-            Change::Added(_)    => write!(f, "{} {}", "+".green(), self.path()),
-            Change::Removed(_)  => write!(f, "{} {}", "-".red(), self.path()),
-            Change::Modified(_,_) => write!(f, "{} {}", "M".yellow(), self.path()),
+            Change::Added(_)    => write!(f, "{} {}", "+".green(), self.path().display()),
+            Change::Removed(_)  => write!(f, "{} {}", "-".red(), self.path().display()),
+            Change::Modified(_,_) => write!(f, "{} {}", "M".yellow(), self.path().display()),
         }
     }
 }
