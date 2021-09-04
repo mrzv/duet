@@ -262,36 +262,37 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
                 if let Action::Conflict(lc,rc) = a {
                     println!("{}", a);
 
-                    // TODO: simplify the loop
-                    let choice = loop {
+                    loop {
                         println!("l = update local, r = update remote, c = keep conflict, a = abort");
                         let choice = term.read_char()?;
-                        if ['l', 'r', 'c', 'a'].contains(&choice) {
-                            break choice;
-                        }
-                    };
 
-                    // TODO: fix the resolution; need more elaborate matching
-                    if choice == 'l' {
-                        if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
-                            resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
+                        // TODO: fix the resolution; need more elaborate matching
+                        if choice == 'l' {
+                            if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
+                                resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
+                            } else {
+                                resolved_actions.push(Action::Local(rc.clone()));
+                            }
+                        } else if choice == 'r' {
+                            if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
+                                resolved_actions.push(Action::Remote(Change::Modified(rc.clone(), lc.clone())));
+                            } else {
+                                resolved_actions.push(Action::Remote(lc.clone()));
+                            }
+                        } else if choice == 'c' {
+                            resolved_actions.push(a.clone());
+                        } else if choice == 'a' {
+                            term.clear_last_lines(1)?;
+                            return Ok(())
                         } else {
-                            resolved_actions.push(Action::Local(rc.clone()));
+                            // didn't recognize the choice, try again
+                            term.clear_last_lines(1)?;
+                            continue;
                         }
-                    } else if choice == 'r' {
-                        if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
-                            resolved_actions.push(Action::Remote(Change::Modified(rc.clone(), lc.clone())));
-                        } else {
-                            resolved_actions.push(Action::Remote(lc.clone()));
-                        }
-                    } else if choice == 'c' {
-                        resolved_actions.push(a.clone());
-                    } else if choice == 'a' {
-                        term.clear_last_lines(1)?;
-                        return Ok(())
+                        term.clear_last_lines(2)?;
+                        println!("{}", resolved_actions.last().unwrap());
+                        break;
                     }
-                    term.clear_last_lines(2)?;
-                    println!("{}", resolved_actions.last().unwrap());
                 } else {
                     resolved_actions.push(a.clone());
                 }
