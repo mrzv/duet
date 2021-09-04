@@ -261,9 +261,11 @@ dependencies = [
  "env_logger",
  "essrpc",
  "filetime",
+ "fnmatch-regex",
  "futures 0.3.16",
  "log",
  "machine-uid",
+ "regex",
  "rustsync",
  "serde",
  "shellexpand",
@@ -333,6 +335,15 @@ dependencies = [
  "libc",
  "redox_syscall",
  "winapi",
+]
+
+[[package]]
+name = "fnmatch-regex"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4d35c93b50d17d67ae1cd0c0c48b7660e1eedcff50d89e1c45d8df602526119"
+dependencies = [
+ "regex",
 ]
 
 [[package]]

@@ -118,15 +118,16 @@ fn old_entries(fname: &str) -> Entries {
     entries
 }
 
-async fn scan_entries(base: &str, path: &str, locations: &Locations) -> Result<Entries> {
+async fn scan_entries(base: &str, path: &str, locations: &Locations, ignore: &profile::Ignore) -> Result<Entries> {
     let base = base.to_string();
     let path = path.to_string();
     let locations = locations.clone();
+    let ignore = ignore.clone();
 
     let mut entries = tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel(32);
         tokio::spawn(async move {
-            scan::scan(&base, &path, &locations, tx).await
+            scan::scan(&base, &path, &locations, &ignore, tx).await
         });
 
         let mut entries: Entries = Entries::new();
@@ -151,7 +152,7 @@ async fn snapshot(matches: &ArgMatches<'_>) -> Result<()> {
 
     let local_base = shellexpand::full(&prf.local)?.to_string();
 
-    let current_entries: Entries = scan_entries(&local_base, "", &prf.locations).await?;
+    let current_entries: Entries = scan_entries(&local_base, "", &prf.locations, &prf.ignore).await?;
 
     let statefile = if let Some(s) = statefile {
         String::from(s)
@@ -177,7 +178,7 @@ async fn changes(matches: &ArgMatches<'_>) -> Result<()> {
     } else {
         String::from(profile::local_state(name).to_str().unwrap())
     };
-    let (_, changes) = old_and_changes(&local_base, "", &prf.locations, Some(&statefile)).await?;
+    let (_, changes) = old_and_changes(&local_base, "", &prf.locations, &prf.ignore, Some(&statefile)).await?;
 
     for c in changes {
         println!("{} {}", c, c.path().display());
@@ -209,13 +210,13 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let remote_base = shellexpand::full(&prf.remote)?.to_string();
 
     let local_state = profile::local_state(name).to_string_lossy().into_owned();
-    let (mut local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, Some(&local_state)).await?;
+    let (mut local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, &prf.ignore, Some(&local_state)).await?;
 
     let mut server = launch_server();
     let mut remote = get_remote(&mut server);
     remote.set_base(remote_base)?;
 
-    let remote_changes = remote.changes(path.to_string(), prf.locations, local_id).expect("Couldn't get remote changes");
+    let remote_changes = remote.changes(path.to_string(), prf.locations, prf.ignore, local_id).expect("Couldn't get remote changes");
 
     let actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
                                 .filter_map(|(lc,rc)| Action::create(lc,rc))
@@ -384,7 +385,7 @@ use sync::{SignatureWithPath,ChangeDetails};
 pub trait DuetServer {
     fn set_base(&mut self, base: String) -> Result<(), RPCError>;
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError>;
-    fn changes(&mut self, path: String, locations: Locations, remote_id: String) -> Result<Changes, RPCError>;
+    fn changes(&mut self, path: String, locations: Locations, ignore: profile::Ignore, remote_id: String) -> Result<Changes, RPCError>;
     fn get_signatures(&self) -> Result<Vec<SignatureWithPath>, RPCError>;
     fn get_detailed_changes(&self, signatures: Vec<SignatureWithPath>) -> Result<Vec<sync::ChangeDetails>, RPCError>;
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError>;
@@ -421,11 +422,11 @@ impl DuetServer for DuetServerImpl {
         Ok(())
     }
 
-    fn changes(&mut self, path: String, locations: Locations, remote_id: String) -> Result<Changes, RPCError> {
+    fn changes(&mut self, path: String, locations: Locations, ignore: profile::Ignore, remote_id: String) -> Result<Changes, RPCError> {
         log::debug!("remote id = {}", remote_id);
         self.remote_id = remote_id;
         let future = async move {
-            let result = old_and_changes(&self.base, &path, &locations, Some(profile::remote_state(&self.remote_id).to_str().unwrap())).await;
+            let result = old_and_changes(&self.base, &path, &locations, &ignore, Some(profile::remote_state(&self.remote_id).to_str().unwrap())).await;
             match result {
                 Ok((all_old, changes)) => {
                     self.all_old = all_old;
@@ -494,8 +495,8 @@ async fn server() -> Result<()> {
     Ok(())
 }
 
-async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, statefile: Option<&str>) -> Result<(Entries, Changes)> {
-    let restricted_current_scan = scan_entries(base, restrict, locations);
+async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, ignore: &profile::Ignore, statefile: Option<&str>) -> Result<(Entries, Changes)> {
+    let restricted_current_scan = scan_entries(base, restrict, locations, ignore);
 
     let all_old_entries: Entries =
         if let Some(f) = statefile {
@@ -529,7 +530,7 @@ async fn walk(matches: &ArgMatches<'_>) -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel(1024);
     tokio::spawn(async move {
-        scan::scan(path, "", &locations, tx).await
+        scan::scan(path, "", &locations, &Vec::new(), tx).await
     });
 
     while let Some(e) = rx.recv().await {

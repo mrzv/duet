@@ -6,12 +6,14 @@ use shellexpand;
 
 use crate::scan::location::{Location,Locations};
 
+pub type Ignore = Vec<String>;
+
 #[derive(Debug)]
 pub struct Profile {
     pub local:      String,
     pub remote:     String,
     pub locations:  Locations,
-    pub ignore:     Vec<String>,
+    pub ignore:     Ignore,
 }
 
 pub fn location(name: &str) -> PathBuf {

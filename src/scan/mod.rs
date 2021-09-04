@@ -12,8 +12,21 @@ use std::sync::Arc;
 
 use log;
 
-//use glob;
-// TODO: incorporate ignore
+use crate::profile::{Ignore};
+use regex::{Regex};
+pub type Regexes = Vec<Regex>;
+fn is_match(regexes: &Regexes, p: &Path) -> bool {
+    if let Some(s) = p.file_name() {
+        if let Some(s) = s.to_str() {
+            for r in regexes {
+                if r.is_match(s) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 pub mod location;
 pub mod change;
@@ -151,7 +164,7 @@ fn find_parent<'a>(path: &PathBuf, locations: &'a Locations, pft: &ParentFromTo)
     &locations[parent]
 }
 
-async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
+async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
     // check the restriction
     if !path.starts_with(&*restrict) && !restrict.starts_with(&path) {
         log::trace!("Skipping (restriction): {:?} vs {:?}", path, restrict);
@@ -174,6 +187,12 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
     let mut dir = fs::read_dir(path).await.expect("Couldn't read the directory");
     while let Some(child) = dir.next_entry().await.expect("Couldn't read the next directory entry") {
         let path = child.path();
+
+        if is_match(&ignore, &path) {
+            log::trace!("Skipping (ignored): {:?}", path);
+            continue;
+        }
+
         let meta = fs::symlink_metadata(&path).await.expect("Couldn't get metadata");
 
         if meta.is_dir() && dev == meta.dev() {
@@ -200,21 +219,22 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
         }
     }
 
-    scan_children(child_dirs, locations, restrict, base, pft, dev, tx, s.clone())?;
+    scan_children(child_dirs, locations, restrict, base, ignore, pft, dev, tx, s.clone())?;
 
     Ok(())
 }
 
-fn scan_children(children: Vec<PathBuf>, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
+fn scan_children(children: Vec<PathBuf>, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
     for path in children {
         let locations = locations.clone();
         let restrict = restrict.clone();
         let base = base.clone();
+        let ignore = ignore.clone();
         let pft = pft.clone();
         let tx = tx.clone();
         let s = s.clone();
         tokio::spawn(async move {
-            scan_dir(path, locations, restrict, base, pft, dev, tx, s).await
+            scan_dir(path, locations, restrict, base, ignore, pft, dev, tx, s).await
         });
     }
     Ok(())
@@ -228,7 +248,7 @@ fn scan_children(children: Vec<PathBuf>, locations: Arc<Locations>, restrict: Ar
 /// * `path` - restriction under base, which should be scanned
 /// * `locations` - [locations](Locations) to scan
 /// * `tx` - [Sender](mpsc::Sender) of the channel, where to send the [directory entries](DirEntryWithMeta)
-pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &Locations, tx: mpsc::Sender<DirEntryWithMeta>) -> Result<()> {
+pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &Locations, ignore: &Ignore, tx: mpsc::Sender<DirEntryWithMeta>) -> Result<()> {
     let base = PathBuf::from(base.as_ref());
     let mut restrict = Arc::new(PathBuf::from(&base));
     (*Arc::get_mut(&mut restrict).unwrap()).push(path);
@@ -240,11 +260,19 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &
     let mut locations: Arc<Locations> = Arc::new(locations.iter().map(|l| l.prefix(&base)).collect());
     (*Arc::get_mut(&mut locations).unwrap()).sort();
 
+    // build ignore regex
+    use fnmatch_regex::glob_to_regex;
+    let mut ignore_regex: Regexes = Vec::new();
+    for p in ignore {
+        ignore_regex.push(glob_to_regex(p).unwrap());
+    }
+    let ignore = Arc::new(ignore_regex.clone());
+
     let s = Arc::new(Semaphore::new(64));
 
     let path = (*base).clone();
     let to = locations.len() - 1;
-    scan_dir(path, locations, restrict, base, ParentFromTo { parent: 0, from: 0, to: to }, dev, tx, s).await?;
+    scan_dir(path, locations, restrict, base, ignore, ParentFromTo { parent: 0, from: 0, to: to }, dev, tx, s).await?;
 
     Ok(())
 }
