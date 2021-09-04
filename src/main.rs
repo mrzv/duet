@@ -1,4 +1,4 @@
-use color_eyre::eyre::{Result};
+use color_eyre::eyre::{Result,eyre};
 use clap::{clap_app,crate_version,crate_authors,ArgMatches,AppSettings};
 use colored::*;
 
@@ -193,6 +193,26 @@ fn info(matches: &ArgMatches<'_>) -> Result<()> {
     Ok(())
 }
 
+fn parse_remote(remote: &String) -> Result<(String, Option<String>, String)> {
+    let elements: Vec<&str> = remote.split_whitespace().collect();
+    let (remote_server, i) =
+        if elements[0] == "ssh" {
+            (Some(elements[1].to_string()), 2)
+        } else {
+            (None, 0)
+        };
+    let (remote_cmd, remote_base, i) =
+        if i == elements.len() - 1 {
+            ("duet".to_string(), elements[i].to_string(), i+1)
+        } else {
+            (elements[i].to_string(), elements[i+1].to_string(), i+2)
+        };
+    if i < elements.len() {
+        eyre!("Couldn't parse remote, elements remaining");
+    }
+    Ok((remote_base, remote_server, remote_cmd))
+}
+
 async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let name = matches.value_of("profile").unwrap();
     let dry_run = matches.is_present("dry_run");
@@ -207,12 +227,12 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let local_id = local_id(name);
 
     let local_base = shellexpand::full(&prf.local)?.to_string();
-    let remote_base = shellexpand::full(&prf.remote)?.to_string();
+    let (remote_base, remote_server, remote_cmd) = parse_remote(&prf.remote)?;
 
     let local_state = profile::local_state(name).to_string_lossy().into_owned();
     let (mut local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, &prf.ignore, Some(&local_state)).await?;
 
-    let mut server = launch_server();
+    let mut server = launch_server(remote_server, remote_cmd);
     let mut remote = get_remote(&mut server);
     remote.set_base(remote_base)?;
 
@@ -353,15 +373,16 @@ fn local_id(name: &str) -> String {
     format!("{:x}", s.finish())
 }
 
-fn launch_server() -> Child {
+fn launch_server(server: Option<String>, cmd: String) -> Child {
     // launch server
-    let server = Command::new("target/debug/duet")       // TODO: need a better way to find the command
+    let cmd = shellexpand::full(&cmd).expect("Failed to expand command").to_string();
+    let server = Command::new(cmd)
         .arg("server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("Failed to spawn child process");
+        .expect("Failed to spawn remote server");
 
     log::trace!("launched server");
 
@@ -412,7 +433,11 @@ impl DuetServerImpl {
 
 impl DuetServer for DuetServerImpl {
     fn set_base(&mut self, base: String) -> Result<(), RPCError> {
-        self.base = base;
+        self.base =
+            match shellexpand::full(&base) {
+                Ok(s) => s.to_string(),
+                Err(_) => { return Err(RPCError::new(RPCErrorKind::Other, "cannot expand base path, when setting remote base")); },
+            };
         Ok(())
     }
 
