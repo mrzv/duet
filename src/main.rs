@@ -1,4 +1,4 @@
-use color_eyre::eyre::{Result,eyre};
+use color_eyre::eyre::{Result};
 use clap::{clap_app,crate_version,crate_authors,ArgMatches,AppSettings};
 use colored::*;
 
@@ -268,28 +268,36 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
                         let choice = term.read_char()?;
 
                         if choice == 'l' {
-                            if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
-                                resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
-                            } else if let (Change::Removed(_lc), Change::Modified(_,rc)) = (lc, rc) {
-                                resolved_actions.push(Action::Local(Change::Added(rc.clone())));
-                            } else if let (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) = (lc, rc) {
-                                resolved_actions.push(Action::Local(Change::Modified(ln.clone(),rn.clone())));
-                            } else if let (Change::Modified(_,_), Change::Removed(rc)) = (lc, rc) {
-                                resolved_actions.push(Action::Local(Change::Removed(rc.clone())));
-                            } else {
-                                return Err(eyre!("unrecognized possibility during conflict resolution"))
+                            match (lc,rc) {
+                                (Change::Added(lc), Change::Added(rc)) => {
+                                    resolved_actions.push(Action::Local(Change::Modified(lc.clone(), rc.clone())));
+                                },
+                                (Change::Removed(_lc), Change::Modified(_,rc)) => {
+                                    resolved_actions.push(Action::Local(Change::Added(rc.clone())));
+                                },
+                                (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
+                                    resolved_actions.push(Action::Local(Change::Modified(ln.clone(),rn.clone())));
+                                },
+                                (Change::Modified(_,ln), Change::Removed(_rc)) => {
+                                    resolved_actions.push(Action::Local(Change::Removed(ln.clone())));
+                                },
+                                _ => unreachable!()
                             }
                         } else if choice == 'r' {
-                            if let (Change::Added(lc), Change::Added(rc)) = (lc, rc) {
-                                resolved_actions.push(Action::Remote(Change::Modified(rc.clone(), lc.clone())));
-                            } else if let (Change::Modified(_,lc), Change::Removed(_rc)) = (lc, rc) {
-                                resolved_actions.push(Action::Remote(Change::Added(lc.clone())));
-                            } else if let (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) = (lc, rc) {
-                                resolved_actions.push(Action::Remote(Change::Modified(rn.clone(),ln.clone())));
-                            } else if let (Change::Removed(lc), Change::Modified(_,_)) = (lc, rc) {
-                                resolved_actions.push(Action::Remote(Change::Removed(lc.clone())));
-                            } else {
-                                return Err(eyre!("unrecognized possibility during conflict resolution"))
+                            match (lc,rc) {
+                                (Change::Added(lc), Change::Added(rc)) => {
+                                    resolved_actions.push(Action::Remote(Change::Modified(rc.clone(), lc.clone())));
+                                },
+                                (Change::Modified(_,lc), Change::Removed(_rc)) => {
+                                    resolved_actions.push(Action::Remote(Change::Added(lc.clone())));
+                                },
+                                (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
+                                    resolved_actions.push(Action::Remote(Change::Modified(rn.clone(),ln.clone())));
+                                },
+                                (Change::Removed(_lc), Change::Modified(_,rn)) => {
+                                    resolved_actions.push(Action::Remote(Change::Removed(rn.clone())));
+                                },
+                                _ => unreachable!()
                             }
                         } else if choice == 'c' {
                             resolved_actions.push(a.clone());
