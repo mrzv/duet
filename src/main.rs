@@ -9,7 +9,7 @@ mod scan;
 mod utils;
 mod actions;
 mod sync;
-use actions::{Action,num_conflicts,reverse};
+use actions::{Action,Actions,num_conflicts,num_identical,reverse};
 use scan::location::{Locations};
 use scan::{Change,DirEntryWithMeta};
 
@@ -24,7 +24,6 @@ use std::process::{Command, Stdio, Child, ChildStdin, ChildStdout};
 
 type Entries = Vec<DirEntryWithMeta>;
 type Changes = Vec<Change>;
-type Actions = Vec<Action>;
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
@@ -39,6 +38,7 @@ pub async fn main() -> Result<()> {
             (about: "synchronize according to profile")
             (@arg profile: +required "profile to synchronize")
             (@arg path:              "path to synchronize")
+            (@arg interactive: -i    "interactive conflict resolution")
             (@arg dry_run: -n        "don't apply changes")
             (@arg batch: -b          "run as a batch (abort on conflict)")
             (@arg force: -f          "in batch mode, apply what's possible, even if there are conflicts")
@@ -219,6 +219,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let batch = matches.is_present("batch");
     let force = matches.is_present("force");
     let verbose = matches.is_present("verbose");
+    let interactive = matches.is_present("interactive");
     let path = matches.value_of("path").unwrap_or("");
 
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
@@ -247,98 +248,36 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         return Ok(())
     }
 
-    let mut num_identical = 0;
-    for a in &actions {
-        if verbose || !a.is_identical() {
-            println!("{}", a);
-        }
-        if a.is_identical() {
-            num_identical += 1;
-        }
-    }
-    if !verbose && num_identical > 0 {
-        println!("Skipped {} identical changes (use --verbose to show all)", num_identical);
-    }
-
     if dry_run {
+        show_actions(&actions, verbose);
         return Ok(())
     }
 
     let num_conflicts = num_conflicts(&actions);
-    if batch && num_conflicts > 0 && !force {
-        println!("{} conflicts found; {}\n", num_conflicts, "aborting".bright_red());
-        return Ok(())
-    }
 
-    if !(num_conflicts == 0 || (batch && force)) {
-        // not batch
-        use console::Term;
-        let term = Term::stdout();
-        println!("Resolve conflicts:");
-        for a in &mut actions {
-            if let Action::Conflict(lc,rc) = &a {
-                println!("{}", a);
-
-                loop {
-                    println!("l = update local, r = update remote, c = keep conflict, a = abort");
-                    let choice = term.read_char()?;
-
-                    if choice == 'l' {
-                        match (lc,rc) {
-                            (Change::Added(lc), Change::Added(rc)) => {
-                                *a = Action::Local(Change::Modified(lc.clone(), rc.clone()));
-                            },
-                            (Change::Removed(_lc), Change::Modified(_,rc)) => {
-                                *a = Action::Local(Change::Added(rc.clone()));
-                            },
-                            (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
-                                *a = Action::Local(Change::Modified(ln.clone(),rn.clone()));
-                            },
-                            (Change::Modified(_,ln), Change::Removed(_rc)) => {
-                                *a = Action::Local(Change::Removed(ln.clone()));
-                            },
-                            _ => unreachable!()
-                        }
-                    } else if choice == 'r' {
-                        match (lc,rc) {
-                            (Change::Added(lc), Change::Added(rc)) => {
-                                *a = Action::Remote(Change::Modified(rc.clone(), lc.clone()));
-                            },
-                            (Change::Modified(_,lc), Change::Removed(_rc)) => {
-                                *a = Action::Remote(Change::Added(lc.clone()));
-                            },
-                            (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
-                                *a = Action::Remote(Change::Modified(rn.clone(),ln.clone()));
-                            },
-                            (Change::Removed(_lc), Change::Modified(_,rn)) => {
-                                *a = Action::Remote(Change::Removed(rn.clone()));
-                            },
-                            _ => unreachable!()
-                        }
-                    } else if choice == 'c' {
-                        // keep as is
-                    } else if choice == 'a' {
-                        term.clear_last_lines(1)?;
-                        return Ok(())
-                    } else {
-                        // didn't recognize the choice, try again
-                        term.clear_last_lines(1)?;
-                        continue;
-                    }
-                    term.clear_last_lines(2)?;
-                    println!("{}", a);
-                    break;
-                }
+    let resolution =
+        if batch {
+            show_actions(&actions, verbose);
+            if force {
+                AllResolution::Force
+            } else if num_conflicts > 0 {
+                println!("{} conflicts found; {}\n", num_conflicts, "aborting".bright_red());
+                AllResolution::Abort
+            } else {
+                AllResolution::Proceed
             }
-        }
-    }
+        } else if interactive {
+            let resolution = resolve_interactive(&mut actions, verbose)?;
+            show_actions(&actions, verbose);
+            resolution
+        } else {
+            show_actions(&actions, verbose);
+            resolve_sequential(&mut actions, verbose)?
+        };
 
-    if !batch {
-        use dialoguer::Confirm;
-
-        if !Confirm::new().with_prompt("Do you want to continue?").interact()? {
-            return Ok(());
-        }
+    if let AllResolution::Abort = resolution {
+        println!("Aborting");
+        return Ok(());
     }
 
     let actions: Actions = actions.into_iter().filter(|a| !a.is_conflict()).collect();
@@ -373,7 +312,8 @@ fn local_id(name: &str) -> String {
     format!("{:x}", s.finish())
 }
 
-fn launch_server(server: Option<String>, cmd: String) -> Child {
+// TODO: switch to tokio::process::Command; need to support async interface for openssh
+fn launch_server(_server: Option<String>, cmd: String) -> Child {
     // launch server
     let cmd = shellexpand::full(&cmd).expect("Failed to expand command").to_string();
     let server = Command::new(cmd)
@@ -561,4 +501,289 @@ async fn walk(matches: &ArgMatches<'_>) -> Result<()> {
         println!("{}", e.path().display());
     }
     Ok(())
+}
+
+enum Resolution {
+    Local,
+    Remote,
+}
+
+fn resolve_action(action: &Action, resolution: Resolution) -> Action {
+    if let Action::Conflict(lc,rc) = action {
+        match resolution {
+            Resolution::Local =>
+                match (lc,rc) {
+                    (Change::Added(lc), Change::Added(rc)) => {
+                        Action::Local(Change::Modified(lc.clone(), rc.clone()))
+                    },
+                    (Change::Removed(_lc), Change::Modified(_,rc)) => {
+                        Action::Local(Change::Added(rc.clone()))
+                    },
+                    (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
+                        Action::Local(Change::Modified(ln.clone(),rn.clone()))
+                    },
+                    (Change::Modified(_,ln), Change::Removed(_rc)) => {
+                        Action::Local(Change::Removed(ln.clone()))
+                    },
+                    _ => unreachable!()
+                },
+            Resolution::Remote =>
+                match (lc,rc) {
+                    (Change::Added(lc), Change::Added(rc)) => {
+                        Action::Remote(Change::Modified(rc.clone(), lc.clone()))
+                    },
+                    (Change::Modified(_,lc), Change::Removed(_rc)) => {
+                        Action::Remote(Change::Added(lc.clone()))
+                    },
+                    (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
+                        Action::Remote(Change::Modified(rn.clone(),ln.clone()))
+                    },
+                    (Change::Removed(_lc), Change::Modified(_,rn)) => {
+                        Action::Remote(Change::Removed(rn.clone()))
+                    },
+                    _ => unreachable!()
+                },
+        }
+    } else {
+        action.clone()
+    }
+}
+
+fn show_actions(actions: &Actions, verbose: bool) {
+    let num_identical = num_identical(&actions);
+    for a in actions {
+        if verbose || !a.is_identical() {
+            println!("{}", a);
+        }
+    }
+    if !verbose && num_identical > 0 {
+        println!("Skipped {} identical changes (use --verbose to show all)", num_identical);
+    }
+}
+
+enum AllResolution {
+    Proceed,
+    Abort,
+    Force,
+}
+
+fn resolve_sequential(actions: &mut Actions, _verbose: bool) -> Result<AllResolution> {
+    // not batch
+    use console::{Key,Term};
+    let term = Term::stdout();
+    if num_conflicts(actions) > 0 {
+        term.write_line("Resolve conflicts:")?;
+
+        for a in actions {
+            if let Action::Conflict(_,_) = &a {
+                term.write_line(format!("{}", a).as_str())?;
+
+                loop {
+                    term.write_line("left/l = update local, right/r = update remote, c = keep conflict, n/a = abort")?;
+                    match term.read_key()? {
+                        Key::ArrowLeft | Key::Char('l') => {
+                            *a = resolve_action(&a, Resolution::Local);
+                        }
+                        Key::ArrowRight | Key::Char('r') => {
+                            *a = resolve_action(&a, Resolution::Remote);
+                        }
+                        Key::Char('c') => {
+                            // keep as is
+                        }
+                        Key::Char('a') => {
+                            term.clear_last_lines(1)?;
+                            return Ok(AllResolution::Abort);
+                        }
+                        _ => {
+                            // didn't recognize the choice, try again
+                            term.clear_last_lines(1)?;
+                            continue;
+                        }
+                    }
+                    term.clear_last_lines(2)?;
+                    term.write_line(format!("{}", a).as_str())?;
+                    break;
+                }
+            }
+        }
+    }
+
+    use dialoguer::Confirm;
+    if !Confirm::new().with_prompt("Do you want to continue?").interact()? {
+        Ok(AllResolution::Abort)
+    } else {
+        Ok(AllResolution::Proceed)
+    }
+}
+
+fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolution> {
+    // Taken from dialoguer::prompts::Select::interact_on()
+    // The MIT License (MIT)
+    // Copyright (c) 2017 Armin Ronacher <armin.ronacher@active-4.com>
+
+    use console::{Key,Term};
+    use std::ops::Rem;
+    let term = Term::stderr();
+
+    let mut page = 0;
+
+    assert!(!actions.is_empty());
+
+    let capacity = term.size().0 as usize - 2;      // extra -1 for the prompt
+    let pages = ((actions.len() - (if verbose { 0 } else { num_identical(actions) })) as f64 / capacity as f64).ceil() as usize;
+
+    let mut sel = 0;
+    let mut height = 0;
+    let mut num_conflicts = num_conflicts(&actions);
+
+    let mut resolved: Vec<(&mut Action, Option<Action>)> = Vec::new();
+    for a in actions {
+        resolved.push((a, None));
+    }
+
+    let resolution = loop {
+        term.write_line(format!("{}{}n/a = abort, f = force{} [{}]",
+                    if num_conflicts == 0 { "y/g = proceed".bright_green() } else { "".normal() },
+                    if num_conflicts == 0 { ", ".normal() } else { "".normal() },
+                    if let Action::Conflict(_,_) = resolved[sel].0 { ", left/l = update local, right/r = update remote, c = keep conflict" } else { "" },
+                    num_conflicts).as_str())?;
+        height += 1;
+
+        for (idx, (original,resolved)) in resolved
+            .iter()
+            .enumerate()
+            .skip(page * capacity)
+            .take(capacity)
+        {
+            let action = if let Some(a) = resolved { a } else { original };
+            if verbose || !action.is_identical() {
+                term.write_line(format!("{} {} {}",
+                         (if sel == idx { ">" } else {" "}).cyan(),
+                         if let Action::Conflict(_,_) = original { "c" } else { " " },
+                         action).as_str())?;
+                height += 1;
+            }
+        }
+
+        term.hide_cursor()?;
+        term.flush()?;
+
+        match term.read_key()? {
+            Key::ArrowDown | Key::Char('j') => {
+                loop {
+                    sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
+                    if verbose || !resolved[sel].0.is_identical() {
+                        break;
+                    }
+                };
+            }
+            Key::ArrowUp | Key::Char('k') => {
+                loop {
+                    sel = ((sel as i64 - 1 + resolved.len() as i64)
+                        % (resolved.len() as i64)) as usize;
+                    if verbose || !resolved[sel].0.is_identical() {
+                        break;
+                    }
+                };
+            }
+            Key::Tab => {       // go to next conflict
+                loop {
+                    sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
+                    if resolved[sel].0.is_conflict() {
+                        break;
+                    }
+                };
+            }
+            Key::BackTab => {   // go to previous conflict
+                loop {
+                    sel = ((sel as i64 - 1 + resolved.len() as i64)
+                        % (resolved.len() as i64)) as usize;
+                    if let Action::Conflict(_,_) = resolved[sel].0 {
+                        break;
+                    }
+                };
+            }
+            Key::ArrowLeft | Key::Char('l') => {
+                if resolved[sel].0.is_conflict() {
+                    if resolved[sel].1.is_none() {
+                        num_conflicts -= 1;
+                    }
+                    resolved[sel].1 = Some(resolve_action(&resolved[sel].0, Resolution::Local));
+                }
+                sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
+            }
+            Key::ArrowRight | Key::Char('r') => {
+                if let Action::Conflict(_,_) = resolved[sel].0 {
+                    if resolved[sel].1.is_none() {
+                        num_conflicts -= 1;
+                    }
+                    resolved[sel].1 = Some(resolve_action(&resolved[sel].0, Resolution::Remote));
+                }
+                sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
+            }
+            Key::Char('c') => {
+                if resolved[sel].0.is_conflict() {
+                    if resolved[sel].1.is_some() {
+                        resolved[sel].1 = None;
+                        num_conflicts += 1;
+                    }
+                }
+                sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
+            }
+            Key::PageUp => {
+                if page == 0 {
+                    page = pages - 1;
+                } else {
+                    page -= 1;
+                }
+
+                sel = page * capacity;
+            }
+            Key::PageDown => {
+                if page == pages - 1 {
+                    page = 0;
+                } else {
+                    page += 1;
+                }
+
+                sel = page * capacity;
+            }
+
+            Key::Char('y') | Key::Char('g') if num_conflicts == 0 => {
+                break AllResolution::Proceed;
+            }
+
+            Key::Escape | Key::Char('a') | Key::Char('n') => {
+                break AllResolution::Abort;
+            }
+
+            Key::Char('f') => {
+                break AllResolution::Force;
+            }
+
+            _ => { }
+        }
+
+        if sel < page * capacity || sel >= (page + 1) * capacity {
+            page = sel / capacity;
+        }
+
+        term.clear_last_lines(height)?;
+        height = 0;
+    };
+
+    term.clear_last_lines(height)?;
+    term.show_cursor()?;
+    term.flush()?;
+
+    // copy resolved actions
+    if let AllResolution::Abort = resolution {
+        for (a, r) in resolved {
+            if let Some(ra) = r {
+                *a = ra;
+            }
+        }
+    }
+
+    Ok(resolution)
 }

@@ -12,6 +12,8 @@ pub enum Action {
     Identical(Change,Change),       // need for bookkeeping
 }
 
+pub type Actions = Vec<Action>;
+
 impl Action {
     pub fn create(loc: Option<&Change>, roc: Option<&Change>) -> Option<Action> {
         match (loc,roc) {
@@ -58,6 +60,15 @@ pub fn num_conflicts(actions: &Vec<Action>) -> usize {
     actions.iter()
         .filter(|a| match a {
             Action::Conflict(_,_) => true,
+            _ => false
+        })
+        .count()
+}
+
+pub fn num_identical(actions: &Vec<Action>) -> usize {
+    actions.iter()
+        .filter(|a| match a {
+            Action::Identical(_,_) => true,
             _ => false
         })
         .count()
