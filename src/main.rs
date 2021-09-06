@@ -280,7 +280,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         return Ok(());
     }
 
-    let actions: Actions = actions.into_iter().filter(|a| !a.is_conflict()).collect();
+    let actions: Actions = actions.into_iter().filter(|a| !a.is_unresolved_conflict()).collect();
     let remote_actions: Actions = reverse(&actions);
     remote.set_actions(remote_actions)?;
 
