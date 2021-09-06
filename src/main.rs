@@ -9,7 +9,7 @@ mod scan;
 mod utils;
 mod actions;
 mod sync;
-use actions::{Action,Actions,num_conflicts,num_identical,reverse};
+use actions::{Action,Actions,num_unresolved_conflicts,num_identical,reverse};
 use scan::location::{Locations};
 use scan::{Change,DirEntryWithMeta};
 
@@ -253,7 +253,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         return Ok(())
     }
 
-    let num_conflicts = num_conflicts(&actions);
+    let num_conflicts = num_unresolved_conflicts(&actions);
 
     let resolution =
         if batch {
@@ -509,43 +509,44 @@ enum Resolution {
 }
 
 fn resolve_action(action: &Action, resolution: Resolution) -> Action {
-    if let Action::Conflict(lc,rc) = action {
-        match resolution {
-            Resolution::Local =>
-                match (lc,rc) {
-                    (Change::Added(lc), Change::Added(rc)) => {
-                        Action::Local(Change::Modified(lc.clone(), rc.clone()))
+    match action {
+        Action::Conflict(lc,rc) | Action::ResolvedLocal((lc,rc),_) | Action::ResolvedRemote((lc,rc),_) => {
+            match resolution {
+                Resolution::Local =>
+                    match (lc,rc) {
+                        (Change::Added(ln), Change::Added(rn)) => {
+                            Action::ResolvedLocal((lc.clone(),rc.clone()),Change::Modified(ln.clone(), rn.clone()))
+                        },
+                        (Change::Removed(_), Change::Modified(_,rn)) => {
+                            Action::ResolvedLocal((lc.clone(),rc.clone()),Change::Added(rn.clone()))
+                        },
+                        (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
+                            Action::ResolvedLocal((lc.clone(),rc.clone()),Change::Modified(ln.clone(),rn.clone()))
+                        },
+                        (Change::Modified(_,ln), Change::Removed(_)) => {
+                            Action::ResolvedLocal((lc.clone(),rc.clone()),Change::Removed(ln.clone()))
+                        },
+                        _ => unreachable!()
                     },
-                    (Change::Removed(_lc), Change::Modified(_,rc)) => {
-                        Action::Local(Change::Added(rc.clone()))
+                Resolution::Remote =>
+                    match (lc,rc) {
+                        (Change::Added(ln), Change::Added(rn)) => {
+                            Action::ResolvedRemote((lc.clone(),rc.clone()),Change::Modified(rn.clone(), ln.clone()))
+                        },
+                        (Change::Modified(_,ln), Change::Removed(_rn)) => {
+                            Action::ResolvedRemote((lc.clone(),rc.clone()),Change::Added(ln.clone()))
+                        },
+                        (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
+                            Action::ResolvedRemote((lc.clone(),rc.clone()),Change::Modified(rn.clone(),ln.clone()))
+                        },
+                        (Change::Removed(_ln), Change::Modified(_,rn)) => {
+                            Action::ResolvedRemote((lc.clone(),rc.clone()),Change::Removed(rn.clone()))
+                        },
+                        _ => unreachable!()
                     },
-                    (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
-                        Action::Local(Change::Modified(ln.clone(),rn.clone()))
-                    },
-                    (Change::Modified(_,ln), Change::Removed(_rc)) => {
-                        Action::Local(Change::Removed(ln.clone()))
-                    },
-                    _ => unreachable!()
-                },
-            Resolution::Remote =>
-                match (lc,rc) {
-                    (Change::Added(lc), Change::Added(rc)) => {
-                        Action::Remote(Change::Modified(rc.clone(), lc.clone()))
-                    },
-                    (Change::Modified(_,lc), Change::Removed(_rc)) => {
-                        Action::Remote(Change::Added(lc.clone()))
-                    },
-                    (Change::Modified(_lo,ln), Change::Modified(_ro,rn)) => {
-                        Action::Remote(Change::Modified(rn.clone(),ln.clone()))
-                    },
-                    (Change::Removed(_lc), Change::Modified(_,rn)) => {
-                        Action::Remote(Change::Removed(rn.clone()))
-                    },
-                    _ => unreachable!()
-                },
-        }
-    } else {
-        action.clone()
+            }
+        },
+        _ => { action.clone() }
     }
 }
 
@@ -561,6 +562,7 @@ fn show_actions(actions: &Actions, verbose: bool) {
     }
 }
 
+#[derive(Debug)]
 enum AllResolution {
     Proceed,
     Abort,
@@ -571,7 +573,7 @@ fn resolve_sequential(actions: &mut Actions, _verbose: bool) -> Result<AllResolu
     // not batch
     use console::{Key,Term};
     let term = Term::stdout();
-    if num_conflicts(actions) > 0 {
+    if num_unresolved_conflicts(actions) > 0 {
         term.write_line("Resolve conflicts:")?;
 
         for a in actions {
@@ -634,32 +636,25 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
 
     let mut sel = 0;
     let mut height = 0;
-    let mut num_conflicts = num_conflicts(&actions);
-
-    let mut resolved: Vec<(&mut Action, Option<Action>)> = Vec::new();
-    for a in actions {
-        resolved.push((a, None));
-    }
+    let mut num_conflicts = num_unresolved_conflicts(&actions);
 
     let resolution = loop {
         term.write_line(format!("{}{}n/a = abort, f = force{} [{}]",
                     if num_conflicts == 0 { "y/g = proceed".bright_green() } else { "".normal() },
                     if num_conflicts == 0 { ", ".normal() } else { "".normal() },
-                    if let Action::Conflict(_,_) = resolved[sel].0 { ", left/l = update local, right/r = update remote, c = keep conflict" } else { "" },
+                    if actions[sel].is_conflict() { ", left/l = update local, right/r = update remote, c = keep conflict" } else { "" },
                     num_conflicts).as_str())?;
         height += 1;
 
-        for (idx, (original,resolved)) in resolved
+        for (idx, action) in actions
             .iter()
             .enumerate()
             .skip(page * capacity)
             .take(capacity)
         {
-            let action = if let Some(a) = resolved { a } else { original };
             if verbose || !action.is_identical() {
-                term.write_line(format!("{} {} {}",
+                term.write_line(format!("{} {}",
                          (if sel == idx { ">" } else {" "}).cyan(),
-                         if let Action::Conflict(_,_) = original { "c" } else { " " },
                          action).as_str())?;
                 height += 1;
             }
@@ -671,64 +666,69 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
         match term.read_key()? {
             Key::ArrowDown | Key::Char('j') => {
                 loop {
-                    sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
-                    if verbose || !resolved[sel].0.is_identical() {
+                    sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
+                    if verbose || !actions[sel].is_identical() {
                         break;
                     }
                 };
             }
             Key::ArrowUp | Key::Char('k') => {
                 loop {
-                    sel = ((sel as i64 - 1 + resolved.len() as i64)
-                        % (resolved.len() as i64)) as usize;
-                    if verbose || !resolved[sel].0.is_identical() {
+                    sel = ((sel as i64 - 1 + actions.len() as i64)
+                        % (actions.len() as i64)) as usize;
+                    if verbose || !actions[sel].is_identical() {
                         break;
                     }
                 };
             }
             Key::Tab => {       // go to next conflict
                 loop {
-                    sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
-                    if resolved[sel].0.is_conflict() {
+                    sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
+                    if actions[sel].is_conflict() {
                         break;
                     }
                 };
             }
             Key::BackTab => {   // go to previous conflict
                 loop {
-                    sel = ((sel as i64 - 1 + resolved.len() as i64)
-                        % (resolved.len() as i64)) as usize;
-                    if let Action::Conflict(_,_) = resolved[sel].0 {
+                    sel = ((sel as i64 - 1 + actions.len() as i64)
+                        % (actions.len() as i64)) as usize;
+                    if actions[sel].is_conflict() {
                         break;
                     }
                 };
             }
             Key::ArrowLeft | Key::Char('l') => {
-                if resolved[sel].0.is_conflict() {
-                    if resolved[sel].1.is_none() {
+                if actions[sel].is_conflict() {
+                    if actions[sel].is_unresolved_conflict() {
                         num_conflicts -= 1;
                     }
-                    resolved[sel].1 = Some(resolve_action(&resolved[sel].0, Resolution::Local));
+                    actions[sel] = resolve_action(&actions[sel], Resolution::Local);
                 }
-                sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
+                sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
             }
             Key::ArrowRight | Key::Char('r') => {
-                if let Action::Conflict(_,_) = resolved[sel].0 {
-                    if resolved[sel].1.is_none() {
+                if actions[sel].is_conflict() {
+                    if actions[sel].is_unresolved_conflict() {
                         num_conflicts -= 1;
                     }
-                    resolved[sel].1 = Some(resolve_action(&resolved[sel].0, Resolution::Remote));
+                    actions[sel] = resolve_action(&actions[sel], Resolution::Remote);
                 }
-                sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
+                sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
             }
             Key::Char('c') => {
-                if resolved[sel].0.is_conflict() {
-                    if resolved[sel].1.is_some() {
-                        resolved[sel].1 = None;
+                if actions[sel].is_conflict() {
+                    if !actions[sel].is_unresolved_conflict() {
+                        match &actions[sel] {
+                            Action::ResolvedLocal((lc,rc),_) | Action::ResolvedRemote((lc,rc),_) => {
+                                actions[sel] = Action::Conflict(lc.clone(),rc.clone());
+                            },
+                            _ => { unreachable!(); }
+                        }
                         num_conflicts += 1;
                     }
                 }
-                sel = (sel as u64 + 1).rem(resolved.len() as u64) as usize;
+                sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
             }
             Key::PageUp => {
                 if page == 0 {
@@ -775,15 +775,6 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
     term.clear_last_lines(height)?;
     term.show_cursor()?;
     term.flush()?;
-
-    // copy resolved actions
-    if let AllResolution::Abort = resolution {
-        for (a, r) in resolved {
-            if let Some(ra) = r {
-                *a = ra;
-            }
-        }
-    }
 
     Ok(resolution)
 }

@@ -22,13 +22,17 @@ pub fn get_signatures(base: &str, actions: &Vec<Action>) -> Result<Vec<Signature
     let base_path = Path::new(base);
     let mut signatures: Vec<SignatureWithPath> = Vec::new();
     for action in actions {
-        if let Action::Local(Change::Modified(e1, e2)) = action {
-            if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
-                let f = fs::File::open(base_path.join(e1.path()))?;
-                let block = [0; WINDOW];
-                let sig = signature(f, block)?;
-                signatures.push(SignatureWithPath(e1.path().clone(), sig));
-            }
+        match action {
+            Action::Local(Change::Modified(e1, e2)) | Action::ResolvedLocal((_,_), Change::Modified(e1,e2)) =>
+            {
+                if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
+                    let f = fs::File::open(base_path.join(e1.path()))?;
+                    let block = [0; WINDOW];
+                    let sig = signature(f, block)?;
+                    signatures.push(SignatureWithPath(e1.path().clone(), sig));
+                }
+            },
+            _ => {}
         }
     }
     Ok(signatures)
@@ -48,29 +52,32 @@ pub fn get_detailed_changes(base: &str, actions: &Vec<Action>, signatures: &Vec<
     let mut details: Vec<ChangeDetails> = Vec::new();
 
     for action in actions {
-        if let Action::Remote(change) = action {
-            match change {
-                Change::Removed(_) => {},
-                Change::Added(e) => {
-                    if e.is_file() {
-                        log::debug!("Getting detail for adding {}", e.path().display());
-                        let v = fs::read(base_path.join(e.path()))?;
-                        details.push(ChangeDetails::Contents(v));
+        match action {
+            Action::Remote(change) | Action::ResolvedRemote((_,_),change) => {
+                match change {
+                    Change::Removed(_) => {},
+                    Change::Added(e) => {
+                        if e.is_file() {
+                            log::debug!("Getting detail for adding {}", e.path().display());
+                            let v = fs::read(base_path.join(e.path()))?;
+                            details.push(ChangeDetails::Contents(v));
+                        }
+                    },
+                    Change::Modified(e1,e2) => {
+                        if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
+                            let block = [0; WINDOW];
+                            let f = fs::File::open(base_path.join(e1.path()))?;
+                            let sig = &sig_iter.next().unwrap().1;
+                            let delta = compare(sig, f, block)?;
+                            details.push(ChangeDetails::Diff(delta))
+                        } else if !e1.is_file() && e2.is_file() {
+                            let v = fs::read(base_path.join(e2.path()))?;
+                            details.push(ChangeDetails::Contents(v));
+                        } // else: permissions or target change
                     }
-                },
-                Change::Modified(e1,e2) => {
-                    if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
-                        let block = [0; WINDOW];
-                        let f = fs::File::open(base_path.join(e1.path()))?;
-                        let sig = &sig_iter.next().unwrap().1;
-                        let delta = compare(sig, f, block)?;
-                        details.push(ChangeDetails::Diff(delta))
-                    } else if !e1.is_file() && e2.is_file() {
-                        let v = fs::read(base_path.join(e2.path()))?;
-                        details.push(ChangeDetails::Contents(v));
-                    } // else: permissions or target change
                 }
-            }
+            },
+            _ => {}
         }
     }
     Ok(details)
@@ -93,7 +100,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                     Ordering::Less => { new_entries.push(old_iter.next().unwrap().clone()); },
                     Ordering::Equal => {
                         let e = old_iter.next().unwrap();
-                        if let Action::Conflict(_,_) = action {
+                        if action.is_unresolved_conflict() {
                             new_entries.push(e.clone());       // preserve the original
                         }
                         continue;
@@ -107,7 +114,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
 
         log::debug!("applying detailed change to {}", action.path().display());
         match action {
-            Action::Local(change) => {
+            Action::Local(change) | Action::ResolvedLocal((_,_),change) => {
                 match change {
                     Change::Removed(e) => {
                         let filename = base_path.join(e.path());
@@ -192,7 +199,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                     }
                 }
             },
-            Action::Remote(change) => {
+            Action::Remote(change) | Action::ResolvedRemote((_,_),change) => {
                 match change {
                     Change::Removed(_) => {},
                     Change::Added(e) => {
@@ -223,33 +230,36 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
     // second pass, in reverse order, to remove directories and update their metadata
     let mut details_iter = leftover_details.iter().rev();
     for action in actions.iter().rev() {
-        if let Action::Local(change) = action {
-            if !change.is_dir() {
-                continue;
-            }
-            match change {
-                Change::Removed(e) => {
-                    let dirname = base_path.join(e.path());
-                    fs::remove_dir(&dirname).expect(format!("failed to remove directory {:?}", dirname).as_str());
-                },
-                Change::Added(e) => {
-                    let dirname = base_path.join(e.path());
-                    new_entries.push(update_meta(&dirname, e)?);
-                },
-                Change::Modified(e1,e2) => {
-                    let dirname = base_path.join(e2.path());
-                    if e1.is_dir() && !e2.is_dir() {
+        match action {
+            Action::Local(change) | Action::ResolvedLocal((_,_),change) => {
+                if !change.is_dir() {
+                    continue;
+                }
+                match change {
+                    Change::Removed(e) => {
+                        let dirname = base_path.join(e.path());
                         fs::remove_dir(&dirname).expect(format!("failed to remove directory {:?}", dirname).as_str());
-                        if let Some(p) = e2.target() {
-                            std::os::unix::fs::symlink(p, &dirname).expect(format!("failed to create symlink {:?} {:?}", p, dirname).as_str());
-                        } else if e2.is_file() {
-                            let detail = details_iter.next().unwrap();
-                            create_file(&dirname, &detail).expect(format!("failed to create file {:?}", dirname).as_str());
+                    },
+                    Change::Added(e) => {
+                        let dirname = base_path.join(e.path());
+                        new_entries.push(update_meta(&dirname, e)?);
+                    },
+                    Change::Modified(e1,e2) => {
+                        let dirname = base_path.join(e2.path());
+                        if e1.is_dir() && !e2.is_dir() {
+                            fs::remove_dir(&dirname).expect(format!("failed to remove directory {:?}", dirname).as_str());
+                            if let Some(p) = e2.target() {
+                                std::os::unix::fs::symlink(p, &dirname).expect(format!("failed to create symlink {:?} {:?}", p, dirname).as_str());
+                            } else if e2.is_file() {
+                                let detail = details_iter.next().unwrap();
+                                create_file(&dirname, &detail).expect(format!("failed to create file {:?}", dirname).as_str());
+                            }
                         }
-                    }
-                    new_entries.push(update_meta(&dirname, e2)?);
-                },
-            }
+                        new_entries.push(update_meta(&dirname, e2)?);
+                    },
+                }
+            },
+            _ => {}
         }
     }
 
