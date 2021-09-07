@@ -462,24 +462,34 @@ async fn server() -> Result<()> {
 async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, ignore: &profile::Ignore, statefile: Option<&str>) -> Result<(Entries, Changes)> {
     let restricted_current_scan = scan_entries(base, restrict, locations, ignore);
 
-    let all_old_entries: Entries =
-        if let Some(f) = statefile {
-            if std::path::Path::new(f).exists() {
-                log::debug!("Loading: {}", f);
-                let f = BufReader::new(File::open(f).unwrap());
-                deserialize_from(f).unwrap()
+    use tokio::fs::File;
+    use tokio::io::AsyncReadExt;
+    let all_old_entries = async {
+        let all_old_entries: Entries =
+            if let Some(f) = statefile {
+                if std::path::Path::new(f).exists() {
+                    log::debug!("Loading: {}", f);
+                    let mut f = File::open(f).await.unwrap();
+                    let mut contents = vec![];
+                    f.read_to_end(&mut contents).await.unwrap();
+                    deserialize_from(contents.as_slice()).unwrap()
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+            };
+        all_old_entries
+    };
 
+    use tokio::join;
+    let (all_old_entries, restricted_current_scan) = join!(all_old_entries, restricted_current_scan);
     let restricted_old_entries_iter = all_old_entries
                                           .iter()
                                           .filter(move |dir: &&scan::DirEntryWithMeta| dir.starts_with(restrict));
 
-    let changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_scan.await?.iter()).collect();
+
+    let changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_scan?.iter()).collect();
 
     Ok((all_old_entries, changes))
 }
