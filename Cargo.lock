@@ -252,6 +252,7 @@ dependencies = [
 name = "duet"
 version = "0.1.0"
 dependencies = [
+ "adler32",
  "bincode",
  "clap",
  "color-eyre",

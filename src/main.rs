@@ -12,6 +12,7 @@ mod sync;
 use actions::{Action,Actions,num_unresolved_conflicts,num_identical,reverse};
 use scan::location::{Locations};
 use scan::{Change,DirEntryWithMeta};
+use std::path::PathBuf;
 
 use std::fs::File;
 use std::io::{BufWriter,BufReader};
@@ -489,7 +490,17 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, igno
                                           .filter(move |dir: &&scan::DirEntryWithMeta| dir.starts_with(restrict));
 
 
-    let changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_scan?.iter()).collect();
+    let mut changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_scan?.iter()).collect();
+
+    // compute checksums
+    let base = PathBuf::from(base);
+    for change in &mut changes {
+        match change {
+            Change::Added(n) => { n.compute_checksum(&base).expect(format!("Unable to compute checksum for {:?}", n).as_str()); },
+            Change::Modified(_,n) => { n.compute_checksum(&base).expect(format!("Unable to compute checksum for {:?}", n).as_str()); },
+            Change::Removed(_) => {},
+        }
+    };
 
     Ok((all_old_entries, changes))
 }
@@ -497,7 +508,6 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, igno
 async fn walk(matches: &ArgMatches<'_>) -> Result<()> {
     let path = matches.value_of("path").unwrap();
 
-    use std::path::PathBuf;
     let locations = vec![scan::location::Location::Include(PathBuf::from("."))];
 
     let path = path.to_string();

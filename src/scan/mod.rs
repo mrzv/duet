@@ -43,6 +43,7 @@ pub struct DirEntryWithMeta {
     mode:   u32,
     target: Option<String>,
     is_dir: bool,
+    checksum: u32,
     // TODO: uid and gid
 }
 
@@ -91,6 +92,17 @@ impl DirEntryWithMeta {
 
     pub fn is_file(&self) -> bool {
         !(self.is_dir || self.is_symlink())
+    }
+
+    pub fn compute_checksum(&mut self, base: &PathBuf) -> Result<()> {
+        if !self.is_file() {
+            return Ok(());
+        }
+
+        let filename = base.join(&self.path);
+        self.checksum = adler32::adler32(std::fs::File::open(filename)?)?;
+
+        Ok(())
     }
 }
 
@@ -215,6 +227,7 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
                     ino: meta.ino(),
                     mode: meta.mode(),
                     is_dir: meta.is_dir(),
+                    checksum: 0,
             }).await.expect("Couldn't send result through the channel")
         }
     }
