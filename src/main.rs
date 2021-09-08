@@ -298,8 +298,12 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
 
     remote.save_state()?;
 
-    let f = BufWriter::new(File::create(local_state).unwrap());
-    serialize_into(f, &local_all_old)?;
+    use atomicwrites::{AtomicFile,AllowOverwrite};
+    let af = AtomicFile::new(local_state, AllowOverwrite);
+    af.write(|f| {
+        let f = BufWriter::new(f);
+        serialize_into(f, &local_all_old)
+    })?;
     Ok(())
 }
 
@@ -432,8 +436,12 @@ impl DuetServer for DuetServerImpl {
     fn save_state(&self) -> Result<(), RPCError> {
         let remote_state = profile::remote_state(&self.remote_id);
         log::info!("Saving remote state {} with {} entries", remote_state.to_str().unwrap(), &self.all_old.len());
-        let f = BufWriter::new(File::create(remote_state).unwrap());
-        let result = serialize_into(f, &self.all_old);
+        use atomicwrites::{AtomicFile,AllowOverwrite};
+        let af = AtomicFile::new(remote_state, AllowOverwrite);
+        let result = af.write(|f| {
+            let f = BufWriter::new(f);
+            serialize_into(f, &self.all_old)
+        });
         match result {
             Ok(()) => Ok(()),
             Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in saving remote state on the server"))
