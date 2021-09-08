@@ -19,9 +19,10 @@ use std::io::{BufWriter,BufReader};
 use bincode::{serialize_into,deserialize_from};
 
 use essrpc::essrpc;
-use essrpc::transports::{BincodeTransport,ReadWrite};
-use essrpc::{RPCClient, RPCError, RPCErrorKind, RPCServer};
-use std::process::{Command, Stdio, Child, ChildStdin, ChildStdout};
+use essrpc::transports::{BincodeTransport,BincodeAsyncClientTransport,ReadWrite};
+use essrpc::{AsyncRPCClient, RPCError, RPCErrorKind, RPCServer};
+use std::process::{Stdio};
+use tokio::process::{Command, Child, ChildStdin, ChildStdout};
 
 type Entries = Vec<DirEntryWithMeta>;
 type Changes = Vec<Change>;
@@ -235,10 +236,10 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let (mut local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, &prf.ignore, Some(&local_state)).await?;
 
     let mut server = launch_server(remote_server, remote_cmd);
-    let mut remote = get_remote(&mut server);
-    remote.set_base(remote_base)?;
+    let remote = get_remote(&mut server);
+    remote.set_base(remote_base).await?;
 
-    let remote_changes = remote.changes(path.to_string(), prf.locations, prf.ignore, local_id).expect("Couldn't get remote changes");
+    let remote_changes = remote.changes(path.to_string(), prf.locations, prf.ignore, local_id).await.expect("Couldn't get remote changes");
 
     let mut actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
                                 .filter_map(|(lc,rc)| Action::create(lc,rc))
@@ -283,20 +284,20 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
 
     let actions: Actions = actions.into_iter().filter(|a| !a.is_unresolved_conflict()).collect();
     let remote_actions: Actions = reverse(&actions);
-    remote.set_actions(remote_actions)?;
+    remote.set_actions(remote_actions).await?;
 
     let local_signatures  = sync::get_signatures(&local_base, &actions).expect("couldn't get local signatures");
-    let remote_signatures = remote.get_signatures().expect("couldn't get remote signatures");
+    let remote_signatures = remote.get_signatures().await.expect("couldn't get remote signatures");
     log::debug!("{} local signatures; {} remote signatures", local_signatures.len(), remote_signatures.len());
 
     let local_detailed_changes  = sync::get_detailed_changes(&local_base, &actions, &remote_signatures).expect("couldn't get local detailed changes");
-    let remote_detailed_changes = remote.get_detailed_changes(local_signatures).expect("couldn't get remote detailed changes");
+    let remote_detailed_changes = remote.get_detailed_changes(local_signatures).await.expect("couldn't get remote detailed changes");
 
     // updates local_all_old to be the new state
     sync::apply_detailed_changes(&local_base, &actions, &remote_detailed_changes, &mut local_all_old)?;
-    remote.apply_detailed_changes(local_detailed_changes)?;
+    remote.apply_detailed_changes(local_detailed_changes).await?;
 
-    remote.save_state()?;
+    remote.save_state().await?;
 
     use atomicwrites::{AtomicFile,AllowOverwrite};
     let af = AtomicFile::new(local_state, AllowOverwrite);
@@ -334,19 +335,23 @@ fn launch_server(_server: Option<String>, cmd: String) -> Child {
     server
 }
 
-fn get_remote(server: &mut Child) -> DuetServerRPCClient<BincodeTransport<ReadWrite<&mut ChildStdout, &mut ChildStdin>>> {
+
+use readwrite::ReadWriteAsyncstd;
+use tokio_util::compat::{Compat,TokioAsyncReadCompatExt,TokioAsyncWriteCompatExt};
+
+fn get_remote(server: &mut Child) -> DuetServerAsyncRPCClient<BincodeAsyncClientTransport<ReadWriteAsyncstd<Compat<&mut ChildStdout>, Compat<&mut ChildStdin>>>> {
     let server_in = server.stdin.as_mut().expect("Failed to open stdin");
     let server_out = server.stdout.as_mut().expect("Failed to read stdout");
 
-    let server_io = ReadWrite::new(server_out, server_in);
+    let server_io = ReadWriteAsyncstd::new(server_out.compat(), server_in.compat_write());
 
-    let remote = DuetServerRPCClient::new(BincodeTransport::new(server_io));
+    let remote = DuetServerAsyncRPCClient::new(BincodeAsyncClientTransport::new(server_io));
     remote
 }
 
 use sync::{SignatureWithPath,ChangeDetails};
 
-#[essrpc]
+#[essrpc(sync,async)]
 pub trait DuetServer {
     fn set_base(&mut self, base: String) -> Result<(), RPCError>;
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError>;

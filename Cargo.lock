@@ -51,6 +51,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.51"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44318e776df68115a881de9a8fd1b9e53368d7a4a5ce4cc48517da3393233a5e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "atomicwrites"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -278,12 +289,14 @@ dependencies = [
  "futures 0.3.16",
  "log",
  "machine-uid",
+ "readwrite",
  "regex",
  "rustsync",
  "serde",
  "shellexpand",
  "text_io",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -308,9 +321,9 @@ dependencies = [
 [[package]]
 name = "essrpc"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb25e933ca17d4e6904f14e1a695fa10fa38bb73f9c10518519a701297322e6c"
+source = "git+https://github.com/Electron100/essrpc?branch=async#a8fa942e381ab65eadbe9439a4f74fdde43353a6"
 dependencies = [
+ "async-trait",
  "bincode",
  "essrpc_macros",
  "futures 0.3.16",
@@ -320,8 +333,7 @@ dependencies = [
 [[package]]
 name = "essrpc_macros"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d678069d233b749a5db7fe2b292f5cc41309f3a6113c0d137fcdd52392d74aac"
+source = "git+https://github.com/Electron100/essrpc?branch=async#a8fa942e381ab65eadbe9439a4f74fdde43353a6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -774,6 +786,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "readwrite"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31ffdc83f7ce1e84943f94033a48a1a50ef9581aaa5d213625dea98e60f9ed54"
+dependencies = [
+ "futures 0.3.16",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1015,6 +1037,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d3725d3efa29485e87311c5b699de63cde14b00ed4d256b8318aa30ca452cd"
+dependencies = [
+ "bytes 1.0.1",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "log",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
