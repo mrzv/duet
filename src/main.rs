@@ -233,13 +233,21 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let (remote_base, remote_server, remote_cmd) = parse_remote(&prf.remote)?;
 
     let local_state = profile::local_state(name).to_string_lossy().into_owned();
-    let (mut local_all_old, local_changes) = old_and_changes(&local_base, &path, &prf.locations, &prf.ignore, Some(&local_state)).await?;
+
+    // --- Get local and remote changes concurrently ---
+    let local_fut = old_and_changes(&local_base, &path, &prf.locations, &prf.ignore, Some(&local_state));
 
     let mut server = launch_server(remote_server, remote_cmd);
     let remote = get_remote(&mut server);
-    remote.set_base(remote_base).await?;
+    let remote_fut = async {
+        remote.set_base(remote_base).await.expect("Couldn't set server base");
+        remote.changes(path.to_string(), prf.locations.clone(), prf.ignore.clone(), local_id).await.expect("Couldn't get remote changes")
+    };
 
-    let remote_changes = remote.changes(path.to_string(), prf.locations, prf.ignore, local_id).await.expect("Couldn't get remote changes");
+    use futures::join;
+    let (local_result, remote_changes) = join!(local_fut,remote_fut);
+    let (mut local_all_old, local_changes) = local_result.unwrap();
+    // -------------------------------------------------
 
     let mut actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
                                 .filter_map(|(lc,rc)| Action::create(lc,rc))
