@@ -153,8 +153,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                                             let block = [0; WINDOW];
                                             let mut updated = Vec::new();
                                             restore_seek(&mut updated, fs::File::open(&filename)?, block, &delta)?;
-                                            let mut f = fs::File::create(&filename)?;
-                                            f.write_all(&updated)?;
+                                            create_file_with_contents(&filename, &updated)?;
                                         },
                                         _ => { return Err(eyre!("mismatch when adding {}, expected Diff, but not found", e1.path().display())) }
                                     }
@@ -275,13 +274,23 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
 }
 
 fn create_file(filename: &Path, detail: &ChangeDetails) -> Result<()> {
-    let mut f = fs::File::create(&filename)?;
     match detail {
         ChangeDetails::Contents(v) => {
-            f.write_all(v)?;
-            Ok(())
+            create_file_with_contents(filename, v)
         },
         _ => { Err(eyre!("mismatch when adding {}, expected Contents, but not found", filename.display())) }
+    }
+}
+
+fn create_file_with_contents(filename: &Path, data: &Vec<u8>) -> Result<()> {
+    use atomicwrites::{AtomicFile,AllowOverwrite};
+    let af = AtomicFile::new(filename, AllowOverwrite);
+    let result = af.write(|f| {
+        f.write_all(data)
+    });
+    match result {
+        Ok(()) => Ok (()),
+        Err(e) => Err(eyre!("unable to save {}: {}", filename.display(), e)),
     }
 }
 
