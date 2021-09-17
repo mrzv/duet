@@ -28,9 +28,14 @@ pub fn local_state(name: &str) -> PathBuf {
     profile_location
 }
 
-pub fn remote_state(id: &str) -> PathBuf {
+pub fn remote_state_dir() -> PathBuf {
     let mut base = PathBuf::from(shellexpand::full("~/.config/duet/").unwrap().to_string());
     base.push("remotes");
+    base
+}
+
+pub fn remote_state(id: &str) -> PathBuf {
+    let mut base = remote_state_dir();
     base.push(id);
     base
 }

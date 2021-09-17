@@ -23,6 +23,7 @@ use essrpc::transports::{BincodeTransport,BincodeAsyncClientTransport,ReadWrite}
 use essrpc::{AsyncRPCClient, RPCError, RPCErrorKind, RPCServer};
 use std::process::{Stdio};
 use tokio::process::{Command, Child, ChildStdin, ChildStdout};
+use openssh::{Session, KnownHosts, RemoteChild};
 
 type Entries = Vec<DirEntryWithMeta>;
 type Changes = Vec<Change>;
@@ -237,7 +238,13 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     // --- Get local and remote changes concurrently ---
     let local_fut = old_and_changes(&local_base, &path, &prf.locations, &prf.ignore, Some(&local_state));
 
-    let mut server = launch_server(remote_server, remote_cmd);
+    let remote_session =
+        if let Some(server) = remote_server {
+            Some(Session::connect(server, KnownHosts::Strict).await.expect("Unable to get SSH session"))
+        } else {
+            None
+        };
+    let mut server = launch_server(&remote_session, remote_cmd);
     let remote = get_remote(&mut server);
     let remote_fut = async {
         remote.set_base(remote_base).await.expect("Couldn't set server base");
@@ -326,30 +333,59 @@ fn local_id(name: &str) -> String {
     format!("{:x}", s.finish())
 }
 
-// TODO: switch to tokio::process::Command; need to support async interface for openssh
-fn launch_server(_server: Option<String>, cmd: String) -> Child {
+enum Server<'a> {
+    Local(Child),
+    Remote(RemoteChild<'a>),
+}
+
+fn launch_server(session: &Option<Session>, cmd: String) -> Server {
     // launch server
-    let cmd = shellexpand::full(&cmd).expect("Failed to expand command").to_string();
-    let server = Command::new(cmd)
-        .arg("server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("Failed to spawn remote server");
+    if let Some(session) = session {
+        let server = session.command(cmd)
+            .arg("server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("Failed to spawn remote server");
 
-    log::trace!("launched server");
+        log::trace!("launched remote server");
 
-    server
+        Server::Remote(server)
+    } else {
+        let cmd = shellexpand::full(&cmd).expect("Failed to expand command").to_string();
+        let server = Command::new(cmd)
+            .arg("server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("Failed to spawn remote server");
+
+        log::trace!("launched local server");
+
+        Server::Local(server)
+    }
 }
 
 
 use readwrite::ReadWriteAsyncstd;
 use tokio_util::compat::{Compat,TokioAsyncReadCompatExt,TokioAsyncWriteCompatExt};
 
-fn get_remote(server: &mut Child) -> DuetServerAsyncRPCClient<BincodeAsyncClientTransport<ReadWriteAsyncstd<Compat<&mut ChildStdout>, Compat<&mut ChildStdin>>>> {
-    let server_in = server.stdin.as_mut().expect("Failed to open stdin");
-    let server_out = server.stdout.as_mut().expect("Failed to read stdout");
+fn get_remote<'a>(server: &'a mut Server) -> DuetServerAsyncRPCClient<BincodeAsyncClientTransport<ReadWriteAsyncstd<Compat<ChildStdout>, Compat<ChildStdin>>>> {
+    let (server_in, server_out) =
+        match server {
+            Server::Local(server) => {
+                let server_in = server.stdin.take().expect("Failed to open local stdin");
+                let server_out = server.stdout.take().expect("Failed to read local stdout");
+                (server_in, server_out)
+            },
+            Server::Remote(server) => {
+                let server_in = server.stdin().take().expect("Failed to open remote stdin");
+                let server_out = server.stdout().take().expect("Failed to open remote stdout");
+                (server_in, server_out)
+            },
+        };
 
     let server_io = ReadWriteAsyncstd::new(server_out.compat(), server_in.compat_write());
 
@@ -447,6 +483,7 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn save_state(&self) -> Result<(), RPCError> {
+        std::fs::create_dir_all(profile::remote_state_dir())?;
         let remote_state = profile::remote_state(&self.remote_id);
         log::info!("Saving remote state {} with {} entries", remote_state.to_str().unwrap(), &self.all_old.len());
         use atomicwrites::{AtomicFile,AllowOverwrite};
