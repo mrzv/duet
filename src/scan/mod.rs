@@ -50,7 +50,9 @@ pub struct DirEntryWithMeta {
 impl DirEntryWithMeta {
     fn same(&self, other: &Self) -> bool {
         assert_eq!(self.path, other.path);
-        self.mode == other.mode && self.target == other.target && self.is_dir == other.is_dir
+        (self.is_symlink() || self.mode == other.mode)
+            && self.target == other.target
+            && self.is_dir == other.is_dir
             && (self.is_dir || self.same_contents(other))
     }
 

@@ -296,8 +296,13 @@ fn create_file_with_contents(filename: &Path, data: &Vec<u8>) -> Result<()> {
 
 fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
     let meta = fs::symlink_metadata(path).expect(format!("failed to acquire metadata for {:?}", path).as_str());
-    meta.permissions().set_mode(e.mode());
-    filetime::set_symlink_file_times(path, filetime::FileTime::from_unix_time(meta.atime(),0), filetime::FileTime::from_unix_time(e.mtime(),0))?;
+    if !e.is_symlink() {
+        let mut perms = meta.permissions();
+        perms.set_mode(e.mode());
+        fs::set_permissions(path, perms).expect(format!("failed to set permissions for {:?}", path).as_str());
+    }
+    filetime::set_symlink_file_times(path, filetime::FileTime::from_unix_time(meta.atime(),0), filetime::FileTime::from_unix_time(e.mtime(),0))
+        .expect(format!("failed to set time for {:?}", path).as_str());
     let mut new_entry = e.clone();
     new_entry.set_ino(meta.ino());
     Ok(new_entry)
