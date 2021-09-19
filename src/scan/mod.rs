@@ -10,6 +10,8 @@ use color_eyre::eyre::Result;
 use tokio::sync::{mpsc,Semaphore};
 use std::sync::Arc;
 
+use async_recursion::async_recursion;
+
 use log;
 
 use crate::profile::{Ignore};
@@ -178,13 +180,14 @@ fn find_parent<'a>(path: &PathBuf, locations: &'a Locations, pft: &ParentFromTo)
     &locations[parent]
 }
 
-async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
+#[async_recursion]
+async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) {
     log::trace!("Scanning: {}", path.display());
 
     // check the restriction
     if !path.starts_with(&*restrict) && !restrict.starts_with(&path) {
         log::trace!("Skipping (restriction): {:?} vs {:?}", path, restrict);
-        return Ok(());
+        return;
     }
 
     let pft = narrow_parent_from_to(pft, &path, &locations);
@@ -192,7 +195,7 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
     // no need to descend if we are in the exclude regime and there are no descendants
     if locations[pft.parent].is_exclude() && pft.from > pft.to {
         log::trace!("Skipping excluded: {:?}", path);
-        return Ok(());
+        return;
     }
 
     // read the directory
@@ -237,25 +240,24 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
         }
     }
 
-    scan_children(child_dirs, locations, restrict, base, ignore, pft, dev, tx, s.clone())?;
-
-    Ok(())
+    scan_children(child_dirs, locations, restrict, base, ignore, pft, dev, tx, s.clone()).await;
 }
 
-fn scan_children(children: Vec<PathBuf>, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
-    for path in children {
-        let locations = locations.clone();
-        let restrict = restrict.clone();
-        let base = base.clone();
-        let ignore = ignore.clone();
-        let pft = pft.clone();
-        let tx = tx.clone();
-        let s = s.clone();
-        tokio::spawn(async move {
-            scan_dir(path, locations, restrict, base, ignore, pft, dev, tx, s).await
-        });
-    }
-    Ok(())
+#[async_recursion]
+async fn scan_children(children: Vec<PathBuf>, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) {
+    use futures::stream::{self, StreamExt};
+    stream::iter(children).for_each_concurrent(None,
+        |path| async {
+            let locations = locations.clone();
+            let restrict = restrict.clone();
+            let base = base.clone();
+            let ignore = ignore.clone();
+            let pft = pft.clone();
+            let tx = tx.clone();
+            let s = s.clone();
+            scan_dir(path, locations, restrict, base, ignore, pft, dev, tx, s).await;
+        }
+    ).await;
 }
 
 /// Send all [directory entries](DirEntryWithMeta) into the channel, given via its [Sender](mpsc::Sender) `tx`.
@@ -290,7 +292,7 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &
 
     let path = (*base).clone();
     let to = locations.len() - 1;
-    scan_dir(path, locations, restrict, base, ignore, ParentFromTo { parent: 0, from: 0, to: to }, dev, tx, s).await?;
+    scan_dir(path, locations, restrict, base, ignore, ParentFromTo { parent: 0, from: 0, to: to }, dev, tx, s).await;
 
     Ok(())
 }

@@ -37,3 +37,4 @@ readwrite = { version = "0.2.0", features = ["asyncstd"] }
 tokio-util = { version = "0.6", features = ["compat"] }
 openssh = "0.8.1"
 simple-logging = "2.0.2"
+async-recursion = "0.3.2"

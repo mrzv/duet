@@ -126,7 +126,7 @@ async fn scan_entries(base: &str, path: &str, locations: &Locations, ignore: &pr
     let locations = locations.clone();
     let ignore = ignore.clone();
 
-    let mut entries = tokio::spawn(async move {
+    let mut entries = async move {
         let (tx, mut rx) = mpsc::channel(32);
         tokio::spawn(async move {
             scan::scan(&base, &path, &locations, &ignore, tx).await
@@ -138,7 +138,7 @@ async fn scan_entries(base: &str, path: &str, locations: &Locations, ignore: &pr
         }
 
         entries
-    }).await?;
+    }.await;
     log::debug!("Done scanning");
 
     entries.sort();
