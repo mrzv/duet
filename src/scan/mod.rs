@@ -179,6 +179,8 @@ fn find_parent<'a>(path: &PathBuf, locations: &'a Locations, pft: &ParentFromTo)
 }
 
 async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) -> Result<()> {
+    log::trace!("Scanning: {}", path.display());
+
     // check the restriction
     if !path.starts_with(&*restrict) && !restrict.starts_with(&path) {
         log::trace!("Skipping (restriction): {:?} vs {:?}", path, restrict);
@@ -221,6 +223,7 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
 
         // check restriction and crossing the filesystem boundary
         if path.starts_with(&*restrict) && dev == meta.dev() {
+            log::trace!("Reporting: {:?}", path);
             tx.send(DirEntryWithMeta {
                     path: relative(&*base, &path).to_path_buf(),
                     target: fs::read_link(path).await.map_or(None, |p| Some(p.to_str().unwrap().to_string())),

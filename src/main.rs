@@ -31,7 +31,6 @@ type Changes = Vec<Change>;
 #[tokio::main]
 pub async fn main() -> Result<()> {
     color_eyre::install().unwrap();
-    env_logger::init();
 
     let matches = clap_app!(duet =>
         (version: crate_version!())
@@ -140,6 +139,7 @@ async fn scan_entries(base: &str, path: &str, locations: &Locations, ignore: &pr
 
         entries
     }).await?;
+    log::debug!("Done scanning");
 
     entries.sort();
 
@@ -217,6 +217,8 @@ fn parse_remote(remote: &String) -> Result<(String, Option<String>, String)> {
 }
 
 async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
+    env_logger::init();
+
     let name = matches.value_of("profile").unwrap();
     let dry_run = matches.is_present("dry_run");
     let batch = matches.is_present("batch");
@@ -246,6 +248,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         };
     let mut server = launch_server(&remote_session, remote_cmd);
     let remote = get_remote(&mut server);
+
     let remote_fut = async {
         remote.set_base(remote_base).await.expect("Couldn't set server base");
         remote.changes(path.to_string(), prf.locations.clone(), prf.ignore.clone(), local_id).await.expect("Couldn't get remote changes")
@@ -297,9 +300,12 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         return Ok(());
     }
 
+    log::debug!("synchronizing");
+
     let actions: Actions = actions.into_iter().filter(|a| !a.is_unresolved_conflict()).collect();
     let remote_actions: Actions = reverse(&actions);
     remote.set_actions(remote_actions).await?;
+    log::debug!("set remote actions");
 
     let local_signatures  = sync::get_signatures(&local_base, &actions).expect("couldn't get local signatures");
     let remote_signatures = remote.get_signatures().await.expect("couldn't get remote signatures");
@@ -307,6 +313,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
 
     let local_detailed_changes  = sync::get_detailed_changes(&local_base, &actions, &remote_signatures).expect("couldn't get local detailed changes");
     let remote_detailed_changes = remote.get_detailed_changes(local_signatures).await.expect("couldn't get remote detailed changes");
+    log::debug!("got detailed changes");
 
     // updates local_all_old to be the new state
     sync::apply_detailed_changes(&local_base, &actions, &remote_detailed_changes, &mut local_all_old)?;
@@ -432,10 +439,12 @@ impl DuetServer for DuetServerImpl {
                 Ok(s) => s.to_string(),
                 Err(_) => { return Err(RPCError::new(RPCErrorKind::Other, "cannot expand base path, when setting remote base")); },
             };
+        log::debug!("Set base {}", self.base);
         Ok(())
     }
 
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError> {
+        log::debug!("Setting {} actions", actions.len());
         self.actions = actions;
         Ok(())
     }
@@ -459,6 +468,7 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn get_signatures(&self) -> Result<Vec<SignatureWithPath>, RPCError> {
+        log::debug!("Getting signatures");
         let result = sync::get_signatures(&self.base, &self.actions);
         match result {
             Ok(signatures) => Ok(signatures),
@@ -467,6 +477,7 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn get_detailed_changes(&self, signatures: Vec<SignatureWithPath>) -> Result<Vec<sync::ChangeDetails>, RPCError> {
+        log::debug!("Getting detailed changes for {} signatures", signatures.len());
         let result = sync::get_detailed_changes(&self.base, &self.actions, &signatures);
         match result {
             Ok(details) => Ok(details),
@@ -475,6 +486,7 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError> {
+        log::debug!("Appling detailed changes, with {} details", details.len());
         let result = sync::apply_detailed_changes(&self.base, &self.actions, &details, &mut self.all_old);
         match result {
             Ok(()) => Ok(()),
@@ -483,6 +495,7 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn save_state(&self) -> Result<(), RPCError> {
+        log::debug!("Saving state");
         std::fs::create_dir_all(profile::remote_state_dir())?;
         let remote_state = profile::remote_state(&self.remote_id);
         log::info!("Saving remote state {} with {} entries", remote_state.to_str().unwrap(), &self.all_old.len());
@@ -500,6 +513,10 @@ impl DuetServer for DuetServerImpl {
 }
 
 async fn server() -> Result<()> {
+    std::fs::create_dir_all(PathBuf::from(shellexpand::full("~/.config/duet")?.to_string()))?;
+    use log::LevelFilter;
+    simple_logging::log_to_file(PathBuf::from(shellexpand::full("~/.config/duet/remote.log")?.to_string()), LevelFilter::Trace)?;
+
     use std::io::{self};
 
     let stdin = io::stdin();
@@ -507,7 +524,7 @@ async fn server() -> Result<()> {
 
     let stdio = ReadWrite::new(stdin, stdout);
 
-    log::trace!("in server()");
+    log::debug!("in server()");
 
     let mut serve = DuetServerRPCServer::new(DuetServerImpl::new(), BincodeTransport::new(stdio));
     match serve.serve() {
@@ -531,6 +548,7 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, igno
                     let mut f = File::open(f).await.unwrap();
                     let mut contents = vec![];
                     f.read_to_end(&mut contents).await.unwrap();
+                    log::debug!("Done loading");
                     deserialize_from(contents.as_slice()).unwrap()
                 } else {
                     Vec::new()
@@ -538,6 +556,7 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, igno
             } else {
                 Vec::new()
             };
+        log::debug!("Done reading out entries");
         all_old_entries
     };
 
