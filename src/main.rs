@@ -453,19 +453,26 @@ impl DuetServer for DuetServerImpl {
     fn changes(&mut self, path: String, locations: Locations, ignore: profile::Ignore, remote_id: String) -> Result<Changes, RPCError> {
         log::debug!("remote id = {}", remote_id);
         self.remote_id = remote_id;
-        let future = async move {
-            let result = old_and_changes(&self.base, &path, &locations, &ignore, Some(profile::remote_state(&self.remote_id).to_str().unwrap())).await;
-            match result {
-                Ok((all_old, changes)) => {
-                    self.all_old = all_old;
-                    Ok(changes)
-                },
-                Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in getting changes from the server"))
-            }
-        };
-        use futures::{executor::block_on};
-        let changes = block_on(future)?;
-        Ok(changes)
+
+        use crossbeam::channel;
+        let (tx, rx) = channel::bounded(1);
+
+        let base = self.base.clone();
+        let remote_id = self.remote_id.clone();
+        let _future = tokio::spawn(async move {
+            let result = old_and_changes(&base, &path, &locations, &ignore, Some(profile::remote_state(&remote_id).to_str().unwrap())).await;
+            let _ = tx.send(result);
+        });
+
+        let result = rx.recv().unwrap();
+
+        match result {
+            Ok((all_old, changes)) => {
+                self.all_old = all_old;
+                Ok(changes)
+            },
+            Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in getting changes from the server"))
+        }
     }
 
     fn get_signatures(&self) -> Result<Vec<SignatureWithPath>, RPCError> {
