@@ -516,7 +516,7 @@ impl DuetServer for DuetServerImpl {
 async fn server() -> Result<()> {
     std::fs::create_dir_all(PathBuf::from(shellexpand::full("~/.config/duet")?.to_string()))?;
     use log::LevelFilter;
-    simple_logging::log_to_file(PathBuf::from(shellexpand::full("~/.config/duet/remote.log")?.to_string()), LevelFilter::Trace)?;
+    simple_logging::log_to_file(PathBuf::from(shellexpand::full("~/.config/duet/remote.log")?.to_string()), LevelFilter::Debug)?;
 
     use std::io::{self};
 
