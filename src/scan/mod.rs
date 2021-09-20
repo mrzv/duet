@@ -1,7 +1,7 @@
 use std::path::{PathBuf,Path};
 use std::cmp::Ordering;
 
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt,FileTypeExt};
 
 use serde::{Serialize,Deserialize};
 
@@ -213,6 +213,12 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
         }
 
         let meta = fs::symlink_metadata(&path).await.expect("Couldn't get metadata");
+
+        let file_type = meta.file_type();
+        if file_type.is_block_device() || file_type.is_char_device() || file_type.is_fifo() || file_type.is_socket() {
+            log::trace!("Skipping (special): {:?}", path);
+            continue;
+        }
 
         if meta.is_dir() && dev == meta.dev() {
             let path = path.clone();
