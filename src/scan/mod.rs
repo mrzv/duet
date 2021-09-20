@@ -258,7 +258,8 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
 #[async_recursion]
 async fn scan_children(children: Vec<PathBuf>, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) {
     use futures::stream::{self, StreamExt};
-    stream::iter(children).for_each_concurrent(None,
+    //stream::iter(children).for_each_concurrent(None,
+    stream::iter(children).for_each(
         |path| async {
             let locations = locations.clone();
             let restrict = restrict.clone();
