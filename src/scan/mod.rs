@@ -98,13 +98,19 @@ impl DirEntryWithMeta {
         !(self.is_dir || self.is_symlink())
     }
 
-    pub fn compute_checksum(&mut self, base: &PathBuf) -> Result<()> {
+    pub async fn compute_checksum(&mut self, base: &PathBuf) -> Result<()> {
         if !self.is_file() {
             return Ok(());
         }
 
         let filename = base.join(&self.path);
-        self.checksum = adler32::adler32(std::fs::File::open(filename)?)?;
+        log::trace!("Computing checksum for {}", filename.display());
+
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(filename).await?;
+        let mut contents = vec![];
+        file.read_to_end(&mut contents).await?;
+        self.checksum = adler32::adler32(&contents[..])?;
 
         Ok(())
     }

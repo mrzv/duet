@@ -571,14 +571,15 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, igno
     let mut changes: Vec<_> = scan::changes(restricted_old_entries_iter, restricted_current_scan?.iter()).collect();
 
     // compute checksums
+    log::debug!("Computing checksums for {} changes", changes.len());
     let base = PathBuf::from(base);
     for change in &mut changes {
         match change {
-            Change::Added(n) => { n.compute_checksum(&base).expect(format!("Unable to compute checksum for {:?}", n).as_str()); },
-            Change::Modified(_,n) => { n.compute_checksum(&base).expect(format!("Unable to compute checksum for {:?}", n).as_str()); },
+            Change::Added(n) => { n.compute_checksum(&base).await.expect(format!("Unable to compute checksum for {:?}", n).as_str()); },
+            Change::Modified(_,n) => { n.compute_checksum(&base).await.expect(format!("Unable to compute checksum for {:?}", n).as_str()); },
             Change::Removed(_) => {},
         }
-    };
+    }
 
     Ok((all_old_entries, changes))
 }
