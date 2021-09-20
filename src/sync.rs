@@ -112,9 +112,9 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
             }
         }
 
-        log::debug!("applying detailed change to {}", action.path().display());
         match action {
             Action::Local(change) | Action::ResolvedLocal((_,_),change) => {
+            log::debug!("applying detailed change to {}", action.path().display());
                 match change {
                     Change::Removed(e) => {
                         let filename = base_path.join(e.path());
