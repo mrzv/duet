@@ -454,17 +454,10 @@ impl DuetServer for DuetServerImpl {
         log::debug!("remote id = {}", remote_id);
         self.remote_id = remote_id;
 
-        use crossbeam::channel;
-        let (tx, rx) = channel::bounded(1);
-
-        let base = self.base.clone();
-        let remote_id = self.remote_id.clone();
-        let _future = tokio::spawn(async move {
-            let result = old_and_changes(&base, &path, &locations, &ignore, Some(profile::remote_state(&remote_id).to_str().unwrap())).await;
-            let _ = tx.send(result);
+        let handle = tokio::runtime::Handle::current();
+        let result = handle.block_on(async {
+            old_and_changes(&self.base, &path, &locations, &ignore, Some(profile::remote_state(&self.remote_id).to_str().unwrap())).await
         });
-
-        let result = rx.recv().unwrap();
 
         match result {
             Ok((all_old, changes)) => {
@@ -534,11 +527,13 @@ async fn server() -> Result<()> {
 
     log::debug!("in server()");
 
-    let mut serve = DuetServerRPCServer::new(DuetServerImpl::new(), BincodeTransport::new(stdio));
-    match serve.serve() {
-        Ok(_) => panic!("Expected EOF error"),
-        Err(e) => assert_eq!(e.kind, RPCErrorKind::TransportEOF),
-    };
+    tokio::task::spawn_blocking(|| {
+        let mut serve = DuetServerRPCServer::new(DuetServerImpl::new(), BincodeTransport::new(stdio));
+        match serve.serve() {
+            Ok(_) => panic!("Expected EOF error"),
+            Err(e) => assert_eq!(e.kind, RPCErrorKind::TransportEOF),
+        };
+    }).await?;
 
     Ok(())
 }
