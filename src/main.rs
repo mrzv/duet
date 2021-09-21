@@ -41,6 +41,7 @@ pub async fn main() -> Result<()> {
             (@arg profile: +required "profile to synchronize")
             (@arg path:              "path to synchronize")
             (@arg interactive: -i    "interactive conflict resolution")
+            (@arg yes: -y            "assume yes (i.e., synchronize, if there are no conflicts)")
             (@arg dry_run: -n        "don't apply changes")
             (@arg batch: -b          "run as a batch (abort on conflict)")
             (@arg force: -f          "in batch mode, apply what's possible, even if there are conflicts")
@@ -244,6 +245,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let force = matches.is_present("force");
     let verbose = matches.is_present("verbose");
     let interactive = matches.is_present("interactive");
+    let yes = matches.is_present("yes");
     let path = matches.value_of("path").unwrap_or("");
 
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
@@ -309,12 +311,21 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
                 AllResolution::Proceed
             }
         } else if interactive {
-            let resolution = resolve_interactive(&mut actions, verbose)?;
+            let resolution =
+                if yes && num_conflicts == 0 {
+                    AllResolution::Proceed
+                } else {
+                    resolve_interactive(&mut actions, verbose)?
+                };
             show_actions(&actions, verbose);
             resolution
         } else {
             show_actions(&actions, verbose);
-            resolve_sequential(&mut actions, verbose)?
+            if yes && num_conflicts == 0 {
+                AllResolution::Proceed
+            } else {
+                resolve_sequential(&mut actions, verbose)?
+            }
         };
 
     if let AllResolution::Abort = resolution {
