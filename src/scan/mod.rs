@@ -168,7 +168,7 @@ fn narrow_parent_from_to(pft: ParentFromTo, path: &PathBuf, locations: &Location
     ParentFromTo { parent, from, to }
 }
 
-fn relative<'a>(base: &PathBuf, path: &'a PathBuf) -> &'a Path {
+pub fn relative<'a>(base: &PathBuf, path: &'a PathBuf) -> &'a Path {
     path.strip_prefix(&base).unwrap()
 }
 

@@ -235,6 +235,23 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let local_base = shellexpand::full(&prf.local)?.to_string();
     let (remote_base, remote_server, remote_cmd) = parse_remote(&prf.remote)?;
 
+    // if path starts with a . or .., treat it as relative to current directory
+    let path =
+        if !path.is_empty() && (path.starts_with("./") || path.starts_with("../") || path == "." || path == "..") {
+            let local_base = PathBuf::from(&local_base);
+            let cwd = std::env::current_dir()?;
+            use path_clean::{PathClean};
+            let path = cwd.join(path).clean();
+            scan::relative(&local_base, &path).to_path_buf()
+        } else if PathBuf::from(path).is_absolute() {
+            let local_base = PathBuf::from(&local_base);
+            let path = PathBuf::from(path);
+            scan::relative(&local_base, &path).to_path_buf()
+        } else {
+            PathBuf::from(path)
+        };
+    let path = path.to_str().unwrap();
+
     let local_state = profile::local_state(name).to_string_lossy().into_owned();
 
     // --- Get local and remote changes concurrently ---
