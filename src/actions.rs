@@ -119,29 +119,29 @@ pub fn details(action: &Action) -> String {
             Action::Local(c)                => {
                 match c {
                     Change::Added(d) | Change::Removed(d) => {
-                        format!("{}", show_meta(d))
+                        format!("{}", show_meta(d, d))
                     },
                     Change::Modified(o,n) => {
-                        format!("{}      {}", show_meta(o), show_meta(n))           // remote is new, local is old
+                        format!("{}      {}", show_meta(o, o), show_meta(n, o))           // remote is new, local is old
                     },
                 }
             },
             Action::Remote(c)               => {
                 match c {
                     Change::Added(d) | Change::Removed(d) => {
-                        format!("{}", show_meta(d))
+                        format!("{}", show_meta(d, d))
                     },
                     Change::Modified(o,n) => {
-                        format!("{}      {}", show_meta(n), show_meta(o))           // local is new, remote is old
+                        format!("{}      {}", show_meta(n,o), show_meta(o,o))           // local is new, remote is old
                     },
                 }
             },
             Action::Conflict(l,r)
             | Action::ResolvedLocal((l,r),_)
             | Action::ResolvedRemote((l,r),_)   => {
-                format!("{}      {}", show_meta(change_entry(l)), show_meta(change_entry(r)))
+                format!("{}      {}", show_meta(change_entry(l),change_entry(r)), show_meta(change_entry(r),change_entry(l)))
             },
-            Action::Identical(l,_)            => format!("{}", show_meta(change_entry(l))),
+            Action::Identical(l,_)            => format!("{}", show_meta(change_entry(l),change_entry(l))),
     }
 }
 
@@ -153,14 +153,27 @@ fn change_entry(change: &Change) -> &Entry {
     }
 }
 
-fn show_meta(e: &Entry) -> String {
+fn highlight(s: String, status: bool) -> ColoredString {
+    if status {
+        s.yellow()
+    } else {
+        s.normal()
+    }
+}
+
+fn show_meta(e: &Entry, before: &Entry) -> String {
     if e.is_symlink() {
         // permissions don't matter
-        show_mtime(e) + " -> " + &e.target().as_ref().unwrap()
+        format!("{} -> {}", highlight(show_mtime(e), e.mtime() != before.mtime()),
+                            highlight(e.target().as_ref().unwrap().to_string(), e.target() != before.target()))
     } else if e.is_dir() {
-        show_permissions(e) + " " + &show_mtime(e)
+        format!("{} {}", highlight(show_permissions(e), e.mode() != before.mode()),
+                         highlight(show_mtime(e), e.mtime() != before.mtime()))
     } else {
-        show_permissions(e) + " " + &show_mtime(e) + " " + &show_size(e) + " " + &show_checksum(e)
+        format!("{} {} {} {}", highlight(show_permissions(e), e.mode() != before.mode()),
+                               highlight(show_mtime(e), e.mtime() != before.mtime()),
+                               highlight(show_size(e), e.size() != before.size()),
+                               highlight(show_checksum(e), e.checksum() != before.checksum()))
     }
 }
 
