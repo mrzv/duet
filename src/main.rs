@@ -249,7 +249,6 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let path = matches.value_of("path").unwrap_or("");
 
     let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
-    println!("Using profile: {}", name.cyan());
 
     let local_id = local_id(name);
 
@@ -258,6 +257,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
 
     let path = normalize_path(&local_base, path)?;
     let path = path.to_str().unwrap();
+    println!("Using profile: {} {}", name.cyan(), path.yellow());
 
     let local_state = profile::local_state(name).to_string_lossy().into_owned();
 
