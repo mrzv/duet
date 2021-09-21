@@ -116,21 +116,39 @@ impl fmt::Display for Action {
 
 pub fn details(action: &Action) -> String {
     match action {
-            Action::Local(c)
-            | Action::Remote(c)                 => format!("{}", show_change_details(c)),
+            Action::Local(c)                => {
+                match c {
+                    Change::Added(d) | Change::Removed(d) => {
+                        format!("{}", show_meta(d))
+                    },
+                    Change::Modified(o,n) => {
+                        format!("{}      {}", show_meta(o), show_meta(n))           // remote is new, local is old
+                    },
+                }
+            },
+            Action::Remote(c)               => {
+                match c {
+                    Change::Added(d) | Change::Removed(d) => {
+                        format!("{}", show_meta(d))
+                    },
+                    Change::Modified(o,n) => {
+                        format!("{}      {}", show_meta(n), show_meta(o))           // local is new, remote is old
+                    },
+                }
+            },
             Action::Conflict(l,r)
             | Action::ResolvedLocal((l,r),_)
             | Action::ResolvedRemote((l,r),_)   => {
-                format!("{}      {}", show_change_details(l), show_change_details(r))
+                format!("{}      {}", show_meta(change_entry(l)), show_meta(change_entry(r)))
             },
-            Action::Identical(_l,_r)            => format!(""),
+            Action::Identical(l,_)            => format!("{}", show_meta(change_entry(l))),
     }
 }
 
-fn show_change_details(change: &Change) -> String {
+fn change_entry(change: &Change) -> &Entry {
     match change {
         Change::Added(d) | Change::Removed(d) | Change::Modified(_,d) => {
-            show_meta(d)
+            d
         }
     }
 }
@@ -138,24 +156,32 @@ fn show_change_details(change: &Change) -> String {
 fn show_meta(e: &Entry) -> String {
     if e.is_symlink() {
         // permissions don't matter
-        show_mtime(e.mtime()) + " -> " + &e.target().as_ref().unwrap()
+        show_mtime(e) + " -> " + &e.target().as_ref().unwrap()
     } else if e.is_dir() {
-        show_permissions(e.mode()) + " " + &show_mtime(e.mtime())
+        show_permissions(e) + " " + &show_mtime(e)
     } else {
-        show_permissions(e.mode()) + " " + &show_mtime(e.mtime()) + " " + &show_size(e.size())
+        show_permissions(e) + " " + &show_mtime(e) + " " + &show_size(e) + " " + &show_checksum(e)
     }
 }
 
-fn show_mtime(mtime: i64) -> String {
+fn show_mtime(e: &Entry) -> String {
+    let mtime = e.mtime();
     use chrono::NaiveDateTime;
     let date_time = NaiveDateTime::from_timestamp(mtime, 0);
     date_time.format("%a %Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn show_permissions(mode: u32) -> String {
+fn show_permissions(e: &Entry) -> String {
+    let mode = e.mode();
     unix_mode::to_string(mode)
 }
 
-fn show_size(size: u64) -> String {
-    byte_unit::Byte::from_bytes(size.into()).get_appropriate_unit(true).to_string()
+fn show_size(e: &Entry) -> String {
+    let size = e.size();
+    format!("{:>10}", byte_unit::Byte::from_bytes(size.into()).get_appropriate_unit(true).to_string())
+}
+
+fn show_checksum(e: &Entry) -> String {
+    let checksum = e.checksum();
+    format!("{:08x}", checksum)
 }

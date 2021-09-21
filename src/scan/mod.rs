@@ -90,6 +90,10 @@ impl DirEntryWithMeta {
         self.size
     }
 
+    pub fn checksum(&self) -> u32 {
+        self.checksum
+    }
+
     pub fn set_ino(&mut self, ino: u64) {
         self.ino = ino;
     }
