@@ -3,6 +3,7 @@ use std::path::{PathBuf};
 use colored::*;
 use serde::{Serialize,Deserialize};
 use super::scan::change::{Change,same};
+use super::scan::{DirEntryWithMeta as Entry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
@@ -67,14 +68,20 @@ impl Action {
     }
 }
 
-pub fn num_unresolved_conflicts(actions: &Vec<Action>) -> usize {
-    actions.iter()
+pub fn num_unresolved_conflicts<'a,I>(actions: I) -> usize
+where
+    I: Iterator<Item = &'a Action>,
+{
+    actions
         .filter(|a| a.is_unresolved_conflict())
         .count()
 }
 
-pub fn num_identical(actions: &Vec<Action>) -> usize {
-    actions.iter()
+pub fn num_identical<'a,I>(actions: I) -> usize
+where
+    I: Iterator<Item = &'a Action>,
+{
+    actions
         .filter(|a| a.is_identical())
         .count()
 }
@@ -105,4 +112,50 @@ impl fmt::Display for Action {
             Action::Identical(l,r)          => write!(f, "{} --I-- {} {}", l, r, l.path().display()),
         }
     }
+}
+
+pub fn details(action: &Action) -> String {
+    match action {
+            Action::Local(c)
+            | Action::Remote(c)                 => format!("{}", show_change_details(c)),
+            Action::Conflict(l,r)
+            | Action::ResolvedLocal((l,r),_)
+            | Action::ResolvedRemote((l,r),_)   => {
+                format!("{}      {}", show_change_details(l), show_change_details(r))
+            },
+            Action::Identical(_l,_r)            => format!(""),
+    }
+}
+
+fn show_change_details(change: &Change) -> String {
+    match change {
+        Change::Added(d) | Change::Removed(d) | Change::Modified(_,d) => {
+            show_meta(d)
+        }
+    }
+}
+
+fn show_meta(e: &Entry) -> String {
+    if e.is_symlink() {
+        // permissions don't matter
+        show_mtime(e.mtime()) + " -> " + &e.target().as_ref().unwrap()
+    } else if e.is_dir() {
+        show_permissions(e.mode()) + " " + &show_mtime(e.mtime())
+    } else {
+        show_permissions(e.mode()) + " " + &show_mtime(e.mtime()) + " " + &show_size(e.size())
+    }
+}
+
+fn show_mtime(mtime: i64) -> String {
+    use chrono::NaiveDateTime;
+    let date_time = NaiveDateTime::from_timestamp(mtime, 0);
+    date_time.format("%a %Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn show_permissions(mode: u32) -> String {
+    unix_mode::to_string(mode)
+}
+
+fn show_size(size: u64) -> String {
+    byte_unit::Byte::from_bytes(size.into()).get_appropriate_unit(true).to_string()
 }

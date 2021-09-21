@@ -290,7 +290,7 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
         return Ok(())
     }
 
-    let num_conflicts = num_unresolved_conflicts(&actions);
+    let num_conflicts = num_unresolved_conflicts(actions.iter());
 
     let resolution =
         if batch {
@@ -669,7 +669,7 @@ fn resolve_action(action: &Action, resolution: Resolution) -> Action {
 }
 
 fn show_actions(actions: &Actions, verbose: bool) {
-    let num_identical = num_identical(&actions);
+    let num_identical = num_identical(actions.iter());
     for a in actions {
         if verbose || !a.is_identical() {
             println!("{}", a);
@@ -691,12 +691,13 @@ fn resolve_sequential(actions: &mut Actions, _verbose: bool) -> Result<AllResolu
     // not batch
     use console::{Key,Term};
     let term = Term::stdout();
-    if num_unresolved_conflicts(actions) > 0 {
+    if num_unresolved_conflicts(actions.iter()) > 0 {
         term.write_line("Resolve conflicts:")?;
 
         for a in actions {
             if let Action::Conflict(_,_) = &a {
                 term.write_line(format!("{}", a).as_str())?;
+                term.write_line(actions::details(a).as_str())?;
 
                 loop {
                     term.write_line("left/l = update local, right/r = update remote, c = keep conflict, n/a = abort")?;
@@ -720,7 +721,7 @@ fn resolve_sequential(actions: &mut Actions, _verbose: bool) -> Result<AllResolu
                             continue;
                         }
                     }
-                    term.clear_last_lines(2)?;
+                    term.clear_last_lines(3)?;
                     term.write_line(format!("{}", a).as_str())?;
                     break;
                 }
@@ -749,12 +750,17 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
 
     assert!(!actions.is_empty());
 
-    let capacity = term.size().0 as usize - 2;      // extra -1 for the prompt
-    let pages = ((actions.len() - (if verbose { 0 } else { num_identical(actions) })) as f64 / capacity as f64).ceil() as usize;
+    let mut actions: Vec<&mut Action> = actions
+                    .iter_mut()
+                    .filter(|a| verbose || !a.is_identical())
+                    .collect();
+
+    let capacity = term.size().0 as usize - 3;      // extra -1 for the prompt, -1 for detaled changes
+    let pages = (actions.len() as f64 / capacity as f64).ceil() as usize;
 
     let mut sel = 0;
     let mut height = 0;
-    let mut num_conflicts = num_unresolved_conflicts(&actions);
+    let mut num_conflicts = num_unresolved_conflicts(actions.iter().map(|a| &**a));
 
     let resolution = loop {
         term.write_line(format!("{}{}n/a = abort, f = force{} [{}]",
@@ -762,7 +768,8 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
                     if num_conflicts == 0 { ", ".normal() } else { "".normal() },
                     if actions[sel].is_conflict() { ", left/l = update local, right/r = update remote, c = keep conflict" } else { "" },
                     num_conflicts).as_str())?;
-        height += 1;
+        term.write_line(actions::details(&actions[sel]).as_str())?;
+        height += 2;
 
         for (idx, action) in actions
             .iter()
@@ -770,12 +777,10 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
             .skip(page * capacity)
             .take(capacity)
         {
-            if verbose || !action.is_identical() {
-                term.write_line(format!("{} {}",
-                         (if sel == idx { ">" } else {" "}).cyan(),
-                         action).as_str())?;
-                height += 1;
-            }
+            term.write_line(format!("{} {}",
+                     (if sel == idx { ">" } else {" "}).cyan(),
+                     action).as_str())?;
+            height += 1;
         }
 
         term.hide_cursor()?;
@@ -821,7 +826,7 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
                     if actions[sel].is_unresolved_conflict() {
                         num_conflicts -= 1;
                     }
-                    actions[sel] = resolve_action(&actions[sel], Resolution::Local);
+                    *actions[sel] = resolve_action(&actions[sel], Resolution::Local);
                 }
                 sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
             }
@@ -830,7 +835,7 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
                     if actions[sel].is_unresolved_conflict() {
                         num_conflicts -= 1;
                     }
-                    actions[sel] = resolve_action(&actions[sel], Resolution::Remote);
+                    *actions[sel] = resolve_action(&actions[sel], Resolution::Remote);
                 }
                 sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
             }
@@ -839,7 +844,7 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
                     if !actions[sel].is_unresolved_conflict() {
                         match &actions[sel] {
                             Action::ResolvedLocal((lc,rc),_) | Action::ResolvedRemote((lc,rc),_) => {
-                                actions[sel] = Action::Conflict(lc.clone(),rc.clone());
+                                *actions[sel] = Action::Conflict(lc.clone(),rc.clone());
                             },
                             _ => { unreachable!(); }
                         }

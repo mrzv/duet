@@ -86,6 +86,10 @@ impl DirEntryWithMeta {
         self.mtime
     }
 
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
     pub fn set_ino(&mut self, ino: u64) {
         self.ino = ino;
     }
