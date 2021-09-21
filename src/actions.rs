@@ -116,7 +116,7 @@ impl fmt::Display for Action {
 
 pub fn details(action: &Action) -> String {
     match action {
-            Action::Local(c)                => {
+            Action::Local(c) => {
                 match c {
                     Change::Added(d) | Change::Removed(d) => {
                         format!("{}", show_meta(d, d))
@@ -126,7 +126,7 @@ pub fn details(action: &Action) -> String {
                     },
                 }
             },
-            Action::Remote(c)               => {
+            Action::Remote(c) => {
                 match c {
                     Change::Added(d) | Change::Removed(d) => {
                         format!("{}", show_meta(d, d))
@@ -138,10 +138,10 @@ pub fn details(action: &Action) -> String {
             },
             Action::Conflict(l,r)
             | Action::ResolvedLocal((l,r),_)
-            | Action::ResolvedRemote((l,r),_)   => {
+            | Action::ResolvedRemote((l,r),_) => {
                 format!("{}      {}", show_meta(change_entry(l),change_entry(r)), show_meta(change_entry(r),change_entry(l)))
             },
-            Action::Identical(l,_)            => format!("{}", show_meta(change_entry(l),change_entry(l))),
+            Action::Identical(l,_) => format!("{}", show_meta(change_entry(l),change_entry(l))),
     }
 }
 
@@ -179,8 +179,9 @@ fn show_meta(e: &Entry, before: &Entry) -> String {
 
 fn show_mtime(e: &Entry) -> String {
     let mtime = e.mtime();
-    use chrono::NaiveDateTime;
+    use chrono::prelude::*;
     let date_time = NaiveDateTime::from_timestamp(mtime, 0);
+    let date_time = DateTime::<Utc>::from_utc(date_time, Utc).with_timezone(&Local);
     date_time.format("%a %Y-%m-%d %H:%M:%S").to_string()
 }
 
