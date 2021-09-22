@@ -165,7 +165,7 @@ fn show_meta(e: &Entry, before: &Entry) -> String {
     if e.is_symlink() {
         // permissions don't matter
         format!("{} -> {}", highlight(show_mtime(e), e.mtime() != before.mtime()),
-                            highlight(e.target().as_ref().unwrap().to_string(), e.target() != before.target()))
+                            highlight(e.target().as_ref().unwrap().display().to_string(), e.target() != before.target()))
     } else if e.is_dir() {
         format!("{} {}", highlight(show_permissions(e), e.mode() != before.mode()),
                          highlight(show_mtime(e), e.mtime() != before.mtime()))

@@ -1,5 +1,4 @@
 use color_eyre::eyre::{Result,eyre};
-use clap::{clap_app,crate_version,crate_authors,ArgMatches,AppSettings};
 use colored::*;
 
 use tokio::sync::mpsc;
@@ -12,7 +11,7 @@ mod sync;
 use actions::{Action,Actions,num_unresolved_conflicts,num_identical,reverse};
 use scan::location::{Locations};
 use scan::{Change,DirEntryWithMeta};
-use std::path::PathBuf;
+use std::path::{Path,PathBuf};
 
 use std::fs::File;
 use std::io::{BufWriter,BufReader};
@@ -28,102 +27,133 @@ use openssh::{Session, KnownHosts, RemoteChild};
 type Entries = Vec<DirEntryWithMeta>;
 type Changes = Vec<Change>;
 
+mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
+}
+
+fn show_help() {
+        print!("\
+duet {}
+bi-directional synchronization
+
+synchronize according to profile
+
+USAGE:
+    duet [FLAGS] <profile> [path]
+
+FLAGS:
+    -i, --interactive   interactive conflict resolution
+    -y, --yes           assume yes (i.e., synchronize, if there are no conflicts)
+    -b, --batch         run as a batch (abort on conflict)
+    -f, --force         in batch mode, apply what's possible, even if there are conflicts
+    -v, --verbose       verbose output
+    -n, --dry-run       don't apply changes
+
+        --version       prints version information
+    -h, --help          prints help information
+
+ARGS:
+    <profile>    profile to synchronize
+    <path>       path to synchronize
+", built_info::PKG_VERSION);
+}
+
 #[tokio::main]
 pub async fn main() -> Result<()> {
     color_eyre::install().unwrap();
 
-    let matches = clap_app!(duet =>
-        (version: crate_version!())
-        (author: crate_authors!())
-        (about: "bi-directional synchronization")
-        (@subcommand sync =>
-            (about: "synchronize according to profile")
-            (@arg profile: +required "profile to synchronize")
-            (@arg path:              "path to synchronize")
-            (@arg interactive: -i    "interactive conflict resolution")
-            (@arg yes: -y            "assume yes (i.e., synchronize, if there are no conflicts)")
-            (@arg dry_run: -n        "don't apply changes")
-            (@arg batch: -b          "run as a batch (abort on conflict)")
-            (@arg force: -f          "in batch mode, apply what's possible, even if there are conflicts")
-            (@arg verbose: -v        "verbose output")
-        )
-        (@subcommand server =>
-            (about: "run server-side code")
-            (setting: AppSettings::Hidden)
-        )
-        // testing/debugging
-        (@subcommand snapshot =>
-            (about: "take snapshot")
-            (@arg profile: +required "profile to snapshot")
-            (@arg state:             "state file to save snapshot")
-            (setting: AppSettings::Hidden)
-        )
-        (@subcommand inspect =>
-            (about: "inspect a state file")
-            (@arg state: +required "statefile to show")
-            (setting: AppSettings::Hidden)
-        )
-        (@subcommand changes =>
-            (about: "show changes compared to a given state")
-            (@arg profile: +required "profile to compare")
-            (@arg state:             "state file to compare")
-            (setting: AppSettings::Hidden)
-        )
-        (@subcommand info =>
-            (about: "show info about a profile")
-            (@arg profile: +required "profile to compare")
-            (setting: AppSettings::Hidden)
-        )
-        (@subcommand walk =>
-            (about: "walk a directory")
-            (@arg path: +required  "path to walk")
-            (setting: AppSettings::Hidden)
-        )
-    ).get_matches();
+    let mut pargs = pico_args::Arguments::from_env();
 
-    if let Some(matches) = matches.subcommand_matches("sync") {
-        return sync(matches).await;
-    } else if let Some(matches) = matches.subcommand_matches("snapshot") {
-        return snapshot(matches).await;
-    } else if let Some(matches) = matches.subcommand_matches("inspect") {
-        return inspect(matches);
-    } else if let Some(matches) = matches.subcommand_matches("changes") {
-        return changes(matches).await;
-    } else if let Some(matches) = matches.subcommand_matches("info") {
-        return info(matches);
-    } else if let Some(_matches) = matches.subcommand_matches("server") {
-        return server().await;
-    } else if let Some(matches) = matches.subcommand_matches("walk") {
-        return walk(matches).await;
+    if pargs.contains(["-h", "--help"]) {
+        show_help();
+        return Ok(());
     }
 
-    Ok(())
+    if pargs.contains("--version") {
+        println!("duet {}", built_info::PKG_VERSION);
+        for (name,version) in built_info::DEPENDENCIES {
+            println!("  {} {}", name, version);
+        }
+        return Ok(());
+    }
+
+    if pargs.contains("--server") {
+        return server().await;
+    }
+
+    let interactive = pargs.contains(["-i", "--interactive"]);
+    let yes         = pargs.contains(["-y", "--yes"]);
+    let dry_run     = pargs.contains(["-n", "--dry-run"]);
+    let batch       = pargs.contains(["-b", "--batch"]);
+    let force       = pargs.contains(["-f", "--force"]);
+    let verbose     = pargs.contains(["-v", "--verbose"]);
+    let profile     = pargs.free_from_str::<String>();
+
+    if let Err(_) = profile {
+        show_help();
+        return Ok(());
+    }
+    let profile = profile.unwrap();
+
+    // check for possible (hidden) subcommands
+    match profile.as_str() {
+        "_snapshot" => {
+            // take snapshot of a profile into a statefile
+            let profile = pargs.free_from_str()?;
+            let state = pargs.opt_free_from_os_str(parse_path)?;
+            return snapshot(profile, state).await;
+        },
+        "_inspect" => {
+            // inspect a state file
+            let state = pargs.free_from_os_str(parse_path)?;
+            return inspect(state);
+        },
+        "_changes" => {
+            // show changes compared to a given state
+            let profile = pargs.free_from_str()?;
+            let state = pargs.opt_free_from_os_str(parse_path)?;
+            return changes(profile, state).await;
+        },
+        "_info" => {
+            // show info about a profile
+            let profile = pargs.free_from_str()?;
+            return info(profile);
+        },
+        "_walk" => {
+            // walk a directory
+            let path = pargs.free_from_os_str(parse_path)?;
+            return walk(path).await;
+        },
+        _ => {
+            // default = synchronize according to profile
+            let path = pargs.opt_free_from_os_str(parse_path)?;
+            return sync(profile, path, interactive, yes, dry_run, batch, force, verbose).await;
+        },
+    }
 }
 
-fn inspect(matches: &ArgMatches<'_>) -> Result<()> {
-    let statefile = matches.value_of("state").unwrap();
-    let entries: Entries = old_entries(statefile);
+fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
+    Ok(s.into())
+}
+
+fn inspect(statefile: PathBuf) -> Result<()> {
+    let entries: Entries =
+        if statefile.exists() {
+            log::debug!("Loading: {}", statefile.display());
+            let f = BufReader::new(File::open(statefile).unwrap());
+            deserialize_from(f).unwrap()
+        } else {
+            Vec::new()
+        };
     for e in entries {
         println!("{:?}", e);
     }
     Ok(())
 }
 
-fn old_entries(fname: &str) -> Entries {
-    let entries: Entries =
-        if std::path::Path::new(fname).exists() {
-            log::debug!("Loading: {}", fname);
-            let f = BufReader::new(File::open(fname).unwrap());
-            deserialize_from(f).unwrap()
-        } else {
-            Vec::new()
-        };
-    entries
-}
-
-async fn scan_entries(base: &str, path: &str, locations: &Locations, ignore: &profile::Ignore) -> Result<Entries> {
-    let base = base.to_string();
-    let path = path.to_string();
+async fn scan_entries(base: &PathBuf, path: &PathBuf, locations: &Locations, ignore: &profile::Ignore) -> Result<Entries> {
+    let base = base.clone();
+    let path = path.clone();
     let locations = locations.clone();
     let ignore = ignore.clone();
 
@@ -147,42 +177,29 @@ async fn scan_entries(base: &str, path: &str, locations: &Locations, ignore: &pr
     Ok(entries)
 }
 
-async fn snapshot(matches: &ArgMatches<'_>) -> Result<()> {
-    let name = matches.value_of("profile").unwrap();
-    let statefile = matches.value_of("state");
-
-    let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
+async fn snapshot(name: String, statefile: Option<PathBuf>) -> Result<()> {
+    let prf = profile::parse(&name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.cyan());
 
-    let local_base = shellexpand::full(&prf.local)?.to_string();
+    let local_base = full(&prf.local)?;
 
-    let current_entries: Entries = scan_entries(&local_base, "", &prf.locations, &prf.ignore).await?;
+    let current_entries: Entries = scan_entries(&local_base, &PathBuf::from(""), &prf.locations, &prf.ignore).await?;
 
-    let statefile = if let Some(s) = statefile {
-        String::from(s)
-    } else {
-        String::from(profile::local_state(name).to_str().unwrap())
-    };
+    let statefile = statefile.unwrap_or(profile::local_state(&name));
     let f = BufWriter::new(File::create(statefile).unwrap());
     serialize_into(f, &current_entries)?;
     Ok(())
 }
 
-async fn changes(matches: &ArgMatches<'_>) -> Result<()> {
-    let name = matches.value_of("profile").unwrap();
-    let statefile = matches.value_of("state");
-
-    let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
+async fn changes(name: String, statefile: Option<PathBuf>) -> Result<()> {
+    let prf = profile::parse(&name).expect(&format!("Failed to read profile {}", name.yellow()));
     println!("Using profile: {}", name.cyan());
 
-    let local_base = shellexpand::full(&prf.local)?.to_string();
+    let local_base = full(&prf.local)?;
 
-    let statefile = if let Some(s) = statefile {
-        String::from(s)
-    } else {
-        String::from(profile::local_state(name).to_str().unwrap())
-    };
-    let (_, changes) = old_and_changes(&local_base, "", &prf.locations, &prf.ignore, Some(&statefile)).await?;
+    let statefile = statefile.unwrap_or(profile::local_state(&name));
+
+    let (_, changes) = old_and_changes(&local_base, &PathBuf::from(""), &prf.locations, &prf.ignore, Some(&statefile)).await?;
 
     for c in changes {
         println!("{} {}", c, c.path().display());
@@ -191,9 +208,8 @@ async fn changes(matches: &ArgMatches<'_>) -> Result<()> {
     Ok(())
 }
 
-fn info(matches: &ArgMatches<'_>) -> Result<()> {
-    let name = matches.value_of("profile").unwrap();
-    println!("Profile {} located at {}", name.yellow(), profile::location(name).to_str().unwrap());
+fn info(name: String) -> Result<()> {
+    println!("Profile {} located at {}", name.cyan(), profile::location(&name).display().to_string().yellow());
     Ok(())
 }
 
@@ -217,11 +233,9 @@ fn parse_remote(remote: &String) -> Result<(String, Option<String>, String)> {
     Ok((remote_base, remote_server, remote_cmd))
 }
 
-fn normalize_path(local_base: &str, path: &str) -> Result<PathBuf> {
-    let local_base = PathBuf::from(&local_base);
-
+fn normalize_path(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
     // if path starts with a . or .., treat it as relative to current directory
-    if !path.is_empty() && (path.starts_with("./") || path.starts_with("../") || path == "." || path == "..") {
+    if path.starts_with("./") || path.starts_with("../") || path == Path::new(".") || path == Path::new("..") {
         let cwd = std::env::current_dir()?;
         use path_clean::{PathClean};
         let path = cwd.join(path).clean();
@@ -236,30 +250,26 @@ fn normalize_path(local_base: &str, path: &str) -> Result<PathBuf> {
     }
 }
 
-async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
+fn full(s: &String) -> Result<PathBuf> {
+    Ok(PathBuf::from(shellexpand::full(s)?.into_owned()))
+}
+
+async fn sync(name: String, path: Option<PathBuf>,
+              interactive: bool, yes: bool, dry_run: bool,
+              batch: bool, force: bool, verbose: bool) -> Result<()> {
     env_logger::init();
 
-    let name = matches.value_of("profile").unwrap();
-    let dry_run = matches.is_present("dry_run");
-    let batch = matches.is_present("batch");
-    let force = matches.is_present("force");
-    let verbose = matches.is_present("verbose");
-    let interactive = matches.is_present("interactive");
-    let yes = matches.is_present("yes");
-    let path = matches.value_of("path").unwrap_or("");
+    let prf = profile::parse(&name).expect(&format!("Failed to read profile {}", name.yellow()));
 
-    let prf = profile::parse(name).expect(&format!("Failed to read profile {}", name.yellow()));
+    let local_id = local_id(&name);
 
-    let local_id = local_id(name);
-
-    let local_base = shellexpand::full(&prf.local)?.to_string();
+    let local_base = full(&prf.local)?;
     let (remote_base, remote_server, remote_cmd) = parse_remote(&prf.remote)?;
 
-    let path = normalize_path(&local_base, path)?;
-    let path = path.to_str().unwrap();
-    println!("Using profile: {} {}", name.cyan(), path.yellow());
+    let path = normalize_path(&local_base, &path.unwrap_or(PathBuf::from("")))?;
+    println!("Using profile: {} {}", name.cyan(), path.display().to_string().yellow());
 
-    let local_state = profile::local_state(name).to_string_lossy().into_owned();
+    let local_state = profile::local_state(&name);
 
     // --- Get local and remote changes concurrently ---
     let local_fut = old_and_changes(&local_base, &path, &prf.locations, &prf.ignore, Some(&local_state));
@@ -273,9 +283,10 @@ async fn sync(matches: &ArgMatches<'_>) -> Result<()> {
     let mut server = launch_server(&remote_session, remote_cmd);
     let remote = get_remote(&mut server);
 
+    let path = path.clone();
     let remote_fut = async {
         remote.set_base(remote_base).await.expect("Couldn't set server base");
-        remote.changes(path.to_string(), prf.locations.clone(), prf.ignore.clone(), local_id).await.expect("Couldn't get remote changes")
+        remote.changes(path, prf.locations.clone(), prf.ignore.clone(), local_id).await.expect("Couldn't get remote changes")
     };
 
     use futures::join;
@@ -382,7 +393,7 @@ fn launch_server(session: &Option<Session>, cmd: String) -> Server {
     // launch server
     if let Some(session) = session {
         let server = session.command(cmd)
-            .arg("server")
+            .arg("--server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -395,7 +406,7 @@ fn launch_server(session: &Option<Session>, cmd: String) -> Server {
     } else {
         let cmd = shellexpand::full(&cmd).expect("Failed to expand command").to_string();
         let server = Command::new(cmd)
-            .arg("server")
+            .arg("--server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -440,7 +451,7 @@ use sync::{SignatureWithPath,ChangeDetails};
 pub trait DuetServer {
     fn set_base(&mut self, base: String) -> Result<(), RPCError>;
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError>;
-    fn changes(&mut self, path: String, locations: Locations, ignore: profile::Ignore, remote_id: String) -> Result<Changes, RPCError>;
+    fn changes(&mut self, path: PathBuf, locations: Locations, ignore: profile::Ignore, remote_id: String) -> Result<Changes, RPCError>;
     fn get_signatures(&self) -> Result<Vec<SignatureWithPath>, RPCError>;
     fn get_detailed_changes(&self, signatures: Vec<SignatureWithPath>) -> Result<Vec<sync::ChangeDetails>, RPCError>;
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError>;
@@ -449,7 +460,7 @@ pub trait DuetServer {
 
 struct DuetServerImpl
 {
-    base:       String,
+    base:       PathBuf,
     remote_id:  String,
     all_old:    Entries,
     actions:    Actions,
@@ -458,7 +469,7 @@ struct DuetServerImpl
 impl DuetServerImpl {
     fn new() -> Self {
         DuetServerImpl {
-            base:       "".to_string(),
+            base:       PathBuf::from(""),
             remote_id:  "".to_string(),
             all_old:    Vec::new(),
             actions:    Vec::new(),
@@ -469,11 +480,11 @@ impl DuetServerImpl {
 impl DuetServer for DuetServerImpl {
     fn set_base(&mut self, base: String) -> Result<(), RPCError> {
         self.base =
-            match shellexpand::full(&base) {
-                Ok(s) => s.to_string(),
+            match full(&base) {
+                Ok(s) => s,
                 Err(_) => { return Err(RPCError::new(RPCErrorKind::Other, "cannot expand base path, when setting remote base")); },
             };
-        log::debug!("Set base {}", self.base);
+        log::debug!("Set base {}", self.base.display());
         Ok(())
     }
 
@@ -483,13 +494,13 @@ impl DuetServer for DuetServerImpl {
         Ok(())
     }
 
-    fn changes(&mut self, path: String, locations: Locations, ignore: profile::Ignore, remote_id: String) -> Result<Changes, RPCError> {
+    fn changes(&mut self, path: PathBuf, locations: Locations, ignore: profile::Ignore, remote_id: String) -> Result<Changes, RPCError> {
         log::debug!("remote id = {}", remote_id);
         self.remote_id = remote_id;
 
         let handle = tokio::runtime::Handle::current();
         let result = handle.block_on(async {
-            old_and_changes(&self.base, &path, &locations, &ignore, Some(profile::remote_state(&self.remote_id).to_str().unwrap())).await
+            old_and_changes(&self.base, &path, &locations, &ignore, Some(&profile::remote_state(&self.remote_id))).await
         });
 
         match result {
@@ -547,9 +558,9 @@ impl DuetServer for DuetServerImpl {
 }
 
 async fn server() -> Result<()> {
-    std::fs::create_dir_all(PathBuf::from(shellexpand::full("~/.config/duet")?.to_string()))?;
+    std::fs::create_dir_all(full(&"~/.config/duet".to_string())?)?;
     use log::LevelFilter;
-    simple_logging::log_to_file(PathBuf::from(shellexpand::full("~/.config/duet/remote.log")?.to_string()), LevelFilter::Debug)?;
+    simple_logging::log_to_file(full(&"~/.config/duet/remote.log".to_string())?, LevelFilter::Debug)?;
 
     use std::io::{self};
 
@@ -571,7 +582,7 @@ async fn server() -> Result<()> {
     Ok(())
 }
 
-async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, ignore: &profile::Ignore, statefile: Option<&str>) -> Result<(Entries, Changes)> {
+async fn old_and_changes(base: &PathBuf, restrict: &PathBuf, locations: &Locations, ignore: &profile::Ignore, statefile: Option<&PathBuf>) -> Result<(Entries, Changes)> {
     let restricted_current_scan = scan_entries(base, restrict, locations, ignore);
 
     use tokio::fs::File;
@@ -579,8 +590,8 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, igno
     let all_old_entries = async {
         let all_old_entries: Entries =
             if let Some(f) = statefile {
-                if std::path::Path::new(f).exists() {
-                    log::debug!("Loading: {}", f);
+                if f.exists() {
+                    log::debug!("Loading: {}", f.display());
                     let mut f = File::open(f).await.unwrap();
                     let mut contents = vec![];
                     f.read_to_end(&mut contents).await.unwrap();
@@ -619,12 +630,8 @@ async fn old_and_changes(base: &str, restrict: &str, locations: &Locations, igno
     Ok((all_old_entries, changes))
 }
 
-async fn walk(matches: &ArgMatches<'_>) -> Result<()> {
-    let path = matches.value_of("path").unwrap();
-
+async fn walk(path: PathBuf) -> Result<()> {
     let locations = vec![scan::location::Location::Include(PathBuf::from("."))];
-
-    let path = path.to_string();
 
     let (tx, mut rx) = mpsc::channel(1024);
     tokio::spawn(async move {

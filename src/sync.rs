@@ -18,15 +18,14 @@ const WINDOW: usize = 1024;       // TODO: figure out appropriate window size
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SignatureWithPath(PathBuf, Signature);
 
-pub fn get_signatures(base: &str, actions: &Vec<Action>) -> Result<Vec<SignatureWithPath>> {
-    let base_path = Path::new(base);
+pub fn get_signatures(base: &PathBuf, actions: &Vec<Action>) -> Result<Vec<SignatureWithPath>> {
     let mut signatures: Vec<SignatureWithPath> = Vec::new();
     for action in actions {
         match action {
             Action::Local(Change::Modified(e1, e2)) | Action::ResolvedLocal((_,_), Change::Modified(e1,e2)) =>
             {
                 if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
-                    let f = fs::File::open(base_path.join(e1.path()))?;
+                    let f = fs::File::open(base.join(e1.path()))?;
                     let block = [0; WINDOW];
                     let sig = signature(f, block)?;
                     signatures.push(SignatureWithPath(e1.path().clone(), sig));
@@ -46,8 +45,7 @@ pub enum ChangeDetails {
     Diff(Delta),
 }
 
-pub fn get_detailed_changes(base: &str, actions: &Vec<Action>, signatures: &Vec<SignatureWithPath>) -> Result<Vec<ChangeDetails>> {
-    let base_path = Path::new(base);
+pub fn get_detailed_changes(base: &PathBuf, actions: &Vec<Action>, signatures: &Vec<SignatureWithPath>) -> Result<Vec<ChangeDetails>> {
     let mut sig_iter = signatures.iter();
     let mut details: Vec<ChangeDetails> = Vec::new();
 
@@ -59,19 +57,19 @@ pub fn get_detailed_changes(base: &str, actions: &Vec<Action>, signatures: &Vec<
                     Change::Added(e) => {
                         if e.is_file() {
                             log::debug!("Getting detail for adding {}", e.path().display());
-                            let v = fs::read(base_path.join(e.path()))?;
+                            let v = fs::read(base.join(e.path()))?;
                             details.push(ChangeDetails::Contents(v));
                         }
                     },
                     Change::Modified(e1,e2) => {
                         if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
                             let block = [0; WINDOW];
-                            let f = fs::File::open(base_path.join(e1.path()))?;
+                            let f = fs::File::open(base.join(e1.path()))?;
                             let sig = &sig_iter.next().unwrap().1;
                             let delta = compare(sig, f, block)?;
                             details.push(ChangeDetails::Diff(delta))
                         } else if !e1.is_file() && e2.is_file() {
-                            let v = fs::read(base_path.join(e2.path()))?;
+                            let v = fs::read(base.join(e2.path()))?;
                             details.push(ChangeDetails::Contents(v));
                         } // else: permissions or target change
                     }
@@ -83,8 +81,7 @@ pub fn get_detailed_changes(base: &str, actions: &Vec<Action>, signatures: &Vec<
     Ok(details)
 }
 
-pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<ChangeDetails>, all_old: &mut Vec<Entry>) -> Result<()> {
-    let base_path = Path::new(base);
+pub fn apply_detailed_changes(base: &PathBuf, actions: &Vec<Action>, details: &Vec<ChangeDetails>, all_old: &mut Vec<Entry>) -> Result<()> {
     log::debug!("details.len() = {}", details.len());
     let mut details_iter = details.iter();
     let mut new_entries: Vec<Entry> = Vec::new();
@@ -117,7 +114,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                 log::debug!("applying detailed change to {}", action.path().display());
                 match change {
                     Change::Removed(e) => {
-                        let filename = base_path.join(e.path());
+                        let filename = base.join(e.path());
                         log::debug!("Removing {:?}", filename);
                         if !e.is_dir() {
                             fs::remove_file(&filename).expect(format!("failed to remove file {:?}", filename).as_str());
@@ -127,7 +124,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                         // nothing gets copied into new_entries
                     },
                     Change::Added(e) => {
-                        let filename = base_path.join(e.path());
+                        let filename = base.join(e.path());
                         if let Some(p) = e.target() {
                             std::os::unix::fs::symlink(p, &filename).expect(format!("failed to create symlink {:?} {:?}", p, filename).as_str());
                             new_entries.push(update_meta(&filename, e).expect(format!("failed to update metadata for {:?}", filename).as_str()));
@@ -143,7 +140,7 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                         }
                     },
                     Change::Modified(e1,e2) => {
-                        let filename = base_path.join(e2.path());
+                        let filename = base.join(e2.path());
                         if e1.is_file() {
                             if e2.is_file() {
                                 if !e1.same_contents(&e2) {
@@ -236,15 +233,15 @@ pub fn apply_detailed_changes(base: &str, actions: &Vec<Action>, details: &Vec<C
                 }
                 match change {
                     Change::Removed(e) => {
-                        let dirname = base_path.join(e.path());
+                        let dirname = base.join(e.path());
                         fs::remove_dir(&dirname).expect(format!("failed to remove directory {:?}", dirname).as_str());
                     },
                     Change::Added(e) => {
-                        let dirname = base_path.join(e.path());
+                        let dirname = base.join(e.path());
                         new_entries.push(update_meta(&dirname, e)?);
                     },
                     Change::Modified(e1,e2) => {
-                        let dirname = base_path.join(e2.path());
+                        let dirname = base.join(e2.path());
                         if e1.is_dir() && !e2.is_dir() {
                             fs::remove_dir(&dirname).expect(format!("failed to remove directory {:?}", dirname).as_str());
                             if let Some(p) = e2.target() {

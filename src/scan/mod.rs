@@ -43,7 +43,7 @@ pub struct DirEntryWithMeta {
     mtime:  i64,
     ino:    u64,
     mode:   u32,
-    target: Option<String>,
+    target: Option<PathBuf>,
     is_dir: bool,
     checksum: u32,
     // TODO: uid and gid
@@ -66,7 +66,7 @@ impl DirEntryWithMeta {
         &self.path
     }
 
-    pub fn target(&self) -> &Option<String> {
+    pub fn target(&self) -> &Option<PathBuf> {
         &self.target
     }
 
@@ -249,7 +249,7 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
             log::trace!("Reporting: {:?}", path);
             tx.send(DirEntryWithMeta {
                     path: relative(&*base, &path).to_path_buf(),
-                    target: fs::read_link(path).await.map_or(None, |p| Some(p.to_str().unwrap().to_string())),
+                    target: fs::read_link(path).await.map_or(None, |p| Some(p)),
                     size: meta.size(),
                     mtime: meta.mtime(),
                     ino: meta.ino(),
