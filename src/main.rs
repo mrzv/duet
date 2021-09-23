@@ -36,8 +36,6 @@ fn show_help() {
 duet {}
 bi-directional synchronization
 
-synchronize according to profile
-
 USAGE:
     duet [FLAGS] <profile> [path]
 
@@ -50,6 +48,7 @@ FLAGS:
     -n, --dry-run       don't apply changes
 
         --version       prints version information
+        --license       prints license information (including dependencies)
     -h, --help          prints help information
 
 ARGS:
@@ -74,6 +73,12 @@ pub async fn main() -> Result<()> {
         for (name,version) in built_info::DEPENDENCIES {
             println!("  {} {}", name, version);
         }
+        return Ok(());
+    }
+
+    if pargs.contains("--license") {
+        println!("{}\n", include_str!("../LICENSE"));
+        println!("{}", include_str!("../dep-licenses.txt"));
         return Ok(());
     }
 
