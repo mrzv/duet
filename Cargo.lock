@@ -186,7 +186,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4830ac690261d0b47f06e86d18c47eaa65d0184e576cf9b62c3a49b28cb876b"
 dependencies = [
- "nix",
+ "nix 0.20.1",
  "tempfile",
  "winapi",
 ]
@@ -440,6 +440,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "377c9b002a72a0b2c1a18c62e2f3864bdfea4a015e3683a96e24aa45dd6c02d1"
+dependencies = [
+ "nix 0.22.1",
+ "winapi",
+]
+
+[[package]]
 name = "dialoguer"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -487,6 +497,7 @@ dependencies = [
  "color-eyre",
  "colored",
  "console",
+ "ctrlc",
  "dialoguer",
  "env_logger",
  "essrpc",
@@ -498,6 +509,7 @@ dependencies = [
  "openssh",
  "path-clean",
  "pico-args",
+ "quit",
  "readwrite",
  "regex",
  "rustsync",
@@ -926,6 +938,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7555d6c7164cc913be1ce7f95cbecdabda61eb2ccd89008524af306fb7f5031"
+dependencies = [
+ "bitflags",
+ "cc",
+ "cfg-if",
+ "libc",
+ "memoffset",
+]
+
+[[package]]
 name = "nodrop"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1101,6 +1126,21 @@ checksum = "5c7ed8b8c7b886ea3ed7dde405212185f423ab44682667c8c6dd14aa1d9f6612"
 dependencies = [
  "unicode-xid",
 ]
+
+[[package]]
+name = "quit"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bad314fc86f60b58587ffaf97e3150ed6f0aece74012db9cf0e36ee88768e49d"
+dependencies = [
+ "quit_macros",
+]
+
+[[package]]
+name = "quit_macros"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a411616b47dce3139c0169c89899ba5ea3534e545ab4d0c1d3956460fe781bae"
 
 [[package]]
 name = "quote"

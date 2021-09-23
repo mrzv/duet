@@ -44,6 +44,8 @@ byte-unit = "4.0.12"
 unix_mode = "0.1.2"
 path-clean = "0.1.0"
 pico-args = { version = "0.4.2", features = ["combined-flags"] }
+quit = "1.1.4"
+ctrlc = "3.2.0"
 
 [build-dependencies]
 built = "0.5.1"

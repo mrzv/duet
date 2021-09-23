@@ -58,6 +58,7 @@ ARGS:
 }
 
 #[tokio::main]
+#[quit::main]
 pub async fn main() -> Result<()> {
     color_eyre::install().unwrap();
 
@@ -259,12 +260,29 @@ fn full(s: &String) -> Result<PathBuf> {
     Ok(PathBuf::from(shellexpand::full(s)?.into_owned()))
 }
 
+const OK_CODE: i32 = 0;
+const PROFILE_ERROR_CODE: i32 = 1;
+const SSH_ERROR_CODE: i32 = 2;
+const LOCAL_ERROR_CODE: i32 = 3;
+const REMOTE_ERROR_CODE: i32 = 4;
+const CTRLC_CODE: i32 = 5;
+const ABORT_CODE: i32 = 6;
+
 async fn sync(name: String, path: Option<PathBuf>,
               interactive: bool, yes: bool, dry_run: bool,
               batch: bool, force: bool, verbose: bool) -> Result<()> {
     env_logger::init();
 
-    let prf = profile::parse(&name).expect(&format!("Failed to read profile {}", name.yellow()));
+    ctrlc::set_handler(|| {
+        eprintln!("\nQuitting");
+        quit::with_code(CTRLC_CODE);
+    }).expect("Error setting Ctrl-C handler");
+
+    let prf = profile::parse(&name).unwrap_or_else(|e| {
+        eprintln!("Failed to read profile {}", name.yellow());
+        eprintln!("{}", e.to_string().cyan());
+        quit::with_code(PROFILE_ERROR_CODE);
+    });
 
     let local_id = local_id(&name);
 
@@ -281,7 +299,10 @@ async fn sync(name: String, path: Option<PathBuf>,
 
     let remote_session =
         if let Some(server) = remote_server {
-            Some(Session::connect(server, KnownHosts::Strict).await.expect("Unable to get SSH session"))
+            Some(Session::connect(server, KnownHosts::Strict).await.unwrap_or_else(|_| {
+                eprintln!("Unable to get SSH session");
+                quit::with_code(SSH_ERROR_CODE);
+            }))
         } else {
             None
         };
@@ -290,13 +311,23 @@ async fn sync(name: String, path: Option<PathBuf>,
 
     let path = path.clone();
     let remote_fut = async {
-        remote.set_base(remote_base).await.expect("Couldn't set server base");
-        remote.changes(path, prf.locations.clone(), prf.ignore.clone(), local_id).await.expect("Couldn't get remote changes")
+        remote.set_base(remote_base).await.unwrap_or_else(|_| {
+            eprintln!("Couldn't set server base");
+            quit::with_code(REMOTE_ERROR_CODE);
+        });
+        remote.changes(path, prf.locations.clone(), prf.ignore.clone(), local_id).await.unwrap_or_else(|_| {
+            eprintln!("Couldn't get remote changes");
+            quit::with_code(REMOTE_ERROR_CODE);
+        })
     };
 
-    use futures::join;
+    use tokio::join;
     let (local_result, remote_changes) = join!(local_fut,remote_fut);
-    let (mut local_all_old, local_changes) = local_result.unwrap();
+    let (mut local_all_old, local_changes) = local_result.unwrap_or_else(|e| {
+        eprintln!("Couldn't get local changes");
+        eprintln!("{}", e);
+        quit::with_code(LOCAL_ERROR_CODE);
+    });
     // -------------------------------------------------
 
     let mut actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
@@ -305,12 +336,12 @@ async fn sync(name: String, path: Option<PathBuf>,
 
     if actions.is_empty() {
         println!("No changes detected");
-        return Ok(())
+        quit::with_code(OK_CODE);
     }
 
     if dry_run {
         show_actions(&actions, verbose);
-        return Ok(())
+        quit::with_code(OK_CODE);
     }
 
     let num_conflicts = num_unresolved_conflicts(actions.iter());
@@ -346,7 +377,7 @@ async fn sync(name: String, path: Option<PathBuf>,
 
     if let AllResolution::Abort = resolution {
         println!("Aborting");
-        return Ok(());
+        quit::with_code(ABORT_CODE);
     }
 
     log::debug!("synchronizing");
