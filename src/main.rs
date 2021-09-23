@@ -261,12 +261,12 @@ fn full(s: &String) -> Result<PathBuf> {
 }
 
 const OK_CODE: i32 = 0;
-const PROFILE_ERROR_CODE: i32 = 1;
-const SSH_ERROR_CODE: i32 = 2;
-const LOCAL_ERROR_CODE: i32 = 3;
-const REMOTE_ERROR_CODE: i32 = 4;
-const CTRLC_CODE: i32 = 5;
-const ABORT_CODE: i32 = 6;
+const ABORT_CODE: i32 = 1;
+const PROFILE_ERROR_CODE: i32 = 2;
+const SSH_ERROR_CODE: i32 = 3;
+const LOCAL_ERROR_CODE: i32 = 4;
+const REMOTE_ERROR_CODE: i32 = 5;
+const CTRLC_CODE: i32 = 6;
 
 async fn sync(name: String, path: Option<PathBuf>,
               interactive: bool, yes: bool, dry_run: bool,
@@ -382,7 +382,10 @@ async fn sync(name: String, path: Option<PathBuf>,
 
     let actions: Actions = actions.into_iter().filter(|a| !a.is_unresolved_conflict()).collect();
     let remote_actions: Actions = reverse(&actions);
-    remote.set_actions(remote_actions).await?;
+    remote.set_actions(remote_actions).await.unwrap_or_else(|e| {
+        eprintln!("Failed to set remote actions ({})", e.to_string().cyan());
+        quit::with_code(REMOTE_ERROR_CODE);
+    });
     log::debug!("set remote actions");
 
     let local_signatures  = sync::get_signatures(&local_base, &actions).expect("couldn't get local signatures");
@@ -397,14 +400,25 @@ async fn sync(name: String, path: Option<PathBuf>,
     sync::apply_detailed_changes(&local_base, &actions, &remote_detailed_changes, &mut local_all_old)?;
     remote.apply_detailed_changes(local_detailed_changes).await?;
 
-    remote.save_state().await?;
+    let (remote_result, local_result) =
+        tokio::join!(remote.save_state(),
+                     tokio::task::spawn_blocking(move || {
+                        use atomicwrites::{AtomicFile,AllowOverwrite};
+                        let af = AtomicFile::new(local_state, AllowOverwrite);
+                        af.write(|f| {
+                            let f = BufWriter::new(f);
+                            serialize_into(f, &local_all_old)
+                        })
+                     }));
+    let _ = local_result.unwrap_or_else(|e| {
+        eprintln!("Failed to save local state ({})", e.to_string().cyan());
+        quit::with_code(LOCAL_ERROR_CODE);
+    });
+    let _ = remote_result.unwrap_or_else(|e| {
+        eprintln!("Failed to save remote state ({})", e.to_string().cyan());
+        quit::with_code(REMOTE_ERROR_CODE);
+    });
 
-    use atomicwrites::{AtomicFile,AllowOverwrite};
-    let af = AtomicFile::new(local_state, AllowOverwrite);
-    af.write(|f| {
-        let f = BufWriter::new(f);
-        serialize_into(f, &local_all_old)
-    })?;
     Ok(())
 }
 
