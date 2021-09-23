@@ -18,13 +18,13 @@ pub struct Profile {
 
 pub fn location(name: &str) -> PathBuf {
     let mut base = PathBuf::from(shellexpand::full("~/.config/duet/").unwrap().to_string());
-    base.push(name);
+    base.push(name.to_owned() + ".prf");
     base
 }
 
 pub fn local_state(name: &str) -> PathBuf {
     let mut profile_location = location(name);
-    profile_location.push("local_state");
+    profile_location.set_extension("snp");
     profile_location
 }
 
@@ -41,8 +41,7 @@ pub fn remote_state(id: &str) -> PathBuf {
 }
 
 pub fn parse(name: &str) -> Result<Profile, io::Error> {
-    let mut profile_location = location(name);
-    profile_location.push("profile");
+    let profile_location = location(name);
     log::debug!("Loading {:?}", profile_location);
 
     let f      = File::open(profile_location)?;

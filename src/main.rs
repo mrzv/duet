@@ -279,8 +279,7 @@ async fn sync(name: String, path: Option<PathBuf>,
     }).expect("Error setting Ctrl-C handler");
 
     let prf = profile::parse(&name).unwrap_or_else(|e| {
-        eprintln!("Failed to read profile {}", name.yellow());
-        eprintln!("{}", e.to_string().cyan());
+        eprintln!("Failed to read profile {} ({})", name.yellow(), e.to_string().cyan());
         quit::with_code(PROFILE_ERROR_CODE);
     });
 
@@ -324,8 +323,7 @@ async fn sync(name: String, path: Option<PathBuf>,
     use tokio::join;
     let (local_result, remote_changes) = join!(local_fut,remote_fut);
     let (mut local_all_old, local_changes) = local_result.unwrap_or_else(|e| {
-        eprintln!("Couldn't get local changes");
-        eprintln!("{}", e);
+        eprintln!("Couldn't get local changes ({})", e.to_string().cyan());
         quit::with_code(LOCAL_ERROR_CODE);
     });
     // -------------------------------------------------
