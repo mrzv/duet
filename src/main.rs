@@ -269,8 +269,6 @@ const OK_CODE: i32 = 0;
 const ABORT_CODE: i32 = 1;
 const PROFILE_ERROR_CODE: i32 = 2;
 const SSH_ERROR_CODE: i32 = 3;
-const LOCAL_ERROR_CODE: i32 = 4;
-const REMOTE_ERROR_CODE: i32 = 5;
 const CTRLC_CODE: i32 = 6;
 
 async fn sync(name: String, path: Option<PathBuf>,
@@ -315,22 +313,13 @@ async fn sync(name: String, path: Option<PathBuf>,
 
     let path = path.clone();
     let remote_fut = async {
-        remote.set_base(remote_base).await.unwrap_or_else(|_| {
-            eprintln!("Couldn't set server base");
-            quit::with_code(REMOTE_ERROR_CODE);
-        });
-        remote.changes(path, prf.locations.clone(), prf.ignore.clone(), local_id).await.unwrap_or_else(|_| {
-            eprintln!("Couldn't get remote changes");
-            quit::with_code(REMOTE_ERROR_CODE);
-        })
+        remote.set_base(remote_base).await.expect("Couldn't set server base");
+        remote.changes(path, prf.locations.clone(), prf.ignore.clone(), local_id).await.expect("Couldn't get remote changes")
     };
 
     use tokio::join;
     let (local_result, remote_changes) = join!(local_fut,remote_fut);
-    let (mut local_all_old, local_changes) = local_result.unwrap_or_else(|e| {
-        eprintln!("Couldn't get local changes ({})", e.to_string().cyan());
-        quit::with_code(LOCAL_ERROR_CODE);
-    });
+    let (mut local_all_old, local_changes) = local_result.expect("Couldn't get local changes");
     // -------------------------------------------------
 
     let mut actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
@@ -387,10 +376,7 @@ async fn sync(name: String, path: Option<PathBuf>,
 
     let actions: Actions = actions.into_iter().filter(|a| !a.is_unresolved_conflict()).collect();
     let remote_actions: Actions = reverse(&actions);
-    remote.set_actions(remote_actions).await.unwrap_or_else(|e| {
-        eprintln!("Failed to set remote actions ({})", e.to_string().cyan());
-        quit::with_code(REMOTE_ERROR_CODE);
-    });
+    remote.set_actions(remote_actions).await.expect("Failed to set remote actions");
     log::debug!("set remote actions");
 
     let local_signatures  = sync::get_signatures(&local_base, &actions).expect("couldn't get local signatures");
@@ -415,14 +401,8 @@ async fn sync(name: String, path: Option<PathBuf>,
                             serialize_into(f, &local_all_old)
                         })
                      }));
-    let _ = local_result.unwrap_or_else(|e| {
-        eprintln!("Failed to save local state ({})", e.to_string().cyan());
-        quit::with_code(LOCAL_ERROR_CODE);
-    });
-    let _ = remote_result.unwrap_or_else(|e| {
-        eprintln!("Failed to save remote state ({})", e.to_string().cyan());
-        quit::with_code(REMOTE_ERROR_CODE);
-    });
+    let _ = local_result.expect("Failed to save local state");
+    let _ = remote_result.expect("Failed to save remote state");
 
     Ok(())
 }
