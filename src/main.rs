@@ -269,6 +269,7 @@ const OK_CODE: i32 = 0;
 const ABORT_CODE: i32 = 1;
 const PROFILE_ERROR_CODE: i32 = 2;
 const SSH_ERROR_CODE: i32 = 3;
+const SERVER_ERROR_CODE: i32 = 4;
 const CTRLC_CODE: i32 = 6;
 
 async fn sync(name: String, path: Option<PathBuf>,
@@ -308,7 +309,10 @@ async fn sync(name: String, path: Option<PathBuf>,
         } else {
             None
         };
-    let mut server = launch_server(&remote_session, remote_cmd);
+    let mut server = launch_server(&remote_session, remote_cmd).unwrap_or_else(|e| {
+        eprintln!("Failed to start server ({})", e.to_string().cyan());
+        quit::with_code(SERVER_ERROR_CODE);
+    });
     let remote = get_remote(&mut server);
 
     let path = path.clone();
@@ -422,7 +426,7 @@ enum Server<'a> {
     Remote(RemoteChild<'a>),
 }
 
-fn launch_server(session: &Option<Session>, cmd: String) -> Server {
+fn launch_server(session: &Option<Session>, cmd: String) -> Result<Server> {
     // launch server
     if let Some(session) = session {
         let server = session.command(cmd)
@@ -430,12 +434,11 @@ fn launch_server(session: &Option<Session>, cmd: String) -> Server {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()
-            .expect("Failed to spawn remote server");
+            .spawn()?;
 
         log::trace!("launched remote server");
 
-        Server::Remote(server)
+        Ok(Server::Remote(server))
     } else {
         let cmd = shellexpand::full(&cmd).expect("Failed to expand command").to_string();
         let server = Command::new(cmd)
@@ -443,12 +446,11 @@ fn launch_server(session: &Option<Session>, cmd: String) -> Server {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()
-            .expect("Failed to spawn remote server");
+            .spawn()?;
 
         log::trace!("launched local server");
 
-        Server::Local(server)
+        Ok(Server::Local(server))
     }
 }
 
