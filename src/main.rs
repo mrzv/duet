@@ -8,6 +8,10 @@ mod scan;
 mod utils;
 mod actions;
 mod sync;
+mod rustsync;
+#[macro_use]
+extern crate serde_derive;
+
 use actions::{Action,Actions,num_unresolved_conflicts,num_identical,reverse};
 use scan::location::{Locations};
 use scan::{Change,DirEntryWithMeta};
@@ -79,7 +83,8 @@ pub async fn main() -> Result<()> {
 
     if pargs.contains("--license") {
         println!("{}\n", include_str!("../LICENSE"));
-        println!("{}", include_str!("../dep-licenses.txt"));
+        println!("{}", include_str!("../licenses/deps.txt"));
+        println!("{}", include_str!("../licenses/included.txt"));
         return Ok(());
     }
 

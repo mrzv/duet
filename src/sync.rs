@@ -10,8 +10,8 @@ use super::scan::{Change, DirEntryWithMeta as Entry};
 
 use crate::actions::Action;
 
-pub use rustsync::{Signature,Delta};
-use rustsync::{signature,compare,restore_seek};
+pub use crate::rustsync::{Signature,Delta};
+use crate::rustsync::{signature,compare,restore_seek};
 
 const WINDOW: usize = 1024;       // TODO: figure out appropriate window size
 

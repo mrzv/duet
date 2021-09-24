@@ -23,8 +23,6 @@ bincode = "1.3.3"
 #essrpc = { git = "https://github.com/Electron100/essrpc", branch = "async", features = ["async_client", "bincode_transport"] }
 essrpc = { path = "../Upstream/essrpc/essrpc", features = ["async_client", "bincode_transport"] }
 futures = "0.3.16"
-#rustsync = "0.2.3"
-rustsync = { path = "../Upstream/rustsync" }
 filetime = "0.2.15"
 text_io = "0.1.9"
 dialoguer = "0.8.0"
@@ -46,6 +44,8 @@ path-clean = "0.1.0"
 pico-args = { version = "0.4.2", features = ["combined-flags"] }
 quit = "1.1.4"
 ctrlc = "3.2.0"
+blake2-rfc = "0.2.18"
+serde_derive = "1.0.130"
 
 [build-dependencies]
 built = "0.5.1"
