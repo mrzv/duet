@@ -2,6 +2,7 @@
 name = "duet"
 version = "0.1.0"
 authors = ["Dmitriy Morozov <dmitriy@mrzv.org>"]
+repository = "https://github.com/mrzv/duet/"
 edition = "2018"
 license = "MIT"
 description = "bi-directional synchronization"
