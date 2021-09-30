@@ -662,14 +662,21 @@ async fn old_and_changes(base: &PathBuf, restrict: &PathBuf, locations: &Locatio
 
     // compute checksums
     log::debug!("Computing checksums for {} changes", changes.len());
+    let pb = indicatif::ProgressBar::new(changes.len() as u64);
+    pb.set_style(indicatif::ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+        .progress_chars("##-"));
+    pb.set_message("computing checksums");
     let base = PathBuf::from(base);
     for change in &mut changes {
+        pb.inc(1);
         match change {
             Change::Added(n) => { n.compute_checksum(&base).await.expect(format!("Unable to compute checksum for {:?}", n).as_str()); },
             Change::Modified(_,n) => { n.compute_checksum(&base).await.expect(format!("Unable to compute checksum for {:?}", n).as_str()); },
             Change::Removed(_) => {},
         }
     }
+    pb.finish_and_clear();
 
     Ok((all_old_entries, changes))
 }
