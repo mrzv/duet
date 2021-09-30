@@ -174,16 +174,12 @@ async fn scan_entries(base: &PathBuf, path: &PathBuf, locations: &Locations, ign
             scan::scan(&base, &path, &locations, &ignore, tx).await
         });
 
-        let term = console::Term::stderr();
-        let width = term.size().1 as usize;
         let pb = indicatif::ProgressBar::new(1);
-        pb.set_style(indicatif::ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {msg}"));
+        pb.set_style(indicatif::ProgressStyle::default_spinner()
+            .template("[{elapsed_precise}] {wide_msg}"));
         let mut entries: Entries = Entries::new();
         while let Some(e) = rx.recv().await {
-            let mut filename = e.path().display().to_string();
-            filename.truncate(width-12);
-            pb.set_message(filename);
+            pb.set_message(e.path().display().to_string());
             entries.push(e);
         }
         pb.finish_and_clear();
