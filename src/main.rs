@@ -387,22 +387,53 @@ async fn sync(name: String, path: Option<PathBuf>,
 
     log::debug!("synchronizing");
 
-    let actions: Actions = actions.into_iter().filter(|a| !a.is_unresolved_conflict()).collect();
+    use std::sync::Arc;
+    let actions: Arc<Actions> = Arc::new(actions.into_iter().filter(|a| !a.is_unresolved_conflict()).collect());
     let remote_actions: Actions = reverse(&actions);
     remote.set_actions(remote_actions).await.expect("Failed to set remote actions");
     log::debug!("set remote actions");
 
-    let local_signatures  = sync::get_signatures(&local_base, &actions).expect("couldn't get local signatures");
-    let remote_signatures = remote.get_signatures().await.expect("couldn't get remote signatures");
+    // --- get local and remote signatures concurrently ---
+    let local_signatures_fut = {
+         let local_base = local_base.clone();
+         let actions = actions.clone();
+         tokio::task::spawn_blocking(move || { sync::get_signatures(&local_base, &actions) })
+    };
+    let remote_signatures_fut = remote.get_signatures();
+    let (local_signatures, remote_signatures) = tokio::join!(local_signatures_fut, remote_signatures_fut);
+    let local_signatures = local_signatures?.expect("couldn't get local signatures");
+    let remote_signatures = remote_signatures.expect("couldn't get remote signatures");
     log::debug!("{} local signatures; {} remote signatures", local_signatures.len(), remote_signatures.len());
+    // ----------------------------------------------------
 
-    let local_detailed_changes  = sync::get_detailed_changes(&local_base, &actions, &remote_signatures).expect("couldn't get local detailed changes");
-    let remote_detailed_changes = remote.get_detailed_changes(local_signatures).await.expect("couldn't get remote detailed changes");
+    // --- get local and remote signatures concurrently ---
+    let local_detailed_changes_fut = {
+        let local_base = local_base.clone();
+        let actions = actions.clone();
+        tokio::task::spawn_blocking(move || { sync::get_detailed_changes(&local_base, &actions, &remote_signatures) })
+    };
+    let remote_detailed_changes_fut = remote.get_detailed_changes(local_signatures);
+    let (local_detailed_changes, remote_detailed_changes) = tokio::join!(local_detailed_changes_fut, remote_detailed_changes_fut);
+    let local_detailed_changes = local_detailed_changes?.expect("couldn't get local detailed changes");
+    let remote_detailed_changes = remote_detailed_changes.expect("couldn't get remote detailed changes");
     log::debug!("got detailed changes");
+    // ----------------------------------------------------
 
-    // updates local_all_old to be the new state
-    sync::apply_detailed_changes(&local_base, &actions, &remote_detailed_changes, &mut local_all_old)?;
-    remote.apply_detailed_changes(local_detailed_changes).await?;
+    // --- apply local and remote detailed changes concurrently ---
+    let local_apply_fut = {
+        let local_base = local_base.clone();
+        let actions = actions.clone();
+        tokio::task::spawn_blocking(move || {
+            // updates local_all_old to be the new state
+            sync::apply_detailed_changes(&local_base, &actions, &remote_detailed_changes, &mut local_all_old).expect("failed to apply local changes");
+            local_all_old
+        })
+    };
+    let remote_apply_fut = remote.apply_detailed_changes(local_detailed_changes);
+    let (local_apply, remote_apply) = tokio::join!(local_apply_fut, remote_apply_fut);
+    let local_all_old = local_apply?;
+    let _ = remote_apply?;
+    // ------------------------------------------------------------
 
     let (remote_result, local_result) =
         tokio::join!(remote.save_state(),
