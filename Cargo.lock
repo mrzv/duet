@@ -504,7 +504,6 @@ dependencies = [
  "simple-logging",
  "text_io",
  "tokio",
- "tokio-util",
  "unix_mode",
 ]
 
@@ -529,19 +528,26 @@ dependencies = [
 
 [[package]]
 name = "essrpc"
-version = "0.3.1"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81c82da4531b5ea7985674a141690e28b0869ee94cae67e3ebf787d4e7d73ea3"
 dependencies = [
  "async-trait",
  "bincode",
+ "bytes",
  "essrpc_macros",
  "futures",
  "parking_lot",
  "serde",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
 name = "essrpc_macros"
-version = "0.3.0"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd987f252488b7ac152c50edcc9918bb28186cb03a5875747649472c0618f687"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1186,8 +1192,8 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31ffdc83f7ce1e84943f94033a48a1a50ef9581aaa5d213625dea98e60f9ed54"
 dependencies = [
- "futures",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -1483,7 +1489,6 @@ checksum = "08d3725d3efa29485e87311c5b699de63cde14b00ed4d256b8318aa30ca452cd"
 dependencies = [
  "bytes",
  "futures-core",
- "futures-io",
  "futures-sink",
  "log",
  "pin-project-lite",

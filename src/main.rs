@@ -491,11 +491,10 @@ fn launch_server(session: &Option<Session>, cmd: String) -> Result<Server> {
 }
 
 
-use readwrite::ReadWriteAsyncstd;
-use tokio_util::compat::{Compat,TokioAsyncReadCompatExt,TokioAsyncWriteCompatExt};
-use async_std::io::{BufReader as AsyncBufReader, BufWriter as AsyncBufWriter};
+use readwrite::ReadWriteTokio;
+use tokio::io::{BufReader as AsyncBufReader, BufWriter as AsyncBufWriter};
 
-fn get_remote<'a>(server: &'a mut Server) -> DuetServerAsyncRPCClient<BincodeAsyncClientTransport<ReadWriteAsyncstd<AsyncBufReader<Compat<ChildStdout>>, AsyncBufWriter<Compat<ChildStdin>>>>> {
+fn get_remote<'a>(server: &'a mut Server) -> DuetServerAsyncRPCClient<BincodeAsyncClientTransport<ReadWriteTokio<AsyncBufReader<ChildStdout>, AsyncBufWriter<ChildStdin>>>> {
     let (server_in, server_out) =
         match server {
             Server::Local(server) => {
@@ -510,7 +509,7 @@ fn get_remote<'a>(server: &'a mut Server) -> DuetServerAsyncRPCClient<BincodeAsy
             },
         };
 
-    let server_io = ReadWriteAsyncstd::new(AsyncBufReader::new(server_out.compat()), AsyncBufWriter::new(server_in.compat_write()));
+    let server_io = ReadWriteTokio::new(AsyncBufReader::new(server_out), AsyncBufWriter::new(server_in));
 
     let remote = DuetServerAsyncRPCClient::new(BincodeAsyncClientTransport::new(server_io));
     remote
