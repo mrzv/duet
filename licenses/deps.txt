@@ -7480,11 +7480,11 @@ The duet package uses some third party libraries under their own license terms:
     limitations under the License.
 
 
- * essrpc 0.3.1 under the terms of MIT:
+ * essrpc 0.4.1 under the terms of MIT:
 
 
 
- * essrpc_macros 0.3.0 under the terms of MIT:
+ * essrpc_macros 0.4.0 under the terms of MIT:
 
 
 

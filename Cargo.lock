@@ -528,9 +528,9 @@ dependencies = [
 
 [[package]]
 name = "essrpc"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81c82da4531b5ea7985674a141690e28b0869ee94cae67e3ebf787d4e7d73ea3"
+checksum = "6ad4ba3212b7ca9420f9d13136360112a6c513af7a01fa003709931cb303a6e8"
 dependencies = [
  "async-trait",
  "bincode",
