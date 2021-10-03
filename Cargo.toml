@@ -1,6 +1,6 @@
 [package]
 name = "duet"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Dmitriy Morozov <dmitriy@mrzv.org>"]
 repository = "https://github.com/mrzv/duet/"
 edition = "2018"
