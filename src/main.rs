@@ -346,6 +346,7 @@ async fn sync(name: String, path: Option<PathBuf>,
     }
 
     let num_conflicts = num_unresolved_conflicts(actions.iter());
+    let num_identical = num_identical(actions.iter());
 
     let resolution =
         if batch {
@@ -358,7 +359,7 @@ async fn sync(name: String, path: Option<PathBuf>,
             } else {
                 AllResolution::Proceed
             }
-        } else if interactive {
+        } else if interactive && (num_identical < actions.len() || verbose) {
             let resolution =
                 if yes && num_conflicts == 0 {
                     AllResolution::Proceed
