@@ -26,7 +26,7 @@ use essrpc::transports::{BincodeTransport,BincodeAsyncClientTransport,ReadWrite}
 use essrpc::{AsyncRPCClient, RPCError, RPCErrorKind, RPCServer};
 use std::process::{Stdio};
 use tokio::process::{Command, Child, ChildStdin, ChildStdout};
-use openssh::{Session, KnownHosts, RemoteChild};
+use openssh::{Session, SessionBuilder, KnownHosts, RemoteChild};
 
 type Entries = Vec<DirEntryWithMeta>;
 type Changes = Vec<Change>;
@@ -307,10 +307,18 @@ async fn sync(name: String, path: Option<PathBuf>,
 
     let remote_session =
         if let Some(server) = remote_server {
-            Some(Session::connect(server, KnownHosts::Strict).await.unwrap_or_else(|_| {
-                eprintln!("Unable to get SSH session");
-                quit::with_code(SSH_ERROR_CODE);
-            }))
+            let session_result = SessionBuilder::default()
+                                    .control_directory(std::env::temp_dir())
+                                    .known_hosts_check(KnownHosts::Strict)
+                                    .connect(server).await;
+            match session_result {
+                Ok(session) => Some(session),
+                Err(e) => {
+                    eprintln!("Unable to get SSH session ({})", e.to_string().cyan());
+                    log::error!("Unable to get SSH session: {:?}", e);
+                    quit::with_code(SSH_ERROR_CODE);
+                }
+            }
         } else {
             None
         };
