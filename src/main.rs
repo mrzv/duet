@@ -176,7 +176,7 @@ async fn scan_entries(base: &PathBuf, path: &PathBuf, locations: &Locations, ign
 
         let pb = indicatif::ProgressBar::new(1);
         pb.set_style(indicatif::ProgressStyle::default_spinner()
-            .template("[{elapsed_precise}] {wide_msg}"));
+            .template("[{elapsed_precise}] {wide_msg}").expect("Failed to set style for a progress bar"));
         let mut entries: Entries = Entries::new();
         while let Some(e) = rx.recv().await {
             pb.set_message(e.path().display().to_string());
@@ -270,12 +270,12 @@ fn full(s: &String) -> Result<PathBuf> {
     Ok(PathBuf::from(shellexpand::full(s)?.into_owned()))
 }
 
-const OK_CODE: i32 = 0;
-const ABORT_CODE: i32 = 1;
-const PROFILE_ERROR_CODE: i32 = 2;
-const SSH_ERROR_CODE: i32 = 3;
-const SERVER_ERROR_CODE: i32 = 4;
-const CTRLC_CODE: i32 = 6;
+const OK_CODE: u8 = 0;
+const ABORT_CODE: u8 = 1;
+const PROFILE_ERROR_CODE: u8 = 2;
+const SSH_ERROR_CODE: u8 = 3;
+const SERVER_ERROR_CODE: u8 = 4;
+const CTRLC_CODE: u8 = 6;
 
 async fn sync(name: String, path: Option<PathBuf>,
               interactive: bool, yes: bool, dry_run: bool,
@@ -322,7 +322,7 @@ async fn sync(name: String, path: Option<PathBuf>,
         } else {
             None
         };
-    let mut server = launch_server(&remote_session, remote_cmd).unwrap_or_else(|e| {
+    let mut server = launch_server(&remote_session, remote_cmd).await.unwrap_or_else(|e| {
         eprintln!("Failed to start server ({})", e.to_string().cyan());
         quit::with_code(SERVER_ERROR_CODE);
     });
@@ -471,15 +471,16 @@ enum Server<'a> {
     Remote(RemoteChild<'a>),
 }
 
-fn launch_server(session: &Option<Session>, cmd: String) -> Result<Server> {
+async fn launch_server(session: &Option<Session>, cmd: String) -> Result<Server> {
     // launch server
     if let Some(session) = session {
         let server = session.command(cmd)
             .arg("--server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stdin(openssh::process::Stdio::piped())
+            .stdout(openssh::process::Stdio::piped())
+            .stderr(openssh::process::Stdio::inherit())
+            .spawn()
+            .await?;
 
         log::trace!("launched remote server");
 
@@ -700,7 +701,9 @@ async fn old_and_changes(base: &PathBuf, restrict: &PathBuf, locations: &Locatio
     let pb = indicatif::ProgressBar::new(changes.len() as u64);
     pb.set_style(indicatif::ProgressStyle::default_bar()
         .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
-        .progress_chars("##-"));
+        .expect("Failed to set template for progress bar style")
+        .progress_chars("##-")
+        );
     pb.set_message("computing checksums");
     let base = PathBuf::from(base);
     for change in &mut changes {

@@ -180,8 +180,7 @@ fn show_meta(e: &Entry, before: &Entry) -> String {
 fn show_mtime(e: &Entry) -> String {
     let mtime = e.mtime();
     use chrono::prelude::*;
-    let date_time = NaiveDateTime::from_timestamp(mtime, 0);
-    let date_time = DateTime::<Utc>::from_utc(date_time, Utc).with_timezone(&Local);
+    let date_time = Local.timestamp_opt(mtime, 0).unwrap();
     date_time.format("%a %Y-%m-%d %H:%M:%S").to_string()
 }
 
@@ -192,7 +191,7 @@ fn show_permissions(e: &Entry) -> String {
 
 fn show_size(e: &Entry) -> String {
     let size = e.size();
-    format!("{:>10}", byte_unit::Byte::from_bytes(size.into()).get_appropriate_unit(true).to_string())
+    format!("{:>10}", byte_unit::Byte::from_u64(size.into()).get_appropriate_unit(byte_unit::UnitType::Decimal).to_string())
 }
 
 fn show_checksum(e: &Entry) -> String {
