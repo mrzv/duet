@@ -9,6 +9,7 @@ mod utils;
 mod actions;
 mod sync;
 mod rustsync;
+mod io_wrappers;
 #[macro_use]
 extern crate serde_derive;
 
@@ -25,7 +26,7 @@ use essrpc::essrpc;
 use essrpc::transports::{BincodeTransport,BincodeAsyncClientTransport,ReadWrite};
 use essrpc::{AsyncRPCClient, RPCError, RPCErrorKind, RPCServer};
 use std::process::{Stdio};
-use tokio::process::{Command, Child, ChildStdin, ChildStdout};
+use tokio::process::{Command, Child};
 use openssh::{Session, SessionBuilder, KnownHosts, RemoteChild};
 
 type Entries = Vec<DirEntryWithMeta>;
@@ -244,9 +245,10 @@ fn parse_remote(remote: &String) -> Result<(String, Option<String>, String)> {
             (elements[i].to_string(), elements[i+1].to_string(), i+2)
         };
     if i < elements.len() {
-        eyre!("Couldn't parse remote, elements remaining");
+        Err(eyre!("Couldn't parse remote, elements remaining"))
+    } else {
+        Ok((remote_base, remote_server, remote_cmd))
     }
-    Ok((remote_base, remote_server, remote_cmd))
 }
 
 fn normalize_path(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
@@ -503,19 +505,20 @@ async fn launch_server(session: &Option<Session>, cmd: String) -> Result<Server>
 
 use readwrite::ReadWriteTokio;
 use tokio::io::{BufReader as AsyncBufReader, BufWriter as AsyncBufWriter};
+use io_wrappers::{StdinWrapper,StdoutWrapper};
 
-fn get_remote<'a>(server: &'a mut Server) -> DuetServerAsyncRPCClient<BincodeAsyncClientTransport<ReadWriteTokio<AsyncBufReader<ChildStdout>, AsyncBufWriter<ChildStdin>>>> {
+fn get_remote<'a>(server: &'a mut Server) -> DuetServerAsyncRPCClient<BincodeAsyncClientTransport<ReadWriteTokio<AsyncBufReader<StdoutWrapper>, AsyncBufWriter<StdinWrapper>>>> {
     let (server_in, server_out) =
         match server {
             Server::Local(server) => {
                 let server_in = server.stdin.take().expect("Failed to open local stdin");
                 let server_out = server.stdout.take().expect("Failed to read local stdout");
-                (server_in, server_out)
+                (StdinWrapper::TokioStdin(server_in), StdoutWrapper::TokioStdout(server_out))
             },
             Server::Remote(server) => {
                 let server_in = server.stdin().take().expect("Failed to open remote stdin");
                 let server_out = server.stdout().take().expect("Failed to open remote stdout");
-                (server_in, server_out)
+                (StdinWrapper::OpensshStdin(server_in), StdoutWrapper::OpensshStdout(server_out))
             },
         };
 
