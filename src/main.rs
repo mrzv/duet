@@ -20,7 +20,8 @@ use std::path::{Path,PathBuf};
 
 use std::fs::File;
 use std::io::{BufWriter,BufReader};
-use bincode::{serialize_into,deserialize_from};
+use bincode::serde::encode_into_std_write as serialize_into;
+use bincode::serde::decode_from_std_read  as deserialize_from;
 
 use essrpc::essrpc;
 use essrpc::transports::{BincodeTransport,BincodeAsyncClientTransport,ReadWrite};
@@ -152,8 +153,8 @@ fn inspect(statefile: PathBuf) -> Result<()> {
     let entries: Entries =
         if statefile.exists() {
             log::debug!("Loading: {}", statefile.display());
-            let f = BufReader::new(File::open(statefile).unwrap());
-            deserialize_from(f).unwrap()
+            let mut f = BufReader::new(File::open(statefile).unwrap());
+            deserialize_from(&mut f, bincode::config::legacy()).unwrap()
         } else {
             Vec::new()
         };
@@ -203,8 +204,8 @@ async fn snapshot(name: String, statefile: Option<PathBuf>) -> Result<()> {
     let current_entries: Entries = scan_entries(&local_base, &PathBuf::from(""), &prf.locations, &prf.ignore).await?;
 
     let statefile = statefile.unwrap_or(profile::local_state(&name));
-    let f = BufWriter::new(File::create(statefile).unwrap());
-    serialize_into(f, &current_entries)?;
+    let mut f = BufWriter::new(File::create(statefile).unwrap());
+    serialize_into(&current_entries, &mut f, bincode::config::legacy())?;
     Ok(())
 }
 
@@ -448,8 +449,8 @@ async fn sync(name: String, path: Option<PathBuf>,
                         use atomicwrites::{AtomicFile,AllowOverwrite};
                         let af = AtomicFile::new(local_state, AllowOverwrite);
                         af.write(|f| {
-                            let f = BufWriter::new(f);
-                            serialize_into(f, &local_all_old)
+                            let mut f = BufWriter::new(f);
+                            serialize_into(&local_all_old, &mut f, bincode::config::legacy())
                         })
                      }));
     let _ = local_result.expect("Failed to save local state");
@@ -630,11 +631,11 @@ impl DuetServer for DuetServerImpl {
         use atomicwrites::{AtomicFile,AllowOverwrite};
         let af = AtomicFile::new(remote_state, AllowOverwrite);
         let result = af.write(|f| {
-            let f = BufWriter::new(f);
-            serialize_into(f, &self.all_old)
+            let mut f = BufWriter::new(f);
+            serialize_into(&self.all_old, &mut f, bincode::config::legacy())
         });
         match result {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(_) => Err(RPCError::new(RPCErrorKind::Other, "error in saving remote state on the server"))
         }
     }
@@ -679,7 +680,7 @@ async fn old_and_changes(base: &PathBuf, restrict: &PathBuf, locations: &Locatio
                     let mut contents = vec![];
                     f.read_to_end(&mut contents).await.unwrap();
                     log::debug!("Done loading");
-                    deserialize_from(contents.as_slice()).unwrap()
+                    deserialize_from(&mut contents.as_slice(), bincode::config::legacy()).unwrap()
                 } else {
                     Vec::new()
                 }
