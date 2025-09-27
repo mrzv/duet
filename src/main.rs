@@ -879,9 +879,8 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
     let mut num_conflicts = num_unresolved_conflicts(actions.iter().map(|a| &**a));
 
     let resolution = loop {
-        term.write_line(format!("{}{}n/a = abort, f = force{} [{}]",
-                    if num_conflicts == 0 { "y/g = proceed".bright_green() } else { "".normal() },
-                    if num_conflicts == 0 { ", ".normal() } else { "".normal() },
+        term.write_line(format!("{}, n/a = abort, f = force{} [{}]",
+                    if num_conflicts == 0 { "y/g = proceed".bright_green() } else { "Tab/S-Tab = next/previous conflict".bright_yellow() },
                     if actions[sel].is_conflict() { ", left/l = update local, right/r = update remote, c = keep conflict" } else { "" },
                     num_conflicts).as_str())?;
         term.write_line(actions::details(&actions[sel]).as_str())?;
