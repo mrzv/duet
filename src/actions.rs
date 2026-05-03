@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::{PathBuf};
+use std::path::{PathBuf,Component};
 use colored::*;
 use serde::{Serialize,Deserialize};
 use super::scan::change::{Change,same};
@@ -99,17 +99,48 @@ pub fn reverse(actions: &Vec<Action>) -> Vec<Action> {
         .collect()
 }
 
+fn abbreviate_hex_components(path: &PathBuf) -> PathBuf {
+    let mut result = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(os_str) => {
+                let abbreviated = os_str.to_str().and_then(|s| {
+                    if s.len() > 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+                        Some(format!("{}..{}", &s[..3], &s[s.len() - 3..]))
+                    } else {
+                        None
+                    }
+                });
+
+                match abbreviated {
+                    Some(abbr) => result.push(abbr),
+                    None => result.push(os_str),
+                }
+            }
+            // Preserve root, prefix, cur_dir, parent_dir as-is
+            _ => result.push(component.as_os_str()),
+        }
+    }
+
+    result
+}
+
+fn show_path(p: &PathBuf) -> String {
+    abbreviate_hex_components(p).display().to_string()
+}
+
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self {
             // actions are reversed:
             // local action means remote change, and remote action means local change
-            Action::Local(l)                => write!(f, "  <---- {} {}", l, l.path().display()),
-            Action::Remote(r)               => write!(f, "{} ---->   {}", r, r.path().display()),
-            Action::Conflict(l,r)           => write!(f, "{} {} {} {}", l, "<===>".bright_red(), r, l.path().display()),
-            Action::ResolvedLocal((_,_),l)  => write!(f, "  <==== {} {}", l, l.path().display()),
-            Action::ResolvedRemote((_,_),r) => write!(f, "{} ====>   {}", r, r.path().display()),
-            Action::Identical(l,r)          => write!(f, "{} --I-- {} {}", l, r, l.path().display()),
+            Action::Local(l)                => write!(f, "  <---- {} {}", l, show_path(l.path())),
+            Action::Remote(r)               => write!(f, "{} ---->   {}", r, show_path(r.path())),
+            Action::Conflict(l,r)           => write!(f, "{} {} {} {}", l, "<===>".bright_red(), r, show_path(l.path())),
+            Action::ResolvedLocal((_,_),l)  => write!(f, "  <==== {} {}", l, show_path(l.path())),
+            Action::ResolvedRemote((_,_),r) => write!(f, "{} ====>   {}", r, show_path(r.path())),
+            Action::Identical(l,r)          => write!(f, "{} --I-- {} {}", l, r, show_path(l.path())),
         }
     }
 }

@@ -474,7 +474,7 @@ enum Server<'a> {
     Remote(RemoteChild<'a>),
 }
 
-async fn launch_server(session: &Option<Session>, cmd: String) -> Result<Server> {
+async fn launch_server(session: &Option<Session>, cmd: String) -> Result<Server<'_>> {
     // launch server
     if let Some(session) = session {
         let server = session.command(cmd)
@@ -862,6 +862,8 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
     use std::ops::Rem;
     let term = Term::stderr();
 
+    let (height, _width) = term.size();
+
     let mut page = 0;
 
     assert!(!actions.is_empty());
@@ -871,7 +873,7 @@ fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolu
                     .filter(|a| verbose || !a.is_identical())
                     .collect();
 
-    let capacity = term.size().0 as usize - 3;      // extra -1 for the prompt, -1 for detaled changes
+    let capacity = height as usize - 3;      // extra -1 for the prompt, -1 for detaled changes
     let pages = (actions.len() as f64 / capacity as f64).ceil() as usize;
 
     let mut sel = 0;
