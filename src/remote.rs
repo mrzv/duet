@@ -104,3 +104,36 @@ pub(crate) fn get_remote<'a>(
 }
 
 use crate::rpc::DuetServerAsyncRPCClient;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_remote_base_with_default_command() {
+        let (base, server, cmd) = parse_remote(&"/remote/base".to_string()).unwrap();
+
+        assert_eq!(base, "/remote/base");
+        assert_eq!(server, None);
+        assert_eq!(cmd, "duet");
+    }
+
+    #[test]
+    fn parses_remote_command_and_base() {
+        let (base, server, cmd) = parse_remote(&"/bin/duet /remote/base".to_string()).unwrap();
+
+        assert_eq!(base, "/remote/base");
+        assert_eq!(server, None);
+        assert_eq!(cmd, "/bin/duet");
+    }
+
+    #[test]
+    fn parses_ssh_remote() {
+        let (base, server, cmd) =
+            parse_remote(&"ssh example.com /bin/duet /remote/base".to_string()).unwrap();
+
+        assert_eq!(base, "/remote/base");
+        assert_eq!(server, Some("example.com".to_string()));
+        assert_eq!(cmd, "/bin/duet");
+    }
+}

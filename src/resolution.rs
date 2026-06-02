@@ -301,3 +301,56 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
 
     Ok(resolution)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::DirEntryWithMeta;
+    use std::path::PathBuf;
+
+    fn entry(path: &str, checksum: u32) -> DirEntryWithMeta {
+        DirEntryWithMeta::test_file(PathBuf::from(path), checksum)
+    }
+
+    #[test]
+    fn local_resolution_turns_added_added_conflict_into_local_update() {
+        let local = Change::Added(entry("file.txt", 1));
+        let remote = Change::Added(entry("file.txt", 2));
+        let resolved = resolve_action(
+            &Action::Conflict(local.clone(), remote.clone()),
+            Resolution::Local,
+        );
+
+        match resolved {
+            Action::ResolvedLocal((original_local, original_remote), Change::Modified(from, to)) => {
+                assert_eq!(original_local.path(), local.path());
+                assert_eq!(original_remote.path(), remote.path());
+                assert_eq!(from.checksum(), 1);
+                assert_eq!(to.checksum(), 2);
+            }
+            _ => panic!("expected local resolution"),
+        }
+    }
+
+    #[test]
+    fn remote_resolution_turns_modified_removed_conflict_into_remote_add() {
+        let old = entry("file.txt", 1);
+        let local_new = entry("file.txt", 2);
+        let remote_old = entry("file.txt", 1);
+        let local = Change::Modified(old, local_new.clone());
+        let remote = Change::Removed(remote_old);
+        let resolved = resolve_action(
+            &Action::Conflict(local.clone(), remote.clone()),
+            Resolution::Remote,
+        );
+
+        match resolved {
+            Action::ResolvedRemote((original_local, original_remote), Change::Added(added)) => {
+                assert_eq!(original_local.path(), local.path());
+                assert_eq!(original_remote.path(), remote.path());
+                assert_eq!(added.checksum(), local_new.checksum());
+            }
+            _ => panic!("expected remote resolution"),
+        }
+    }
+}

@@ -278,3 +278,33 @@ fn local_id(name: &str) -> String {
     name.hash(&mut s);
     format!("{:x}", s.finish())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_path_leaves_relative_paths_unchanged() {
+        let normalized =
+            normalize_path(&PathBuf::from("/tmp/duet-base"), &PathBuf::from("sub/path")).unwrap();
+
+        assert_eq!(normalized, PathBuf::from("sub/path"));
+    }
+
+    #[test]
+    fn normalize_path_makes_absolute_paths_relative_to_base() {
+        let normalized = normalize_path(
+            &PathBuf::from("/tmp/duet-base"),
+            &PathBuf::from("/tmp/duet-base/sub/path"),
+        )
+        .unwrap();
+
+        assert_eq!(normalized, PathBuf::from("sub/path"));
+    }
+
+    #[test]
+    fn local_id_is_stable_and_profile_specific() {
+        assert_eq!(local_id("work"), local_id("work"));
+        assert_ne!(local_id("work"), local_id("personal"));
+    }
+}

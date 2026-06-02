@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::Result;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncOptions {
     pub interactive: bool,
     pub yes: bool,
@@ -12,7 +12,7 @@ pub struct SyncOptions {
     pub verbose: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
     Version,
@@ -43,8 +43,10 @@ pub enum Command {
 }
 
 pub fn parse_from_env() -> Result<Command> {
-    let mut pargs = pico_args::Arguments::from_env();
+    parse(pico_args::Arguments::from_env())
+}
 
+fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
     if pargs.contains(["-h", "--help"]) {
         return Ok(Command::Help);
     }
@@ -103,4 +105,89 @@ pub fn parse_from_env() -> Result<Command> {
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<PathBuf, &'static str> {
     Ok(s.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn parse_args(args: &[&str]) -> Command {
+        parse(pico_args::Arguments::from_vec(
+            args.iter().map(OsString::from).collect(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_global_commands() {
+        assert_eq!(parse_args(&["--help"]), Command::Help);
+        assert_eq!(parse_args(&["--version"]), Command::Version);
+        assert_eq!(parse_args(&["--license"]), Command::License);
+        assert_eq!(parse_args(&["--server"]), Command::Server);
+    }
+
+    #[test]
+    fn parses_sync_command_with_options() {
+        assert_eq!(
+            parse_args(&[
+                "--interactive",
+                "-y",
+                "-n",
+                "-b",
+                "-f",
+                "-v",
+                "work",
+                "docs",
+            ]),
+            Command::Sync {
+                profile: "work".to_string(),
+                path: Some(PathBuf::from("docs")),
+                options: SyncOptions {
+                    interactive: true,
+                    yes: true,
+                    dry_run: true,
+                    batch: true,
+                    force: true,
+                    verbose: true,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_hidden_commands() {
+        assert_eq!(
+            parse_args(&["_snapshot", "work", "state.bin"]),
+            Command::Snapshot {
+                profile: "work".to_string(),
+                statefile: Some(PathBuf::from("state.bin")),
+            }
+        );
+        assert_eq!(
+            parse_args(&["_inspect", "state.bin"]),
+            Command::Inspect {
+                statefile: PathBuf::from("state.bin"),
+            }
+        );
+        assert_eq!(
+            parse_args(&["_changes", "work", "state.bin"]),
+            Command::Changes {
+                profile: "work".to_string(),
+                statefile: Some(PathBuf::from("state.bin")),
+            }
+        );
+        assert_eq!(
+            parse_args(&["_info", "work"]),
+            Command::Info {
+                profile: "work".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(&["_walk", "docs"]),
+            Command::Walk {
+                path: PathBuf::from("docs"),
+            }
+        );
+    }
 }
