@@ -13,6 +13,8 @@ use crate::scan::location::Locations;
 use crate::state::{Changes, Entries};
 use crate::sync::{self, ChangeDetails, SignatureWithPath};
 
+pub(crate) const SERVER_LOG_ENV: &str = "DUET_SERVER_LOG";
+
 #[essrpc(sync, async)]
 pub trait DuetServer {
     fn set_base(&mut self, base: String) -> Result<(), RPCError>;
@@ -31,11 +33,13 @@ pub trait DuetServer {
     ) -> Result<Vec<sync::ChangeDetails>, RPCError>;
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError>;
     fn save_state(&self) -> Result<(), RPCError>;
+    fn set_remote_state_dir(&mut self, remote_state_dir: PathBuf) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
     base: PathBuf,
     remote_id: String,
+    remote_state_dir: PathBuf,
     all_old: Entries,
     actions: Actions,
 }
@@ -45,6 +49,7 @@ impl DuetServerImpl {
         DuetServerImpl {
             base: PathBuf::from(""),
             remote_id: "".to_string(),
+            remote_state_dir: profile::remote_state_dir(),
             all_old: Vec::new(),
             actions: Vec::new(),
         }
@@ -72,6 +77,12 @@ impl DuetServer for DuetServerImpl {
         Ok(())
     }
 
+    fn set_remote_state_dir(&mut self, remote_state_dir: PathBuf) -> Result<(), RPCError> {
+        log::debug!("Set remote state dir {}", remote_state_dir.display());
+        self.remote_state_dir = remote_state_dir;
+        Ok(())
+    }
+
     fn changes(
         &mut self,
         path: PathBuf,
@@ -89,7 +100,10 @@ impl DuetServer for DuetServerImpl {
                 &path,
                 &locations,
                 &ignore,
-                Some(&profile::remote_state(&self.remote_id)),
+                Some(&profile::remote_state_in(
+                    &self.remote_state_dir,
+                    &self.remote_id,
+                )),
             )
             .await
         });
@@ -151,8 +165,8 @@ impl DuetServer for DuetServerImpl {
 
     fn save_state(&self) -> Result<(), RPCError> {
         log::debug!("Saving state");
-        std::fs::create_dir_all(profile::remote_state_dir())?;
-        let remote_state = profile::remote_state(&self.remote_id);
+        std::fs::create_dir_all(&self.remote_state_dir)?;
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         log::info!(
             "Saving remote state {} with {} entries",
             remote_state.display(),
@@ -175,12 +189,16 @@ impl DuetServer for DuetServerImpl {
 }
 
 pub async fn server() -> Result<()> {
-    std::fs::create_dir_all(crate::full(&"~/.config/duet".to_string())?)?;
+    let log_path = if let Some(path) = std::env::var_os(SERVER_LOG_ENV) {
+        PathBuf::from(path)
+    } else {
+        crate::full(&"~/.config/duet/remote.log".to_string())?
+    };
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     use log::LevelFilter;
-    simple_logging::log_to_file(
-        crate::full(&"~/.config/duet/remote.log".to_string())?,
-        LevelFilter::Debug,
-    )?;
+    simple_logging::log_to_file(log_path, LevelFilter::Debug)?;
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -192,10 +210,11 @@ pub async fn server() -> Result<()> {
     tokio::task::spawn_blocking(|| {
         let mut serve =
             DuetServerRPCServer::new(DuetServerImpl::new(), BincodeTransport::new(stdio));
-        match serve.serve() {
-            Ok(_) => panic!("Expected EOF error"),
-            Err(e) => assert_eq!(e.kind, RPCErrorKind::TransportEOF),
-        };
+        if let Err(e) = serve.serve() {
+            if e.kind != RPCErrorKind::TransportEOF {
+                log::error!("RPC server stopped with error: {:?}", e);
+            }
+        }
     })
     .await?;
 

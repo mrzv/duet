@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::Result;
 
+use crate::profile::ProfileSource;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncOptions {
     pub interactive: bool,
@@ -36,7 +38,7 @@ pub enum Command {
         path: PathBuf,
     },
     Sync {
-        profile: String,
+        profile: ProfileSource,
         path: Option<PathBuf>,
         options: SyncOptions,
     },
@@ -63,6 +65,8 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         return Ok(Command::Server);
     }
 
+    let profile_file = pargs.opt_value_from_os_str("--profile-file", parse_path)?;
+
     let options = SyncOptions {
         interactive: pargs.contains(["-i", "--interactive"]),
         yes: pargs.contains(["-y", "--yes"]),
@@ -71,6 +75,14 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         force: pargs.contains(["-f", "--force"]),
         verbose: pargs.contains(["-v", "--verbose"]),
     };
+
+    if let Some(profile_file) = profile_file {
+        return Ok(Command::Sync {
+            profile: ProfileSource::File(profile_file),
+            path: pargs.opt_free_from_os_str(parse_path)?,
+            options,
+        });
+    }
 
     let profile = match pargs.free_from_str::<String>() {
         Ok(profile) => profile,
@@ -96,7 +108,7 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
             path: pargs.free_from_os_str(parse_path)?,
         }),
         _ => Ok(Command::Sync {
-            profile,
+            profile: ProfileSource::Named(profile),
             path: pargs.opt_free_from_os_str(parse_path)?,
             options,
         }),
@@ -141,7 +153,7 @@ mod tests {
                 "docs",
             ]),
             Command::Sync {
-                profile: "work".to_string(),
+                profile: ProfileSource::Named("work".to_string()),
                 path: Some(PathBuf::from("docs")),
                 options: SyncOptions {
                     interactive: true,
@@ -150,6 +162,25 @@ mod tests {
                     batch: true,
                     force: true,
                     verbose: true,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_sync_command_with_profile_file() {
+        assert_eq!(
+            parse_args(&["--profile-file", "profile.prf", "docs"]),
+            Command::Sync {
+                profile: ProfileSource::File(PathBuf::from("profile.prf")),
+                path: Some(PathBuf::from("docs")),
+                options: SyncOptions {
+                    interactive: false,
+                    yes: false,
+                    dry_run: false,
+                    batch: false,
+                    force: false,
+                    verbose: false,
                 },
             }
         );

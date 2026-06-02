@@ -18,6 +18,7 @@ bi-directional synchronization
 
 USAGE:
     duet [FLAGS] <profile> [path]
+    duet [FLAGS] --profile-file <file> [path]
 
 FLAGS:
     -i, --interactive   interactive conflict resolution
@@ -26,6 +27,9 @@ FLAGS:
     -f, --force         in batch mode, apply what's possible, even if there are conflicts
     -v, --verbose       verbose output
     -n, --dry-run       don't apply changes
+
+        --profile-file <file>
+                         read profile from a local file and keep state next to it
 
         --version       prints version information
         --license       prints license information (including dependencies)

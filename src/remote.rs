@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Stdio;
 
 use color_eyre::eyre::{eyre, Result};
@@ -34,7 +35,11 @@ pub(crate) enum Server<'a> {
     Remote(RemoteChild<'a>),
 }
 
-pub(crate) async fn launch_server(session: &Option<Session>, cmd: String) -> Result<Server<'_>> {
+pub(crate) async fn launch_server<'a>(
+    session: &'a Option<Session>,
+    cmd: String,
+    server_log: &Path,
+) -> Result<Server<'a>> {
     if let Some(session) = session {
         let server = session
             .command(cmd)
@@ -55,6 +60,7 @@ pub(crate) async fn launch_server(session: &Option<Session>, cmd: String) -> Res
             .to_string();
         let server = TokioCommand::new(cmd)
             .arg("--server")
+            .env(crate::rpc::SERVER_LOG_ENV, server_log)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

@@ -2,13 +2,14 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use bincode::serde::encode_into_std_write as serialize_into;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Result};
 use colored::*;
+use essrpc::{RPCError, RPCErrorKind};
 use openssh::{KnownHosts, Session, SessionBuilder};
 
 use crate::actions::{num_identical, num_unresolved_conflicts, reverse, Action, Actions};
 use crate::cli::SyncOptions;
-use crate::profile;
+use crate::profile::{self, ProfileSource};
 use crate::remote;
 use crate::resolution::{self, AllResolution};
 use crate::rpc::DuetServerAsync;
@@ -33,9 +34,11 @@ struct SyncContext {
     remote_cmd: String,
     path: PathBuf,
     local_state: PathBuf,
+    remote_state_dir: Option<PathBuf>,
+    server_log: PathBuf,
 }
 
-pub async fn sync(name: String, path: Option<PathBuf>, options: SyncOptions) -> Result<()> {
+pub async fn sync(source: ProfileSource, path: Option<PathBuf>, options: SyncOptions) -> Result<()> {
     env_logger::init();
     install_ctrlc_handler();
 
@@ -48,7 +51,9 @@ pub async fn sync(name: String, path: Option<PathBuf>, options: SyncOptions) -> 
         remote_cmd,
         path,
         local_state,
-    } = prepare_context(name, path)?;
+        remote_state_dir,
+        server_log,
+    } = prepare_context(source, path)?;
 
     let local_fut = state::old_and_changes(
         &local_base,
@@ -59,7 +64,7 @@ pub async fn sync(name: String, path: Option<PathBuf>, options: SyncOptions) -> 
     );
 
     let remote_session = open_remote_session(remote_server).await;
-    let mut server = remote::launch_server(&remote_session, remote_cmd)
+    let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
         .await
         .unwrap_or_else(|e| {
             eprintln!("Failed to start server ({})", e.to_string().cyan());
@@ -75,14 +80,21 @@ pub async fn sync(name: String, path: Option<PathBuf>, options: SyncOptions) -> 
             .set_base(remote_base)
             .await
             .expect("Couldn't set server base");
+        if let Some(remote_state_dir) = remote_state_dir {
+            remote
+                .set_remote_state_dir(remote_state_dir)
+                .await
+                .map_err(remote_state_dir_error)?;
+        }
         remote
             .changes(remote_path, remote_locations, remote_ignore, local_id)
             .await
-            .expect("Couldn't get remote changes")
+            .map_err(|e| eyre!("Couldn't get remote changes: {:?}", e))
     };
 
-    let (local_result, remote_changes) = tokio::join!(local_fut, remote_fut);
+    let (local_result, remote_result) = tokio::join!(local_fut, remote_fut);
     let (mut local_all_old, local_changes) = local_result.expect("Couldn't get local changes");
+    let remote_changes = remote_result?;
 
     let mut actions = build_actions(&local_changes, &remote_changes);
     let resolution = resolve_actions(&mut actions, options)?;
@@ -184,40 +196,62 @@ fn install_ctrlc_handler() {
     .expect("Error setting Ctrl-C handler");
 }
 
-fn prepare_context(name: String, path: Option<PathBuf>) -> Result<SyncContext> {
-    let prf = profile::parse(&name).unwrap_or_else(|e| {
+fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncContext> {
+    let config = profile::load(&source).unwrap_or_else(|e| {
         eprintln!(
             "Failed to read profile {} ({})",
-            name.yellow(),
+            profile_name(&source).yellow(),
             e.to_string().cyan()
         );
         quit::with_code(PROFILE_ERROR_CODE);
     });
 
-    let local_id = local_id(&name);
+    let local_id = local_id(&config.identity);
 
-    let local_base = crate::full(&prf.local)?;
-    let (remote_base, remote_server, remote_cmd) = remote::parse_remote(&prf.remote)?;
+    let local_base = crate::full(&config.profile.local)?;
+    let (remote_base, remote_server, remote_cmd) = remote::parse_remote(&config.profile.remote)?;
 
     let path = normalize_path(&local_base, &path.unwrap_or(PathBuf::from("")))?;
     println!(
         "Using profile: {} {}",
-        name.cyan(),
+        config.display_name.cyan(),
         path.display().to_string().yellow()
     );
 
-    let local_state = profile::local_state(&name);
+    let remote_state_dir = match source {
+        ProfileSource::Named(_) => None,
+        ProfileSource::File(_) => Some(config.remote_state_dir),
+    };
 
     Ok(SyncContext {
-        profile: prf,
+        profile: config.profile,
         local_id,
         local_base,
         remote_base,
         remote_server,
         remote_cmd,
         path,
-        local_state,
+        local_state: config.local_state,
+        remote_state_dir,
+        server_log: config.server_log,
     })
+}
+
+fn remote_state_dir_error(error: RPCError) -> color_eyre::eyre::Report {
+    match error.kind {
+        RPCErrorKind::TransportEOF | RPCErrorKind::SerializationError => eyre!(
+            "remote server does not support --profile-file state isolation; upgrade remote duet ({:?})",
+            error
+        ),
+        _ => eyre!("Couldn't set remote state dir: {:?}", error),
+    }
+}
+
+fn profile_name(source: &ProfileSource) -> String {
+    match source {
+        ProfileSource::Named(name) => name.clone(),
+        ProfileSource::File(path) => path.display().to_string(),
+    }
 }
 
 async fn open_remote_session(remote_server: Option<String>) -> Option<Session> {
