@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, WrapErr};
 use colored::*;
 use tokio::sync::mpsc;
 
@@ -61,7 +61,8 @@ pub(crate) fn inspect(statefile: PathBuf) -> Result<()> {
 }
 
 pub(crate) async fn snapshot(name: String, statefile: Option<PathBuf>) -> Result<()> {
-    let prf = profile::parse(&name).expect(&format!("Failed to read profile {}", name.yellow()));
+    let prf = profile::parse(&name)
+        .wrap_err_with(|| format!("Failed to read profile {}", name.yellow()))?;
     println!("Using profile: {}", name.cyan());
 
     let local_base = full(&prf.local)?;
@@ -75,7 +76,8 @@ pub(crate) async fn snapshot(name: String, statefile: Option<PathBuf>) -> Result
 }
 
 pub(crate) async fn changes(name: String, statefile: Option<PathBuf>) -> Result<()> {
-    let prf = profile::parse(&name).expect(&format!("Failed to read profile {}", name.yellow()));
+    let prf = profile::parse(&name)
+        .wrap_err_with(|| format!("Failed to read profile {}", name.yellow()))?;
     println!("Using profile: {}", name.cyan());
 
     let local_base = full(&prf.local)?;

@@ -85,11 +85,12 @@ pub async fn old_and_changes(
         let all_old_entries: Entries = if let Some(f) = statefile {
             if f.exists() {
                 log::debug!("Loading: {}", f.display());
-                let mut f = File::open(f).await.unwrap();
+                let mut f = File::open(f).await?;
                 let mut contents = vec![];
-                f.read_to_end(&mut contents).await.unwrap();
+                f.read_to_end(&mut contents).await?;
                 log::debug!("Done loading");
-                deserialize_from(&mut contents.as_slice(), bincode::config::legacy()).unwrap()
+                let mut contents = contents.as_slice();
+                deserialize_from(&mut contents, bincode::config::legacy())?
             } else {
                 Vec::new()
             }
@@ -97,41 +98,37 @@ pub async fn old_and_changes(
             Vec::new()
         };
         log::debug!("Done reading out entries");
-        all_old_entries
+        Ok::<Entries, color_eyre::eyre::Report>(all_old_entries)
     };
 
     use tokio::join;
     let (all_old_entries, restricted_current_scan) =
         join!(all_old_entries, restricted_current_scan);
+    let all_old_entries = all_old_entries?;
+    let restricted_current_scan = restricted_current_scan?;
     let restricted_old_entries_iter = all_old_entries
         .iter()
         .filter(move |dir: &&scan::DirEntryWithMeta| dir.starts_with(restrict));
 
     let mut changes: Vec<_> =
-        scan::changes(restricted_old_entries_iter, restricted_current_scan?.iter()).collect();
+        scan::changes(restricted_old_entries_iter, restricted_current_scan.iter()).collect();
 
     log::debug!("Computing checksums for {} changes", changes.len());
     let pb = indicatif::ProgressBar::new(changes.len() as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
-            .expect("Failed to set template for progress bar style")
-            .progress_chars("##-"),
-    );
+    let style = indicatif::ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")?
+        .progress_chars("##-");
+    pb.set_style(style);
     pb.set_message("computing checksums");
     let base = PathBuf::from(base);
     for change in &mut changes {
         pb.inc(1);
         match change {
             Change::Added(n) => {
-                n.compute_checksum(&base)
-                    .await
-                    .expect(format!("Unable to compute checksum for {:?}", n).as_str());
+                n.compute_checksum(&base).await?;
             }
             Change::Modified(_, n) => {
-                n.compute_checksum(&base)
-                    .await
-                    .expect(format!("Unable to compute checksum for {:?}", n).as_str());
+                n.compute_checksum(&base).await?;
             }
             Change::Removed(_) => {}
         }

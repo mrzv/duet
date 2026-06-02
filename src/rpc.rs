@@ -155,7 +155,7 @@ impl DuetServer for DuetServerImpl {
         let remote_state = profile::remote_state(&self.remote_id);
         log::info!(
             "Saving remote state {} with {} entries",
-            remote_state.to_str().unwrap(),
+            remote_state.display(),
             &self.all_old.len()
         );
         use atomicwrites::{AllowOverwrite, AtomicFile};

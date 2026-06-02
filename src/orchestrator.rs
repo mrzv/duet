@@ -326,7 +326,10 @@ fn normalize_path(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
 fn local_id(name: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    let mid: String = machine_uid::get().unwrap();
+    let mid = machine_uid::get().unwrap_or_else(|e| {
+        log::warn!("Unable to read machine id: {:?}", e);
+        "unknown-machine".to_string()
+    });
     let mut s = DefaultHasher::new();
     mid.hash(&mut s);
     name.hash(&mut s);
