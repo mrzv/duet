@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::Result;
 use colored::*;
-use openssh::{KnownHosts, SessionBuilder};
+use openssh::{KnownHosts, Session, SessionBuilder};
 
 use crate::actions::{num_identical, num_unresolved_conflicts, reverse, Action, Actions};
 use crate::cli::SyncOptions;
@@ -24,45 +24,31 @@ const SSH_ERROR_CODE: u8 = 3;
 const SERVER_ERROR_CODE: u8 = 4;
 const CTRLC_CODE: u8 = 6;
 
+struct SyncContext {
+    profile: profile::Profile,
+    local_id: String,
+    local_base: PathBuf,
+    remote_base: String,
+    remote_server: Option<String>,
+    remote_cmd: String,
+    path: PathBuf,
+    local_state: PathBuf,
+}
+
 pub async fn sync(name: String, path: Option<PathBuf>, options: SyncOptions) -> Result<()> {
-    let SyncOptions {
-        interactive,
-        yes,
-        dry_run,
-        batch,
-        force,
-        verbose,
-    } = options;
     env_logger::init();
+    install_ctrlc_handler();
 
-    ctrlc::set_handler(|| {
-        eprintln!("\nQuitting");
-        quit::with_code(CTRLC_CODE);
-    })
-    .expect("Error setting Ctrl-C handler");
-
-    let prf = profile::parse(&name).unwrap_or_else(|e| {
-        eprintln!(
-            "Failed to read profile {} ({})",
-            name.yellow(),
-            e.to_string().cyan()
-        );
-        quit::with_code(PROFILE_ERROR_CODE);
-    });
-
-    let local_id = local_id(&name);
-
-    let local_base = crate::full(&prf.local)?;
-    let (remote_base, remote_server, remote_cmd) = remote::parse_remote(&prf.remote)?;
-
-    let path = normalize_path(&local_base, &path.unwrap_or(PathBuf::from("")))?;
-    println!(
-        "Using profile: {} {}",
-        name.cyan(),
-        path.display().to_string().yellow()
-    );
-
-    let local_state = profile::local_state(&name);
+    let SyncContext {
+        profile: prf,
+        local_id,
+        local_base,
+        remote_base,
+        remote_server,
+        remote_cmd,
+        path,
+        local_state,
+    } = prepare_context(name, path)?;
 
     let local_fut = state::old_and_changes(
         &local_base,
@@ -72,23 +58,7 @@ pub async fn sync(name: String, path: Option<PathBuf>, options: SyncOptions) -> 
         Some(&local_state),
     );
 
-    let remote_session = if let Some(server) = remote_server {
-        let session_result = SessionBuilder::default()
-            .control_directory(std::env::temp_dir())
-            .known_hosts_check(KnownHosts::Strict)
-            .connect(server)
-            .await;
-        match session_result {
-            Ok(session) => Some(session),
-            Err(e) => {
-                eprintln!("Unable to get SSH session ({})", e.to_string().cyan());
-                log::error!("Unable to get SSH session: {:?}", e);
-                quit::with_code(SSH_ERROR_CODE);
-            }
-        }
-    } else {
-        None
-    };
+    let remote_session = open_remote_session(remote_server).await;
     let mut server = remote::launch_server(&remote_session, remote_cmd)
         .await
         .unwrap_or_else(|e| {
@@ -97,14 +67,16 @@ pub async fn sync(name: String, path: Option<PathBuf>, options: SyncOptions) -> 
         });
     let remote = remote::get_remote(&mut server);
 
-    let path = path.clone();
+    let remote_path = path.clone();
+    let remote_locations = prf.locations.clone();
+    let remote_ignore = prf.ignore.clone();
     let remote_fut = async {
         remote
             .set_base(remote_base)
             .await
             .expect("Couldn't set server base");
         remote
-            .changes(path, prf.locations.clone(), prf.ignore.clone(), local_id)
+            .changes(remote_path, remote_locations, remote_ignore, local_id)
             .await
             .expect("Couldn't get remote changes")
     };
@@ -112,53 +84,8 @@ pub async fn sync(name: String, path: Option<PathBuf>, options: SyncOptions) -> 
     let (local_result, remote_changes) = tokio::join!(local_fut, remote_fut);
     let (mut local_all_old, local_changes) = local_result.expect("Couldn't get local changes");
 
-    let mut actions: Actions = utils::match_sorted(local_changes.iter(), remote_changes.iter())
-        .filter_map(|(lc, rc)| Action::create(lc, rc))
-        .collect();
-
-    if actions.is_empty() {
-        println!("No changes detected");
-        quit::with_code(OK_CODE);
-    }
-
-    if dry_run {
-        resolution::show_actions(&actions, verbose);
-        quit::with_code(OK_CODE);
-    }
-
-    let num_conflicts = num_unresolved_conflicts(actions.iter());
-    let num_identical = num_identical(actions.iter());
-
-    let resolution = if batch {
-        resolution::show_actions(&actions, verbose);
-        if force {
-            AllResolution::Force
-        } else if num_conflicts > 0 {
-            println!(
-                "{} conflicts found; {}\n",
-                num_conflicts,
-                "aborting".bright_red()
-            );
-            AllResolution::Abort
-        } else {
-            AllResolution::Proceed
-        }
-    } else if interactive && (num_identical < actions.len() || verbose) {
-        let resolution = if yes && num_conflicts == 0 {
-            AllResolution::Proceed
-        } else {
-            resolution::resolve_interactive(&mut actions, verbose)?
-        };
-        resolution::show_actions(&actions, verbose);
-        resolution
-    } else {
-        resolution::show_actions(&actions, verbose);
-        if yes && num_conflicts == 0 {
-            AllResolution::Proceed
-        } else {
-            resolution::resolve_sequential(&mut actions, verbose)?
-        }
-    };
+    let mut actions = build_actions(&local_changes, &remote_changes);
+    let resolution = resolve_actions(&mut actions, options)?;
 
     if let AllResolution::Abort = resolution {
         println!("Aborting");
@@ -247,6 +174,133 @@ pub async fn sync(name: String, path: Option<PathBuf>, options: SyncOptions) -> 
     let _ = remote_result.expect("Failed to save remote state");
 
     Ok(())
+}
+
+fn install_ctrlc_handler() {
+    ctrlc::set_handler(|| {
+        eprintln!("\nQuitting");
+        quit::with_code(CTRLC_CODE);
+    })
+    .expect("Error setting Ctrl-C handler");
+}
+
+fn prepare_context(name: String, path: Option<PathBuf>) -> Result<SyncContext> {
+    let prf = profile::parse(&name).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to read profile {} ({})",
+            name.yellow(),
+            e.to_string().cyan()
+        );
+        quit::with_code(PROFILE_ERROR_CODE);
+    });
+
+    let local_id = local_id(&name);
+
+    let local_base = crate::full(&prf.local)?;
+    let (remote_base, remote_server, remote_cmd) = remote::parse_remote(&prf.remote)?;
+
+    let path = normalize_path(&local_base, &path.unwrap_or(PathBuf::from("")))?;
+    println!(
+        "Using profile: {} {}",
+        name.cyan(),
+        path.display().to_string().yellow()
+    );
+
+    let local_state = profile::local_state(&name);
+
+    Ok(SyncContext {
+        profile: prf,
+        local_id,
+        local_base,
+        remote_base,
+        remote_server,
+        remote_cmd,
+        path,
+        local_state,
+    })
+}
+
+async fn open_remote_session(remote_server: Option<String>) -> Option<Session> {
+    if let Some(server) = remote_server {
+        let session_result = SessionBuilder::default()
+            .control_directory(std::env::temp_dir())
+            .known_hosts_check(KnownHosts::Strict)
+            .connect(server)
+            .await;
+        match session_result {
+            Ok(session) => Some(session),
+            Err(e) => {
+                eprintln!("Unable to get SSH session ({})", e.to_string().cyan());
+                log::error!("Unable to get SSH session: {:?}", e);
+                quit::with_code(SSH_ERROR_CODE);
+            }
+        }
+    } else {
+        None
+    }
+}
+
+fn build_actions(local_changes: &state::Changes, remote_changes: &state::Changes) -> Actions {
+    utils::match_sorted(local_changes.iter(), remote_changes.iter())
+        .filter_map(|(lc, rc)| Action::create(lc, rc))
+        .collect()
+}
+
+fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllResolution> {
+    let SyncOptions {
+        interactive,
+        yes,
+        dry_run,
+        batch,
+        force,
+        verbose,
+    } = options;
+
+    if actions.is_empty() {
+        println!("No changes detected");
+        quit::with_code(OK_CODE);
+    }
+
+    if dry_run {
+        resolution::show_actions(&actions, verbose);
+        quit::with_code(OK_CODE);
+    }
+
+    let num_conflicts = num_unresolved_conflicts(actions.iter());
+    let num_identical = num_identical(actions.iter());
+
+    let resolution = if batch {
+        resolution::show_actions(&actions, verbose);
+        if force {
+            AllResolution::Force
+        } else if num_conflicts > 0 {
+            println!(
+                "{} conflicts found; {}\n",
+                num_conflicts,
+                "aborting".bright_red()
+            );
+            AllResolution::Abort
+        } else {
+            AllResolution::Proceed
+        }
+    } else if interactive && (num_identical < actions.len() || verbose) {
+        let resolution = if yes && num_conflicts == 0 {
+            AllResolution::Proceed
+        } else {
+            resolution::resolve_interactive(actions, verbose)?
+        };
+        resolution::show_actions(&actions, verbose);
+        resolution
+    } else {
+        resolution::show_actions(&actions, verbose);
+        if yes && num_conflicts == 0 {
+            AllResolution::Proceed
+        } else {
+            resolution::resolve_sequential(actions, verbose)?
+        }
+    };
+
+    Ok(resolution)
 }
 
 fn normalize_path(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
