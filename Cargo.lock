@@ -676,6 +676,7 @@ dependencies = [
  "serde_derive",
  "shellexpand",
  "simple-logging",
+ "tempfile",
  "text_io",
  "tokio",
  "unix_mode",
