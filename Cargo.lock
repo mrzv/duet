@@ -669,6 +669,7 @@ dependencies = [
  "path-clean",
  "pico-args",
  "quit",
+ "rand",
  "readwrite",
  "regex",
  "serde",

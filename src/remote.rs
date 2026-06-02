@@ -1,0 +1,106 @@
+use std::process::Stdio;
+
+use color_eyre::eyre::{eyre, Result};
+use essrpc::transports::BincodeAsyncClientTransport;
+use essrpc::AsyncRPCClient;
+use openssh::{RemoteChild, Session};
+use readwrite::ReadWriteTokio;
+use tokio::io::{BufReader as AsyncBufReader, BufWriter as AsyncBufWriter};
+use tokio::process::{Child, Command as TokioCommand};
+
+use crate::io_wrappers::{StdinWrapper, StdoutWrapper};
+
+pub(crate) fn parse_remote(remote: &String) -> Result<(String, Option<String>, String)> {
+    let elements: Vec<&str> = remote.split_whitespace().collect();
+    let (remote_server, i) = if elements[0] == "ssh" {
+        (Some(elements[1].to_string()), 2)
+    } else {
+        (None, 0)
+    };
+    let (remote_cmd, remote_base, i) = if i == elements.len() - 1 {
+        ("duet".to_string(), elements[i].to_string(), i + 1)
+    } else {
+        (elements[i].to_string(), elements[i + 1].to_string(), i + 2)
+    };
+    if i < elements.len() {
+        Err(eyre!("Couldn't parse remote, elements remaining"))
+    } else {
+        Ok((remote_base, remote_server, remote_cmd))
+    }
+}
+
+pub(crate) enum Server<'a> {
+    Local(Child),
+    Remote(RemoteChild<'a>),
+}
+
+pub(crate) async fn launch_server(session: &Option<Session>, cmd: String) -> Result<Server<'_>> {
+    if let Some(session) = session {
+        let server = session
+            .command(cmd)
+            .arg("--server")
+            .stdin(openssh::process::Stdio::piped())
+            .stdout(openssh::process::Stdio::piped())
+            .stderr(openssh::process::Stdio::inherit())
+            .spawn()
+            .await?;
+
+        log::trace!("launched remote server");
+
+        Ok(Server::Remote(server))
+    } else {
+        let cmd = crate::full(&cmd)
+            .expect("Failed to expand command")
+            .to_string_lossy()
+            .to_string();
+        let server = TokioCommand::new(cmd)
+            .arg("--server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        log::trace!("launched local server");
+
+        Ok(Server::Local(server))
+    }
+}
+
+pub(crate) fn get_remote<'a>(
+    server: &'a mut Server,
+) -> crate::rpc::DuetServerAsyncRPCClient<
+    BincodeAsyncClientTransport<
+        ReadWriteTokio<AsyncBufReader<StdoutWrapper>, AsyncBufWriter<StdinWrapper>>,
+    >,
+> {
+    let (server_in, server_out) = match server {
+        Server::Local(server) => {
+            let server_in = server.stdin.take().expect("Failed to open local stdin");
+            let server_out = server.stdout.take().expect("Failed to read local stdout");
+            (
+                StdinWrapper::TokioStdin(server_in),
+                StdoutWrapper::TokioStdout(server_out),
+            )
+        }
+        Server::Remote(server) => {
+            let server_in = server.stdin().take().expect("Failed to open remote stdin");
+            let server_out = server
+                .stdout()
+                .take()
+                .expect("Failed to open remote stdout");
+            (
+                StdinWrapper::OpensshStdin(server_in),
+                StdoutWrapper::OpensshStdout(server_out),
+            )
+        }
+    };
+
+    let server_io = ReadWriteTokio::new(
+        AsyncBufReader::new(server_out),
+        AsyncBufWriter::new(server_in),
+    );
+
+    DuetServerAsyncRPCClient::new(BincodeAsyncClientTransport::new(server_io))
+}
+
+use crate::rpc::DuetServerAsyncRPCClient;
