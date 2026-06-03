@@ -81,19 +81,17 @@ pub async fn sync(
     let remote_locations = prf.locations.clone();
     let remote_ignore = prf.ignore.clone();
     let remote_fut = async {
-        let mut remote_info = None;
         remote
             .set_base(remote_base)
             .await
             .expect("Couldn't set server base");
+        let remote_info = remote.server_info().await.map_err(server_info_error)?;
         if let Some(remote_state_dir) = remote_state_dir {
-            let info = remote.server_info().await.map_err(server_info_error)?;
-            require_remote_capability(&info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
+            require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
             remote
                 .set_remote_state_dir(remote_state_dir)
                 .await
                 .map_err(remote_state_dir_error)?;
-            remote_info = Some(info);
         }
         let changes = remote
             .changes(remote_path, remote_locations, remote_ignore, local_id)
@@ -108,7 +106,7 @@ pub async fn sync(
 
     let mut actions = build_actions(&local_changes, &remote_changes);
     if options.debug_info {
-        show_debug_info(remote_info.as_ref());
+        show_debug_info(&remote_info);
     }
     let resolution = resolve_actions(&mut actions, options)?;
 
@@ -127,9 +125,7 @@ pub async fn sync(
             .collect(),
     );
     let remote_actions: Actions = reverse(&actions);
-    let can_stream_details = remote_info
-        .as_ref()
-        .is_some_and(|info| has_remote_capability(info, rpc::CAPABILITY_STREAMED_DETAILS))
+    let can_stream_details = has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAILS)
         && sync_ops::can_stream_details(&actions)
         && sync_ops::can_stream_details(&remote_actions);
     remote
@@ -366,29 +362,23 @@ fn format_capabilities(capabilities: &[impl AsRef<str>]) -> String {
     }
 }
 
-fn show_debug_info(remote_info: Option<&rpc::ServerInfo>) {
+fn show_debug_info(info: &rpc::ServerInfo) {
     println!("Debug information:");
     println!("  client protocol: {}", rpc::PROTOCOL_VERSION);
     println!(
         "  client capabilities: {}",
         format_capabilities(rpc::client_capabilities())
     );
-
-    if let Some(info) = remote_info {
-        println!("  server version: {}", info.duet_version);
-        println!("  server protocol: {}", info.protocol_version);
-        println!(
-            "  server capabilities: {}",
-            format_capabilities(&info.capabilities)
-        );
-        println!(
-            "  agreed capabilities: {}",
-            format_capabilities(&agreed_capabilities(info))
-        );
-    } else {
-        println!("  server negotiation: not attempted for named profile compatibility");
-        println!("  agreed capabilities: unknown");
-    }
+    println!("  server version: {}", info.duet_version);
+    println!("  server protocol: {}", info.protocol_version);
+    println!(
+        "  server capabilities: {}",
+        format_capabilities(&info.capabilities)
+    );
+    println!(
+        "  agreed capabilities: {}",
+        format_capabilities(&agreed_capabilities(info))
+    );
 }
 
 fn server_info_error(error: RPCError) -> color_eyre::eyre::Report {

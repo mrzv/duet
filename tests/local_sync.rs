@@ -197,6 +197,50 @@ fn debug_info_reports_negotiated_capabilities() {
 }
 
 #[test]
+fn named_profile_debug_info_reports_negotiated_capabilities() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let config = home.join(".config").join("duet");
+    let local = temp.path().join("local");
+    let remote = temp.path().join("remote");
+
+    fs::create_dir_all(&config).unwrap();
+    fs::create_dir(&local).unwrap();
+    fs::create_dir(&remote).unwrap();
+    fs::write(
+        config.join("work.prf"),
+        format!(
+            "{}\n{} {}\n+a.txt\n",
+            local.display(),
+            duet_bin().display(),
+            remote.display()
+        ),
+    )
+    .unwrap();
+    write(&local.join("a.txt"), "from local");
+
+    let output = Command::new(duet_bin())
+        .arg("--debug-info")
+        .arg("work")
+        .arg("-b")
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert_success(output);
+    assert!(stdout.contains("Debug information:"), "{}", stdout);
+    assert!(stdout.contains("server protocol:"), "{}", stdout);
+    assert!(
+        stdout.contains("agreed capabilities: profile-file-state-dir, streamed-details-v1"),
+        "{}",
+        stdout
+    );
+    assert_eq!(read(&remote.join("a.txt")), "from local");
+}
+
+#[test]
 fn large_local_added_file_streams_to_remote() {
     let case = SyncCase::new();
     let contents = patterned_bytes(3 * 1024 * 1024 + 17);
