@@ -1,21 +1,21 @@
-use std::path::{PathBuf,Path};
 use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
 
-use std::os::unix::fs::{MetadataExt,FileTypeExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-use serde::{Serialize,Deserialize};
+use serde::{Deserialize, Serialize};
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Result, WrapErr};
 
-use tokio::sync::{mpsc,Semaphore};
 use std::sync::Arc;
+use tokio::sync::{mpsc, Semaphore};
 
 use async_recursion::async_recursion;
 
 use log;
 
-use crate::profile::{Ignore};
-use regex::{Regex};
+use crate::profile::Ignore;
+use regex::Regex;
 pub type Regexes = Vec<Regex>;
 fn is_match(regexes: &Regexes, p: &Path) -> bool {
     if let Some(s) = p.file_name() {
@@ -30,19 +30,19 @@ fn is_match(regexes: &Regexes, p: &Path) -> bool {
     false
 }
 
-pub mod location;
 pub mod change;
+pub mod location;
 
-use location::{Locations,Location};
-pub use change::{changes,Change};
+pub use change::{changes, Change};
+use location::{Location, Locations};
 
-#[derive(Debug,Clone,Serialize,Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntryWithMeta {
-    path:   PathBuf,
-    size:   u64,
-    mtime:  i64,
-    ino:    u64,
-    mode:   u32,
+    path: PathBuf,
+    size: u64,
+    mtime: i64,
+    ino: u64,
+    mode: u32,
     target: Option<PathBuf>,
     is_dir: bool,
     checksum: u32,
@@ -129,10 +129,15 @@ impl DirEntryWithMeta {
         log::trace!("Computing checksum for {}", filename.display());
 
         use tokio::io::AsyncReadExt;
-        let mut file = tokio::fs::File::open(filename).await?;
+        let mut file = tokio::fs::File::open(&filename)
+            .await
+            .wrap_err_with(|| format!("unable to open {} for checksum", filename.display()))?;
         let mut contents = vec![];
-        file.read_to_end(&mut contents).await?;
-        self.checksum = adler32::adler32(&contents[..])?;
+        file.read_to_end(&mut contents)
+            .await
+            .wrap_err_with(|| format!("unable to read {} for checksum", filename.display()))?;
+        self.checksum = adler32::adler32(&contents[..])
+            .wrap_err_with(|| format!("unable to checksum {}", filename.display()))?;
 
         Ok(())
     }
@@ -144,7 +149,7 @@ impl PartialEq for DirEntryWithMeta {
     }
 }
 
-impl Eq for DirEntryWithMeta { }
+impl Eq for DirEntryWithMeta {}
 
 impl PartialOrd for DirEntryWithMeta {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -158,11 +163,11 @@ impl Ord for DirEntryWithMeta {
     }
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 struct ParentFromTo {
     parent: usize,
     from: usize,
-    to: usize
+    to: usize,
 }
 
 fn narrow_parent_from_to(pft: ParentFromTo, path: &PathBuf, locations: &Locations) -> ParentFromTo {
@@ -177,7 +182,7 @@ fn narrow_parent_from_to(pft: ParentFromTo, path: &PathBuf, locations: &Location
     if from <= to {
         let parent_to = to;
         to = from;
-        while to < parent_to && locations[to+1].path().starts_with(path) {
+        while to < parent_to && locations[to + 1].path().starts_with(path) {
             to += 1;
         }
     }
@@ -209,13 +214,23 @@ fn find_parent<'a>(path: &PathBuf, locations: &'a Locations, pft: &ParentFromTo)
 }
 
 #[async_recursion]
-async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) {
+async fn scan_dir(
+    path: PathBuf,
+    locations: Arc<Locations>,
+    restrict: Arc<PathBuf>,
+    base: Arc<PathBuf>,
+    ignore: Arc<Regexes>,
+    pft: ParentFromTo,
+    dev: u64,
+    tx: mpsc::Sender<DirEntryWithMeta>,
+    s: Arc<Semaphore>,
+) -> Result<()> {
     log::trace!("Scanning: {}", path.display());
 
     // check the restriction
     if !path.starts_with(&*restrict) && !restrict.starts_with(&path) {
         log::trace!("Skipping (restriction): {:?} vs {:?}", path, restrict);
-        return;
+        return Ok(());
     }
 
     let pft = narrow_parent_from_to(pft, &path, &locations);
@@ -223,16 +238,22 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
     // no need to descend if we are in the exclude regime and there are no descendants
     if locations[pft.parent].is_exclude() && pft.from > pft.to {
         log::trace!("Skipping excluded: {:?}", path);
-        return;
+        return Ok(());
     }
 
     // read the directory
     use tokio::fs;
     let mut child_dirs = Vec::new();
 
-    let _sp = s.acquire().await;
-    let mut dir = fs::read_dir(path).await.expect("Couldn't read the directory");
-    while let Some(child) = dir.next_entry().await.expect("Couldn't read the next directory entry") {
+    let _sp = s.acquire().await.wrap_err("scanner semaphore closed")?;
+    let mut dir = fs::read_dir(&path)
+        .await
+        .wrap_err_with(|| format!("unable to read directory {}", path.display()))?;
+    while let Some(child) = dir
+        .next_entry()
+        .await
+        .wrap_err_with(|| format!("unable to read next directory entry in {}", path.display()))?
+    {
         let path = child.path();
 
         if is_match(&ignore, &path) {
@@ -240,10 +261,16 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
             continue;
         }
 
-        let meta = fs::symlink_metadata(&path).await.expect("Couldn't get metadata");
+        let meta = fs::symlink_metadata(&path)
+            .await
+            .wrap_err_with(|| format!("unable to read metadata for {}", path.display()))?;
 
         let file_type = meta.file_type();
-        if file_type.is_block_device() || file_type.is_char_device() || file_type.is_fifo() || file_type.is_socket() {
+        if file_type.is_block_device()
+            || file_type.is_char_device()
+            || file_type.is_fifo()
+            || file_type.is_socket()
+        {
             log::trace!("Skipping (special): {:?}", path);
             continue;
         }
@@ -261,38 +288,72 @@ async fn scan_dir(path: PathBuf, locations: Arc<Locations>, restrict: Arc<PathBu
         // check restriction and crossing the filesystem boundary
         if path.starts_with(&*restrict) && dev == meta.dev() {
             log::trace!("Reporting: {:?}", path);
+            let target = if file_type.is_symlink() {
+                Some(fs::read_link(&path).await.wrap_err_with(|| {
+                    format!("unable to read symlink target for {}", path.display())
+                })?)
+            } else {
+                None
+            };
+
             tx.send(DirEntryWithMeta {
-                    path: relative(&*base, &path).to_path_buf(),
-                    target: fs::read_link(path).await.map_or(None, |p| Some(p)),
-                    size: meta.size(),
-                    mtime: meta.mtime(),
-                    ino: meta.ino(),
-                    mode: meta.mode(),
-                    is_dir: meta.is_dir(),
-                    checksum: 0,
-            }).await.expect("Couldn't send result through the channel")
+                path: relative(&*base, &path).to_path_buf(),
+                target,
+                size: meta.size(),
+                mtime: meta.mtime(),
+                ino: meta.ino(),
+                mode: meta.mode(),
+                is_dir: meta.is_dir(),
+                checksum: 0,
+            })
+            .await
+            .map_err(|_| eyre!("unable to send scan result for {}", path.display()))?
         }
     }
 
-    scan_children(child_dirs, locations, restrict, base, ignore, pft, dev, tx, s.clone()).await;
+    scan_children(
+        child_dirs,
+        locations,
+        restrict,
+        base,
+        ignore,
+        pft,
+        dev,
+        tx,
+        s.clone(),
+    )
+    .await?;
+
+    Ok(())
 }
 
-#[async_recursion]
-async fn scan_children(children: Vec<PathBuf>, locations: Arc<Locations>, restrict: Arc<PathBuf>, base: Arc<PathBuf>, ignore: Arc<Regexes>, pft: ParentFromTo, dev: u64, tx: mpsc::Sender<DirEntryWithMeta>, s: Arc<Semaphore>) {
-    use futures::stream::{self, StreamExt};
-    //stream::iter(children).for_each_concurrent(None,
-    stream::iter(children).for_each(
-        |path| async {
-            let locations = locations.clone();
-            let restrict = restrict.clone();
-            let base = base.clone();
-            let ignore = ignore.clone();
-            let pft = pft.clone();
-            let tx = tx.clone();
-            let s = s.clone();
-            scan_dir(path, locations, restrict, base, ignore, pft, dev, tx, s).await;
-        }
-    ).await;
+async fn scan_children(
+    children: Vec<PathBuf>,
+    locations: Arc<Locations>,
+    restrict: Arc<PathBuf>,
+    base: Arc<PathBuf>,
+    ignore: Arc<Regexes>,
+    pft: ParentFromTo,
+    dev: u64,
+    tx: mpsc::Sender<DirEntryWithMeta>,
+    s: Arc<Semaphore>,
+) -> Result<()> {
+    for path in children {
+        scan_dir(
+            path,
+            locations.clone(),
+            restrict.clone(),
+            base.clone(),
+            ignore.clone(),
+            pft.clone(),
+            dev,
+            tx.clone(),
+            s.clone(),
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 /// Send all [directory entries](DirEntryWithMeta) into the channel, given via its [Sender](mpsc::Sender) `tx`.
@@ -303,7 +364,13 @@ async fn scan_children(children: Vec<PathBuf>, locations: Arc<Locations>, restri
 /// * `path` - restriction under base, which should be scanned
 /// * `locations` - [locations](Locations) to scan
 /// * `tx` - [Sender](mpsc::Sender) of the channel, where to send the [directory entries](DirEntryWithMeta)
-pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &Locations, ignore: &Ignore, tx: mpsc::Sender<DirEntryWithMeta>) -> Result<()> {
+pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(
+    base: P,
+    path: Q,
+    locations: &Locations,
+    ignore: &Ignore,
+    tx: mpsc::Sender<DirEntryWithMeta>,
+) -> Result<()> {
     let base = PathBuf::from(base.as_ref());
     let mut restrict = Arc::new(PathBuf::from(&base));
     (*Arc::get_mut(&mut restrict).unwrap()).push(path);
@@ -311,15 +378,20 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &
 
     log::info!("Going to scan: {}", restrict.display());
 
-    let dev = base.symlink_metadata().ok().unwrap().dev();
-    let mut locations: Arc<Locations> = Arc::new(locations.iter().map(|l| l.prefix(&base)).collect());
+    let dev = base
+        .symlink_metadata()
+        .wrap_err_with(|| format!("unable to read metadata for scan base {}", base.display()))?
+        .dev();
+    let mut locations: Arc<Locations> =
+        Arc::new(locations.iter().map(|l| l.prefix(&base)).collect());
     (*Arc::get_mut(&mut locations).unwrap()).sort();
 
     // build ignore regex
     use fnmatch_regex::glob_to_regex;
     let mut ignore_regex: Regexes = Vec::new();
     for p in ignore {
-        ignore_regex.push(glob_to_regex(p).unwrap());
+        ignore_regex
+            .push(glob_to_regex(p).wrap_err_with(|| format!("invalid ignore pattern {p}"))?);
     }
     let ignore = Arc::new(ignore_regex.clone());
 
@@ -327,7 +399,22 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(base: P, path: Q, locations: &
 
     let path = (*base).clone();
     let to = locations.len() - 1;
-    scan_dir(path, locations, restrict, base, ignore, ParentFromTo { parent: 0, from: 0, to: to }, dev, tx, s).await;
+    scan_dir(
+        path,
+        locations,
+        restrict,
+        base,
+        ignore,
+        ParentFromTo {
+            parent: 0,
+            from: 0,
+            to: to,
+        },
+        dev,
+        tx,
+        s,
+    )
+    .await?;
 
     Ok(())
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use bincode::serde::decode_from_std_read as deserialize_from;
 use bincode::serde::encode_into_std_write as serialize_into;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, WrapErr};
 use tokio::sync::mpsc;
 
 use crate::profile;
@@ -45,7 +45,8 @@ pub async fn scan_entries(
 
     let mut entries = async move {
         let (tx, mut rx) = mpsc::channel(32);
-        tokio::spawn(async move { scan::scan(&base, &path, &locations, &ignore, tx).await });
+        let scanner =
+            tokio::spawn(async move { scan::scan(&base, &path, &locations, &ignore, tx).await });
 
         let pb = indicatif::ProgressBar::new(1);
         pb.set_style(
@@ -60,9 +61,14 @@ pub async fn scan_entries(
         }
         pb.finish_and_clear();
 
-        entries
+        scanner
+            .await
+            .wrap_err("scanner task failed")?
+            .wrap_err("scanner failed")?;
+
+        Ok::<Entries, color_eyre::eyre::Report>(entries)
     }
-    .await;
+    .await?;
     log::debug!("Done scanning");
 
     entries.sort();
