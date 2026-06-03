@@ -190,15 +190,14 @@ pub async fn sync(
                     &actions,
                     &remote_detailed_changes,
                     &mut local_all_old,
-                )
-                .expect("failed to apply local changes");
-                local_all_old
+                )?;
+                Ok::<state::Entries, color_eyre::eyre::Report>(local_all_old)
             })
         };
         let remote_apply_fut = remote.apply_detailed_changes(local_detailed_changes);
         let (local_apply, remote_apply) = tokio::join!(local_apply_fut, remote_apply_fut);
         let _ = remote_apply?;
-        local_apply?
+        local_apply.wrap_err("local apply task failed")??
     };
 
     let local_state_display = local_state.display().to_string();
