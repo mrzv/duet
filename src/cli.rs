@@ -12,6 +12,7 @@ pub struct SyncOptions {
     pub batch: bool,
     pub force: bool,
     pub verbose: bool,
+    pub debug_info: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,6 +75,7 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         batch: pargs.contains(["-b", "--batch"]),
         force: pargs.contains(["-f", "--force"]),
         verbose: pargs.contains(["-v", "--verbose"]),
+        debug_info: pargs.contains("--debug-info"),
     };
 
     if let Some(profile_file) = profile_file {
@@ -162,6 +164,27 @@ mod tests {
                     batch: true,
                     force: true,
                     verbose: true,
+                    debug_info: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_sync_command_with_debug_info() {
+        assert_eq!(
+            parse_args(&["--debug-info", "work"]),
+            Command::Sync {
+                profile: ProfileSource::Named("work".to_string()),
+                path: None,
+                options: SyncOptions {
+                    interactive: false,
+                    yes: false,
+                    dry_run: false,
+                    batch: false,
+                    force: false,
+                    verbose: false,
+                    debug_info: true,
                 },
             }
         );
@@ -181,6 +204,7 @@ mod tests {
                     batch: false,
                     force: false,
                     verbose: false,
+                    debug_info: false,
                 },
             }
         );
