@@ -71,7 +71,8 @@ pub fn load(source: &ProfileSource) -> Result<ProfileConfig, io::Error> {
             local_state.set_extension("snp");
             let mut remote_state_dir = path.clone();
             remote_state_dir.set_extension("remotes");
-            let server_log = remote_state_dir.join("remote.log");
+            let mut server_log = path.clone();
+            server_log.set_extension("remote.log");
 
             Ok(ProfileConfig {
                 display_name,
