@@ -204,20 +204,13 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
                 }
             }
             Key::Tab => {
-                loop {
-                    sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
-                    if actions[sel].is_conflict() {
-                        break;
-                    }
+                if let Some(next) = next_conflict_index(&actions, sel, 1) {
+                    sel = next;
                 }
             }
             Key::BackTab => {
-                loop {
-                    sel =
-                        ((sel as i64 - 1 + actions.len() as i64) % (actions.len() as i64)) as usize;
-                    if actions[sel].is_conflict() {
-                        break;
-                    }
+                if let Some(previous) = next_conflict_index(&actions, sel, -1) {
+                    sel = previous;
                 }
             }
             Key::ArrowLeft | Key::Char('l') => {
@@ -302,6 +295,23 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
     Ok(resolution)
 }
 
+fn next_conflict_index(actions: &[&mut Action], sel: usize, step: isize) -> Option<usize> {
+    if actions.is_empty() {
+        return None;
+    }
+
+    let len = actions.len() as isize;
+    let mut idx = sel as isize;
+    for _ in 0..actions.len() {
+        idx = (idx + step).rem_euclid(len);
+        if actions[idx as usize].is_conflict() {
+            return Some(idx as usize);
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +362,30 @@ mod tests {
             }
             _ => panic!("expected remote resolution"),
         }
+    }
+
+    #[test]
+    fn next_conflict_index_returns_none_without_conflicts() {
+        let mut first = Action::Remote(Change::Added(entry("first.txt", 1)));
+        let mut second = Action::Remote(Change::Added(entry("second.txt", 2)));
+        let actions = vec![&mut first, &mut second];
+
+        assert_eq!(next_conflict_index(&actions, 0, 1), None);
+        assert_eq!(next_conflict_index(&actions, 0, -1), None);
+    }
+
+    #[test]
+    fn next_conflict_index_wraps_between_conflicts() {
+        let mut first = Action::Remote(Change::Added(entry("first.txt", 1)));
+        let mut second = Action::Conflict(
+            Change::Added(entry("second.txt", 2)),
+            Change::Added(entry("second.txt", 3)),
+        );
+        let mut third = Action::Remote(Change::Added(entry("third.txt", 4)));
+        let actions = vec![&mut first, &mut second, &mut third];
+
+        assert_eq!(next_conflict_index(&actions, 0, 1), Some(1));
+        assert_eq!(next_conflict_index(&actions, 2, 1), Some(1));
+        assert_eq!(next_conflict_index(&actions, 0, -1), Some(1));
     }
 }
