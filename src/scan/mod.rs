@@ -50,6 +50,20 @@ pub struct DirEntryWithMeta {
 }
 
 impl DirEntryWithMeta {
+    #[cfg(test)]
+    pub(crate) fn test_file(path: PathBuf, checksum: u32) -> Self {
+        Self {
+            path,
+            size: 0,
+            mtime: 0,
+            ino: 0,
+            mode: 0o100644,
+            target: None,
+            is_dir: false,
+            checksum,
+        }
+    }
+
     fn same(&self, other: &Self) -> bool {
         assert_eq!(self.path, other.path);
         (self.is_symlink() || self.mode == other.mode)

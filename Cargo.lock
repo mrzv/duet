@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "duet"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "adler32",
  "async-recursion",
@@ -669,12 +669,14 @@ dependencies = [
  "path-clean",
  "pico-args",
  "quit",
+ "rand",
  "readwrite",
  "regex",
  "serde",
  "serde_derive",
  "shellexpand",
  "simple-logging",
+ "tempfile",
  "text_io",
  "tokio",
  "unix_mode",

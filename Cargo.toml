@@ -1,6 +1,6 @@
 [package]
 name = "duet"
-version = "0.3.2"
+version = "0.3.3"
 authors = ["Dmitriy Morozov <dmitriy@mrzv.org>"]
 repository = "https://github.com/mrzv/duet/"
 edition = "2018"
@@ -48,3 +48,7 @@ indicatif = "0.17.11"
 
 [build-dependencies]
 built = { version = "0.7.7", features = ["cargo-lock"] }
+
+[dev-dependencies]
+rand = "0.8.6"
+tempfile = "=3.19.1"

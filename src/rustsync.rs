@@ -8,7 +8,6 @@
 // documentation = "https://docs.rs/rustsync"
 // repository = "https://nest.pijul.com/pmeunier/rustsync"
 
-
 //! An implementation of an rsync-like protocol (not compatible with
 //! rsync), in pure Rust.
 //!
@@ -100,14 +99,17 @@ impl std::borrow::Borrow<[u8]> for Blake2b {
 /// content-indexed description of the blocks in the file.
 pub struct Signature {
     pub window: usize,
-    chunks: HashMap<u32, HashMap<Blake2b, usize>>
+    chunks: HashMap<u32, HashMap<Blake2b, usize>>,
 }
 
 /// Create the "signature" of a file, essentially a content-indexed
 /// map of blocks. The first step of the protocol is to run this
 /// function on the "source" (the remote file when downloading, the
 /// local file while uploading).
-pub fn signature<R: Read, B: AsRef<[u8]>+AsMut<[u8]>>(mut r: R, mut block: B) -> Result<Signature, std::io::Error> {
+pub fn signature<R: Read, B: AsRef<[u8]> + AsMut<[u8]>>(
+    mut r: R,
+    mut block: B,
+) -> Result<Signature, std::io::Error> {
     let mut chunks = HashMap::new();
 
     let mut i = 0;
@@ -138,10 +140,9 @@ pub fn signature<R: Read, B: AsRef<[u8]>+AsMut<[u8]>>(mut r: R, mut block: B) ->
 
     Ok(Signature {
         window: block.len(),
-        chunks
+        chunks,
     })
 }
-
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum Block {
@@ -181,7 +182,11 @@ pub struct Delta {
 /// remote file when uploading.
 ///
 /// `block` must be a buffer the same size as `sig.window`.
-pub fn compare<R: Read, B:AsRef<[u8]>+AsMut<[u8]>>(sig: &Signature, mut r: R, mut block: B) -> Result<Delta, std::io::Error> {
+pub fn compare<R: Read, B: AsRef<[u8]> + AsMut<[u8]>>(
+    sig: &Signature,
+    mut r: R,
+    mut block: B,
+) -> Result<Delta, std::io::Error> {
     let mut st = State::new();
     let block = block.as_mut();
     assert_eq!(block.len(), sig.window);
@@ -298,7 +303,7 @@ pub fn restore<W: Write>(mut w: W, s: &[u8], delta: &Delta) -> Result<(), std::i
 /// slice.
 ///
 /// `buf` must be a buffer the same size as `sig.window`.
-pub fn restore_seek<W: Write, R: Read + Seek, B: AsRef<[u8]>+AsMut<[u8]>>(
+pub fn restore_seek<W: Write, R: Read + Seek, B: AsRef<[u8]> + AsMut<[u8]>>(
     mut w: W,
     mut s: R,
     mut buf: B,
@@ -335,17 +340,13 @@ pub fn restore_seek<W: Write, R: Read + Seek, B: AsRef<[u8]>+AsMut<[u8]>>(
 
 #[cfg(test)]
 mod tests {
-    use rand;
     use super::*;
-    use rand::Rng;
+    use rand::distributions::{Alphanumeric, DistString};
     const WINDOW: usize = 32;
     #[test]
     fn basic() {
         for index in 0..10 {
-            let source = rand::thread_rng()
-                .gen_ascii_chars()
-                .take(WINDOW * 10 + 8)
-                .collect::<String>();
+            let source = Alphanumeric.sample_string(&mut rand::thread_rng(), WINDOW * 10 + 8);
             let mut modified = source.clone();
             let index = WINDOW * index + 3;
             unsafe {
