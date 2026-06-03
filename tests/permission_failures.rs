@@ -210,7 +210,6 @@ fn local_added_directory_mode_propagates_to_remote() {
 }
 
 #[test]
-#[ignore = "documents current unsafe handling of unreadable local scan subtrees"]
 fn unreadable_local_subdir_does_not_look_like_deletion() {
     let case = SyncCase::new(&["+dir", "+dir/a.txt"]);
     let local_dir = case.local.join("dir");
@@ -227,7 +226,6 @@ fn unreadable_local_subdir_does_not_look_like_deletion() {
 }
 
 #[test]
-#[ignore = "documents current unsafe handling of unreadable remote scan subtrees"]
 fn unreadable_remote_subdir_does_not_look_like_deletion() {
     let case = SyncCase::new(&["+dir", "+dir/a.txt"]);
     let local_file = case.local.join("dir/a.txt");
@@ -258,7 +256,6 @@ fn unreadable_changed_local_file_fails_before_remote_apply() {
 }
 
 #[test]
-#[ignore = "documents desired path-aware remote read permission errors"]
 fn unreadable_changed_remote_file_reports_remote_permission_error() {
     let case = SyncCase::new(&["+a.txt"]);
     let local_file = case.local.join("a.txt");
@@ -279,7 +276,6 @@ fn unreadable_changed_remote_file_reports_remote_permission_error() {
 }
 
 #[test]
-#[ignore = "documents lack of preflight before partial local apply"]
 fn unwritable_destination_parent_does_not_partially_apply() {
     let case = SyncCase::new(&["+a.txt", "+blocked", "+blocked/b.txt"]);
     let local_blocked = case.local.join("blocked");
@@ -298,7 +294,6 @@ fn unwritable_destination_parent_does_not_partially_apply() {
 }
 
 #[test]
-#[ignore = "documents concurrent apply mutating one side despite the other side failing"]
 fn concurrent_apply_does_not_mutate_remote_when_local_apply_fails() {
     let case = SyncCase::new(&["+upload.txt", "+blocked", "+blocked/download.txt"]);
     let local_blocked = case.local.join("blocked");
@@ -317,7 +312,6 @@ fn concurrent_apply_does_not_mutate_remote_when_local_apply_fails() {
 }
 
 #[test]
-#[ignore = "documents directory modes blocking future child updates"]
 fn readonly_synced_directory_does_not_block_future_child_sync() {
     let case = SyncCase::new(&["+dir", "+dir/a.txt"]);
     let local_dir = case.local.join("dir");
@@ -328,13 +322,13 @@ fn readonly_synced_directory_does_not_block_future_child_sync() {
     assert_success(case.sync());
 
     chmod(&local_dir, 0o755);
-    write(&local_dir.join("a.txt"), "updated");
+    write(&local_dir.join("a.txt"), "updated contents");
     chmod(&local_dir, 0o555);
     assert_eq!(mode(&remote_dir), 0o555);
     let output = case.sync();
 
     assert_success(output);
-    assert_eq!(read(&remote_dir.join("a.txt")), "updated");
+    assert_eq!(read(&remote_dir.join("a.txt")), "updated contents");
     assert_eq!(mode(&remote_dir), 0o555);
 }
 
@@ -355,7 +349,6 @@ fn unreadable_local_state_file_fails_without_remote_mutation() {
 }
 
 #[test]
-#[ignore = "documents generic remote state-file permission errors"]
 fn unreadable_remote_state_file_reports_path_aware_error() {
     let case = SyncCase::new(&["+a.txt"]);
     let local_file = case.local.join("a.txt");
@@ -385,7 +378,6 @@ fn unreadable_remote_state_file_reports_path_aware_error() {
 }
 
 #[test]
-#[ignore = "documents state save failures after filesystem mutation"]
 fn unwritable_profile_directory_save_failure_is_reported_after_mutation() {
     let case = SyncCase::new(&["+a.txt"]);
     let local_file = case.local.join("a.txt");
