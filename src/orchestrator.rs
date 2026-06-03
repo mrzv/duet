@@ -2,7 +2,7 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use bincode::serde::encode_into_std_write as serialize_into;
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use colored::*;
 use essrpc::{RPCError, RPCErrorKind};
 use openssh::{KnownHosts, Session, SessionBuilder};
@@ -201,6 +201,7 @@ pub async fn sync(
         local_apply?
     };
 
+    let local_state_display = local_state.display().to_string();
     let (remote_result, local_result) = tokio::join!(
         remote.save_state(),
         tokio::task::spawn_blocking(move || {
@@ -212,8 +213,10 @@ pub async fn sync(
             })
         })
     );
-    let _ = local_result.expect("Failed to save local state");
-    let _ = remote_result.expect("Failed to save remote state");
+    local_result
+        .wrap_err("local state save task failed")?
+        .wrap_err_with(|| format!("failed to save local state {}", local_state_display))?;
+    remote_result.map_err(|e| eyre!("failed to save remote state: {:?}", e))?;
 
     Ok(())
 }
