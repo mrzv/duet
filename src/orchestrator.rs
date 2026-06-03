@@ -12,7 +12,7 @@ use crate::cli::SyncOptions;
 use crate::profile::{self, ProfileSource};
 use crate::remote;
 use crate::resolution::{self, AllResolution};
-use crate::rpc::DuetServerAsync;
+use crate::rpc::{self, DuetServerAsync};
 use crate::scan;
 use crate::state;
 use crate::sync as sync_ops;
@@ -81,6 +81,8 @@ pub async fn sync(source: ProfileSource, path: Option<PathBuf>, options: SyncOpt
             .await
             .expect("Couldn't set server base");
         if let Some(remote_state_dir) = remote_state_dir {
+            let info = remote.server_info().await.map_err(server_info_error)?;
+            require_remote_capability(&info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
             remote
                 .set_remote_state_dir(remote_state_dir)
                 .await
@@ -247,6 +249,31 @@ fn remote_state_dir_error(error: RPCError) -> color_eyre::eyre::Report {
     }
 }
 
+fn server_info_error(error: RPCError) -> color_eyre::eyre::Report {
+    match error.kind {
+        RPCErrorKind::TransportEOF
+        | RPCErrorKind::SerializationError
+        | RPCErrorKind::UnknownMethod => eyre!(
+            "remote server does not support capability negotiation; upgrade remote duet ({:?})",
+            error
+        ),
+        _ => eyre!("Couldn't get remote server info: {:?}", error),
+    }
+}
+
+fn require_remote_capability(info: &rpc::ServerInfo, capability: &str) -> Result<()> {
+    if info.capabilities.iter().any(|c| c == capability) {
+        return Ok(());
+    }
+
+    Err(eyre!(
+        "remote duet {} protocol {} does not support {}; upgrade remote duet",
+        info.duet_version,
+        info.protocol_version,
+        capability
+    ))
+}
+
 fn profile_name(source: &ProfileSource) -> String {
     match source {
         ProfileSource::Named(name) => name.clone(),
@@ -397,5 +424,32 @@ mod tests {
     fn local_id_is_stable_and_profile_specific() {
         assert_eq!(local_id("work"), local_id("work"));
         assert_ne!(local_id("work"), local_id("personal"));
+    }
+
+    #[test]
+    fn require_remote_capability_accepts_advertised_capability() {
+        let info = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "0.3.2".to_string(),
+            capabilities: vec![rpc::CAPABILITY_PROFILE_FILE_STATE_DIR.to_string()],
+        };
+
+        require_remote_capability(&info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR).unwrap();
+    }
+
+    #[test]
+    fn require_remote_capability_rejects_missing_capability() {
+        let info = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "0.3.2".to_string(),
+            capabilities: Vec::new(),
+        };
+
+        let error = require_remote_capability(&info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("0.3.2"));
+        assert!(error.contains(rpc::CAPABILITY_PROFILE_FILE_STATE_DIR));
     }
 }

@@ -6,6 +6,7 @@ use color_eyre::eyre::Result;
 use essrpc::essrpc;
 use essrpc::transports::{BincodeTransport, ReadWrite};
 use essrpc::{RPCError, RPCErrorKind, RPCServer};
+use serde::{Deserialize, Serialize};
 
 use crate::actions::Actions;
 use crate::profile;
@@ -14,9 +15,24 @@ use crate::state::{Changes, Entries};
 use crate::sync::{self, ChangeDetails, SignatureWithPath};
 
 pub(crate) const SERVER_LOG_ENV: &str = "DUET_SERVER_LOG";
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const CAPABILITY_PROFILE_FILE_STATE_DIR: &str = "profile-file-state-dir";
+
+mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub protocol_version: u32,
+    pub duet_version: String,
+    pub capabilities: Vec<String>,
+}
 
 #[essrpc(sync, async)]
 pub trait DuetServer {
+    // This trait is the wire protocol. To preserve compatibility with older
+    // servers, only append methods; never reorder, remove, or change signatures.
     fn set_base(&mut self, base: String) -> Result<(), RPCError>;
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError>;
     fn changes(
@@ -34,6 +50,7 @@ pub trait DuetServer {
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError>;
     fn save_state(&self) -> Result<(), RPCError>;
     fn set_remote_state_dir(&mut self, remote_state_dir: PathBuf) -> Result<(), RPCError>;
+    fn server_info(&self) -> Result<ServerInfo, RPCError>;
 }
 
 struct DuetServerImpl {
@@ -74,12 +91,6 @@ impl DuetServer for DuetServerImpl {
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError> {
         log::debug!("Setting {} actions", actions.len());
         self.actions = actions;
-        Ok(())
-    }
-
-    fn set_remote_state_dir(&mut self, remote_state_dir: PathBuf) -> Result<(), RPCError> {
-        log::debug!("Set remote state dir {}", remote_state_dir.display());
-        self.remote_state_dir = remote_state_dir;
         Ok(())
     }
 
@@ -186,6 +197,20 @@ impl DuetServer for DuetServerImpl {
             )),
         }
     }
+
+    fn set_remote_state_dir(&mut self, remote_state_dir: PathBuf) -> Result<(), RPCError> {
+        log::debug!("Set remote state dir {}", remote_state_dir.display());
+        self.remote_state_dir = remote_state_dir;
+        Ok(())
+    }
+
+    fn server_info(&self) -> Result<ServerInfo, RPCError> {
+        Ok(ServerInfo {
+            protocol_version: PROTOCOL_VERSION,
+            duet_version: built_info::PKG_VERSION.to_string(),
+            capabilities: vec![CAPABILITY_PROFILE_FILE_STATE_DIR.to_string()],
+        })
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -219,4 +244,21 @@ pub async fn server() -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_info_advertises_protocol_and_capabilities() {
+        let info = DuetServerImpl::new().server_info().unwrap();
+
+        assert_eq!(info.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(info.duet_version, built_info::PKG_VERSION);
+        assert_eq!(
+            info.capabilities,
+            vec![CAPABILITY_PROFILE_FILE_STATE_DIR.to_string()]
+        );
+    }
 }
