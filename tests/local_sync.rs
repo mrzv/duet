@@ -190,7 +190,9 @@ fn debug_info_reports_negotiated_capabilities() {
     assert!(stdout.contains("client protocol:"), "{}", stdout);
     assert!(stdout.contains("server protocol:"), "{}", stdout);
     assert!(
-        stdout.contains("agreed capabilities: profile-file-state-dir, streamed-details-v1"),
+        stdout.contains(
+            "agreed capabilities: profile-file-state-dir, streamed-details-v1, streamed-detail-batches-v1"
+        ),
         "{}",
         stdout
     );
@@ -233,7 +235,9 @@ fn named_profile_debug_info_reports_negotiated_capabilities() {
     assert!(stdout.contains("Debug information:"), "{}", stdout);
     assert!(stdout.contains("server protocol:"), "{}", stdout);
     assert!(
-        stdout.contains("agreed capabilities: profile-file-state-dir, streamed-details-v1"),
+        stdout.contains(
+            "agreed capabilities: profile-file-state-dir, streamed-details-v1, streamed-detail-batches-v1"
+        ),
         "{}",
         stdout
     );

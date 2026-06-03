@@ -22,9 +22,11 @@ pub(crate) const SERVER_LOG_ENV: &str = "DUET_SERVER_LOG";
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
 pub(crate) const CAPABILITY_PROFILE_FILE_STATE_DIR: &str = "profile-file-state-dir";
 pub(crate) const CAPABILITY_STREAMED_DETAILS: &str = "streamed-details-v1";
+pub(crate) const CAPABILITY_STREAMED_DETAIL_BATCHES: &str = "streamed-detail-batches-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
+    CAPABILITY_STREAMED_DETAIL_BATCHES,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -81,6 +83,17 @@ pub trait DuetServer {
         frame: DetailFrame,
     ) -> Result<(), RPCError>;
     fn finish_apply_stream(&mut self, stream_id: ApplyStreamId) -> Result<(), RPCError>;
+    fn next_detail_chunks(
+        &mut self,
+        stream_id: DetailStreamId,
+        max_frames: u32,
+        max_payload_bytes: u32,
+    ) -> Result<Vec<DetailFrame>, RPCError>;
+    fn apply_detail_chunks(
+        &mut self,
+        stream_id: ApplyStreamId,
+        frames: Vec<DetailFrame>,
+    ) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -348,6 +361,51 @@ impl DuetServer for DuetServerImpl {
         })?;
         Ok(())
     }
+
+    fn next_detail_chunks(
+        &mut self,
+        stream_id: DetailStreamId,
+        max_frames: u32,
+        max_payload_bytes: u32,
+    ) -> Result<Vec<DetailFrame>, RPCError> {
+        let producer = self
+            .detail_streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "detail stream does not exist"))?;
+        match producer.next_frames(max_frames as usize, max_payload_bytes as usize) {
+            Ok(frames) => {
+                if frames.is_empty() {
+                    self.detail_streams.remove(&stream_id);
+                }
+                Ok(frames)
+            }
+            Err(e) => Err(RPCError::with_cause(
+                RPCErrorKind::Other,
+                "error reading detail stream",
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            )),
+        }
+    }
+
+    fn apply_detail_chunks(
+        &mut self,
+        stream_id: ApplyStreamId,
+        frames: Vec<DetailFrame>,
+    ) -> Result<(), RPCError> {
+        let applier = self
+            .apply_streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
+        for frame in frames {
+            applier.apply_frame(frame).map_err(|e| {
+                RPCError::new(
+                    RPCErrorKind::Other,
+                    format!("error applying detail stream: {}", e),
+                )
+            })?;
+        }
+        Ok(())
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -397,7 +455,8 @@ mod tests {
             info.capabilities,
             vec![
                 CAPABILITY_PROFILE_FILE_STATE_DIR.to_string(),
-                CAPABILITY_STREAMED_DETAILS.to_string()
+                CAPABILITY_STREAMED_DETAILS.to_string(),
+                CAPABILITY_STREAMED_DETAIL_BATCHES.to_string()
             ]
         );
     }

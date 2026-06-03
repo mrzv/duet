@@ -25,6 +25,8 @@ const SSH_ERROR_CODE: u8 = 3;
 const SERVER_ERROR_CODE: u8 = 4;
 const CTRLC_CODE: u8 = 6;
 const DETAIL_CHUNK_BYTES: usize = 1024 * 1024;
+const DETAIL_BATCH_FRAMES: usize = 256;
+const DETAIL_BATCH_PAYLOAD_BYTES: usize = DETAIL_CHUNK_BYTES;
 
 struct SyncContext {
     profile: profile::Profile,
@@ -125,9 +127,10 @@ pub async fn sync(
             .collect(),
     );
     let remote_actions: Actions = reverse(&actions);
-    let can_stream_details = has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAILS)
-        && sync_ops::can_stream_details(&actions)
-        && sync_ops::can_stream_details(&remote_actions);
+    let can_stream_details =
+        has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAIL_BATCHES)
+            && sync_ops::can_stream_details(&actions)
+            && sync_ops::can_stream_details(&remote_actions);
     remote
         .set_actions(remote_actions)
         .await
@@ -307,25 +310,33 @@ where
     let mut remote_done = false;
     while !local_done || !remote_done {
         if !remote_done {
-            match remote
-                .next_detail_chunk(remote_detail_stream)
+            let frames = remote
+                .next_detail_chunks(
+                    remote_detail_stream,
+                    DETAIL_BATCH_FRAMES as u32,
+                    DETAIL_BATCH_PAYLOAD_BYTES as u32,
+                )
                 .await
-                .map_err(|e| eyre!("Couldn't read remote detail stream: {:?}", e))?
-            {
-                Some(frame) => local_applier.apply_frame(frame)?,
-                None => remote_done = true,
+                .map_err(|e| eyre!("Couldn't read remote detail stream: {:?}", e))?;
+            if frames.is_empty() {
+                remote_done = true;
+            } else {
+                for frame in frames {
+                    local_applier.apply_frame(frame)?;
+                }
             }
         }
 
         if !local_done {
-            match local_producer.next_frame()? {
-                Some(frame) => {
-                    remote
-                        .apply_detail_chunk(remote_apply_stream, frame)
-                        .await
-                        .map_err(|e| eyre!("Couldn't apply remote detail stream: {:?}", e))?;
-                }
-                None => local_done = true,
+            let frames =
+                local_producer.next_frames(DETAIL_BATCH_FRAMES, DETAIL_BATCH_PAYLOAD_BYTES)?;
+            if frames.is_empty() {
+                local_done = true;
+            } else {
+                remote
+                    .apply_detail_chunks(remote_apply_stream, frames)
+                    .await
+                    .map_err(|e| eyre!("Couldn't apply remote detail stream: {:?}", e))?;
             }
         }
     }

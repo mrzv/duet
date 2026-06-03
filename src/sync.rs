@@ -262,6 +262,45 @@ impl DetailProducer {
 
         Ok(None)
     }
+
+    pub fn next_frames(
+        &mut self,
+        max_frames: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<DetailFrame>> {
+        let max_frames = max_frames.max(1);
+        let max_payload_bytes = max_payload_bytes.max(1);
+        let mut frames = Vec::new();
+        let mut payload_bytes = 0;
+
+        while frames.len() < max_frames {
+            let Some(frame) = self.next_frame()? else {
+                break;
+            };
+
+            let frame_payload_bytes = detail_payload_bytes(&frame.payload);
+            if !frames.is_empty() && payload_bytes + frame_payload_bytes > max_payload_bytes {
+                self.pending.push_front(frame);
+                break;
+            }
+
+            payload_bytes += frame_payload_bytes;
+            frames.push(frame);
+        }
+
+        Ok(frames)
+    }
+}
+
+fn detail_payload_bytes(payload: &DetailPayload) -> usize {
+    match payload {
+        DetailPayload::FileBytes(bytes) | DetailPayload::DiffBytes(bytes) => bytes.len(),
+        DetailPayload::FileBegin
+        | DetailPayload::FileEnd
+        | DetailPayload::DiffBegin
+        | DetailPayload::DiffCopy { .. }
+        | DetailPayload::DiffEnd => 0,
+    }
 }
 
 enum SourceDetailKind<'a> {
@@ -299,14 +338,9 @@ fn stream_diff_frames(
 ) -> Result<()> {
     let file = fs::File::open(file_path)?;
     let block = vec![0; signature.window];
-    compare_stream(&signature, file, block, max_chunk_bytes, |op| {
-        let payload = match op {
-            DeltaOp::FromSource(offset) => DetailPayload::DiffCopy {
-                offset,
-                len: signature.window as u64,
-            },
-            DeltaOp::Literal(bytes) => DetailPayload::DiffBytes(bytes),
-        };
+    let mut pending_copy: Option<(u64, u64)> = None;
+
+    let send_frame = |payload| {
         sender
             .send(Ok(DetailFrame {
                 action_index,
@@ -315,11 +349,37 @@ fn stream_diff_frames(
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "detail stream closed")
             })
+    };
+
+    let flush_copy = |pending_copy: &mut Option<(u64, u64)>| {
+        if let Some((offset, len)) = pending_copy.take() {
+            send_frame(DetailPayload::DiffCopy { offset, len })?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    compare_stream(&signature, file, block, max_chunk_bytes, |op| {
+        match op {
+            DeltaOp::FromSource(offset) => {
+                let copy_len = signature.window as u64;
+                match &mut pending_copy {
+                    Some((start, len)) if *start + *len == offset => *len += copy_len,
+                    Some(_) => {
+                        flush_copy(&mut pending_copy)?;
+                        pending_copy = Some((offset, copy_len));
+                    }
+                    None => pending_copy = Some((offset, copy_len)),
+                }
+            }
+            DeltaOp::Literal(bytes) => {
+                flush_copy(&mut pending_copy)?;
+                send_frame(DetailPayload::DiffBytes(bytes))?;
+            }
+        }
+        Ok(())
     })?;
-    sender.send(Ok(DetailFrame {
-        action_index,
-        payload: DetailPayload::DiffEnd,
-    }))?;
+    flush_copy(&mut pending_copy)?;
+    send_frame(DetailPayload::DiffEnd)?;
     Ok(())
 }
 
@@ -1037,4 +1097,38 @@ fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
     let mut new_entry = e.clone();
     new_entry.set_ino(meta.ino());
     Ok(new_entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{RngCore, SeedableRng};
+
+    #[test]
+    fn stream_diff_frames_coalesces_adjacent_copy_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let mut contents = vec![0; WINDOW * 8];
+        rand::rngs::StdRng::seed_from_u64(1).fill_bytes(&mut contents);
+        fs::write(&path, &contents).unwrap();
+
+        let sig = signature(fs::File::open(&path).unwrap(), [0; WINDOW]).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(16);
+
+        stream_diff_frames(path, 0, sig, 1024 * 1024, sender).unwrap();
+
+        let frames = receiver
+            .into_iter()
+            .map(|frame| frame.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].action_index, 0);
+        assert!(matches!(
+            frames[0].payload,
+            DetailPayload::DiffCopy { offset: 0, len }
+                if len >= contents.len() as u64 && len <= (contents.len() + WINDOW) as u64
+        ));
+        assert!(matches!(frames[1].payload, DetailPayload::DiffEnd));
+    }
 }
