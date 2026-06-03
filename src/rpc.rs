@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, BufWriter};
 use std::path::PathBuf;
 
@@ -12,11 +13,15 @@ use crate::actions::Actions;
 use crate::profile;
 use crate::scan::location::Locations;
 use crate::state::{Changes, Entries};
-use crate::sync::{self, ChangeDetails, SignatureWithPath};
+use crate::sync::{
+    self, ApplyStreamId, ChangeDetails, DetailFrame, DetailProducer, DetailStreamId,
+    SignatureWithPath,
+};
 
 pub(crate) const SERVER_LOG_ENV: &str = "DUET_SERVER_LOG";
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
 pub(crate) const CAPABILITY_PROFILE_FILE_STATE_DIR: &str = "profile-file-state-dir";
+pub(crate) const CAPABILITY_STREAMED_DETAILS: &str = "streamed-details-v1";
 
 mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
@@ -51,6 +56,23 @@ pub trait DuetServer {
     fn save_state(&self) -> Result<(), RPCError>;
     fn set_remote_state_dir(&mut self, remote_state_dir: PathBuf) -> Result<(), RPCError>;
     fn server_info(&self) -> Result<ServerInfo, RPCError>;
+    fn begin_detail_stream(
+        &mut self,
+        signatures: Vec<SignatureWithPath>,
+        max_chunk_bytes: u32,
+    ) -> Result<DetailStreamId, RPCError>;
+    fn next_detail_chunk(
+        &mut self,
+        stream_id: DetailStreamId,
+    ) -> Result<Option<DetailFrame>, RPCError>;
+    fn end_detail_stream(&mut self, stream_id: DetailStreamId) -> Result<(), RPCError>;
+    fn begin_apply_stream(&mut self) -> Result<ApplyStreamId, RPCError>;
+    fn apply_detail_chunk(
+        &mut self,
+        stream_id: ApplyStreamId,
+        frame: DetailFrame,
+    ) -> Result<(), RPCError>;
+    fn finish_apply_stream(&mut self, stream_id: ApplyStreamId) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -59,6 +81,9 @@ struct DuetServerImpl {
     remote_state_dir: PathBuf,
     all_old: Entries,
     actions: Actions,
+    detail_streams: HashMap<DetailStreamId, DetailProducer>,
+    apply_streams: HashMap<ApplyStreamId, sync::DetailApplier>,
+    next_stream_id: u64,
 }
 
 impl DuetServerImpl {
@@ -69,7 +94,22 @@ impl DuetServerImpl {
             remote_state_dir: profile::remote_state_dir(),
             all_old: Vec::new(),
             actions: Vec::new(),
+            detail_streams: HashMap::new(),
+            apply_streams: HashMap::new(),
+            next_stream_id: 1,
         }
+    }
+
+    fn next_detail_stream_id(&mut self) -> DetailStreamId {
+        let id = DetailStreamId(self.next_stream_id);
+        self.next_stream_id += 1;
+        id
+    }
+
+    fn next_apply_stream_id(&mut self) -> ApplyStreamId {
+        let id = ApplyStreamId(self.next_stream_id);
+        self.next_stream_id += 1;
+        id
     }
 }
 
@@ -208,8 +248,97 @@ impl DuetServer for DuetServerImpl {
         Ok(ServerInfo {
             protocol_version: PROTOCOL_VERSION,
             duet_version: built_info::PKG_VERSION.to_string(),
-            capabilities: vec![CAPABILITY_PROFILE_FILE_STATE_DIR.to_string()],
+            capabilities: vec![
+                CAPABILITY_PROFILE_FILE_STATE_DIR.to_string(),
+                CAPABILITY_STREAMED_DETAILS.to_string(),
+            ],
         })
+    }
+
+    fn begin_detail_stream(
+        &mut self,
+        signatures: Vec<SignatureWithPath>,
+        max_chunk_bytes: u32,
+    ) -> Result<DetailStreamId, RPCError> {
+        let id = self.next_detail_stream_id();
+        let producer = sync::DetailProducer::new(
+            self.base.clone(),
+            self.actions.clone(),
+            signatures,
+            max_chunk_bytes as usize,
+        );
+        self.detail_streams.insert(id, producer);
+        Ok(id)
+    }
+
+    fn next_detail_chunk(
+        &mut self,
+        stream_id: DetailStreamId,
+    ) -> Result<Option<DetailFrame>, RPCError> {
+        let producer = self
+            .detail_streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "detail stream does not exist"))?;
+        match producer.next_frame() {
+            Ok(frame) => {
+                if frame.is_none() {
+                    self.detail_streams.remove(&stream_id);
+                }
+                Ok(frame)
+            }
+            Err(e) => Err(RPCError::with_cause(
+                RPCErrorKind::Other,
+                "error reading detail stream",
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            )),
+        }
+    }
+
+    fn end_detail_stream(&mut self, stream_id: DetailStreamId) -> Result<(), RPCError> {
+        self.detail_streams.remove(&stream_id);
+        Ok(())
+    }
+
+    fn begin_apply_stream(&mut self) -> Result<ApplyStreamId, RPCError> {
+        let id = self.next_apply_stream_id();
+        let applier = sync::DetailApplier::new(
+            self.base.clone(),
+            self.actions.clone(),
+            self.all_old.clone(),
+        );
+        self.apply_streams.insert(id, applier);
+        Ok(id)
+    }
+
+    fn apply_detail_chunk(
+        &mut self,
+        stream_id: ApplyStreamId,
+        frame: DetailFrame,
+    ) -> Result<(), RPCError> {
+        let applier = self
+            .apply_streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
+        applier.apply_frame(frame).map_err(|e| {
+            RPCError::new(
+                RPCErrorKind::Other,
+                format!("error applying detail stream: {}", e),
+            )
+        })
+    }
+
+    fn finish_apply_stream(&mut self, stream_id: ApplyStreamId) -> Result<(), RPCError> {
+        let applier = self
+            .apply_streams
+            .remove(&stream_id)
+            .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
+        self.all_old = applier.finish().map_err(|e| {
+            RPCError::new(
+                RPCErrorKind::Other,
+                format!("error finishing apply stream: {}", e),
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -258,7 +387,10 @@ mod tests {
         assert_eq!(info.duet_version, built_info::PKG_VERSION);
         assert_eq!(
             info.capabilities,
-            vec![CAPABILITY_PROFILE_FILE_STATE_DIR.to_string()]
+            vec![
+                CAPABILITY_PROFILE_FILE_STATE_DIR.to_string(),
+                CAPABILITY_STREAMED_DETAILS.to_string()
+            ]
         );
     }
 }

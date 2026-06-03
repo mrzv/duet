@@ -24,6 +24,7 @@ const PROFILE_ERROR_CODE: u8 = 2;
 const SSH_ERROR_CODE: u8 = 3;
 const SERVER_ERROR_CODE: u8 = 4;
 const CTRLC_CODE: u8 = 6;
+const DETAIL_CHUNK_BYTES: usize = 1024 * 1024;
 
 struct SyncContext {
     profile: profile::Profile,
@@ -38,7 +39,11 @@ struct SyncContext {
     server_log: PathBuf,
 }
 
-pub async fn sync(source: ProfileSource, path: Option<PathBuf>, options: SyncOptions) -> Result<()> {
+pub async fn sync(
+    source: ProfileSource,
+    path: Option<PathBuf>,
+    options: SyncOptions,
+) -> Result<()> {
     env_logger::init();
     install_ctrlc_handler();
 
@@ -76,6 +81,7 @@ pub async fn sync(source: ProfileSource, path: Option<PathBuf>, options: SyncOpt
     let remote_locations = prf.locations.clone();
     let remote_ignore = prf.ignore.clone();
     let remote_fut = async {
+        let mut remote_info = None;
         remote
             .set_base(remote_base)
             .await
@@ -87,16 +93,18 @@ pub async fn sync(source: ProfileSource, path: Option<PathBuf>, options: SyncOpt
                 .set_remote_state_dir(remote_state_dir)
                 .await
                 .map_err(remote_state_dir_error)?;
+            remote_info = Some(info);
         }
-        remote
+        let changes = remote
             .changes(remote_path, remote_locations, remote_ignore, local_id)
             .await
-            .map_err(|e| eyre!("Couldn't get remote changes: {:?}", e))
+            .map_err(|e| eyre!("Couldn't get remote changes: {:?}", e))?;
+        Ok::<_, color_eyre::eyre::Report>((changes, remote_info))
     };
 
     let (local_result, remote_result) = tokio::join!(local_fut, remote_fut);
     let (mut local_all_old, local_changes) = local_result.expect("Couldn't get local changes");
-    let remote_changes = remote_result?;
+    let (remote_changes, remote_info) = remote_result?;
 
     let mut actions = build_actions(&local_changes, &remote_changes);
     let resolution = resolve_actions(&mut actions, options)?;
@@ -116,6 +124,11 @@ pub async fn sync(source: ProfileSource, path: Option<PathBuf>, options: SyncOpt
             .collect(),
     );
     let remote_actions: Actions = reverse(&actions);
+    let can_stream_details = remote_info
+        .as_ref()
+        .is_some_and(|info| has_remote_capability(info, rpc::CAPABILITY_STREAMED_DETAILS))
+        && sync_ops::can_stream_details(&actions)
+        && sync_ops::can_stream_details(&remote_actions);
     remote
         .set_actions(remote_actions)
         .await
@@ -138,40 +151,53 @@ pub async fn sync(source: ProfileSource, path: Option<PathBuf>, options: SyncOpt
         remote_signatures.len()
     );
 
-    let local_detailed_changes_fut = {
-        let local_base = local_base.clone();
-        let actions = actions.clone();
-        tokio::task::spawn_blocking(move || {
-            sync_ops::get_detailed_changes(&local_base, &actions, &remote_signatures)
-        })
-    };
-    let remote_detailed_changes_fut = remote.get_detailed_changes(local_signatures);
-    let (local_detailed_changes, remote_detailed_changes) =
-        tokio::join!(local_detailed_changes_fut, remote_detailed_changes_fut);
-    let local_detailed_changes =
-        local_detailed_changes?.expect("couldn't get local detailed changes");
-    let remote_detailed_changes =
-        remote_detailed_changes.expect("couldn't get remote detailed changes");
-    log::debug!("got detailed changes");
+    let local_all_old = if can_stream_details {
+        log::debug!("streaming detailed changes");
+        stream_detailed_changes(
+            &remote,
+            &local_base,
+            &actions,
+            local_all_old,
+            local_signatures,
+            remote_signatures,
+        )
+        .await?
+    } else {
+        let local_detailed_changes_fut = {
+            let local_base = local_base.clone();
+            let actions = actions.clone();
+            tokio::task::spawn_blocking(move || {
+                sync_ops::get_detailed_changes(&local_base, &actions, &remote_signatures)
+            })
+        };
+        let remote_detailed_changes_fut = remote.get_detailed_changes(local_signatures);
+        let (local_detailed_changes, remote_detailed_changes) =
+            tokio::join!(local_detailed_changes_fut, remote_detailed_changes_fut);
+        let local_detailed_changes =
+            local_detailed_changes?.expect("couldn't get local detailed changes");
+        let remote_detailed_changes =
+            remote_detailed_changes.expect("couldn't get remote detailed changes");
+        log::debug!("got detailed changes");
 
-    let local_apply_fut = {
-        let local_base = local_base.clone();
-        let actions = actions.clone();
-        tokio::task::spawn_blocking(move || {
-            sync_ops::apply_detailed_changes(
-                &local_base,
-                &actions,
-                &remote_detailed_changes,
-                &mut local_all_old,
-            )
-            .expect("failed to apply local changes");
-            local_all_old
-        })
+        let local_apply_fut = {
+            let local_base = local_base.clone();
+            let actions = actions.clone();
+            tokio::task::spawn_blocking(move || {
+                sync_ops::apply_detailed_changes(
+                    &local_base,
+                    &actions,
+                    &remote_detailed_changes,
+                    &mut local_all_old,
+                )
+                .expect("failed to apply local changes");
+                local_all_old
+            })
+        };
+        let remote_apply_fut = remote.apply_detailed_changes(local_detailed_changes);
+        let (local_apply, remote_apply) = tokio::join!(local_apply_fut, remote_apply_fut);
+        let _ = remote_apply?;
+        local_apply?
     };
-    let remote_apply_fut = remote.apply_detailed_changes(local_detailed_changes);
-    let (local_apply, remote_apply) = tokio::join!(local_apply_fut, remote_apply_fut);
-    let local_all_old = local_apply?;
-    let _ = remote_apply?;
 
     let (remote_result, local_result) = tokio::join!(
         remote.save_state(),
@@ -249,6 +275,74 @@ fn remote_state_dir_error(error: RPCError) -> color_eyre::eyre::Report {
     }
 }
 
+async fn stream_detailed_changes<R>(
+    remote: &R,
+    local_base: &PathBuf,
+    actions: &Actions,
+    local_all_old: state::Entries,
+    local_signatures: Vec<sync_ops::SignatureWithPath>,
+    remote_signatures: Vec<sync_ops::SignatureWithPath>,
+) -> Result<state::Entries>
+where
+    R: DuetServerAsync,
+{
+    let mut local_producer = sync_ops::DetailProducer::new(
+        local_base.clone(),
+        actions.clone(),
+        remote_signatures,
+        DETAIL_CHUNK_BYTES,
+    );
+    let mut local_applier =
+        sync_ops::DetailApplier::new(local_base.clone(), actions.clone(), local_all_old);
+
+    let remote_detail_stream = remote
+        .begin_detail_stream(local_signatures, DETAIL_CHUNK_BYTES as u32)
+        .await
+        .map_err(|e| eyre!("Couldn't begin remote detail stream: {:?}", e))?;
+    let remote_apply_stream = remote
+        .begin_apply_stream()
+        .await
+        .map_err(|e| eyre!("Couldn't begin remote apply stream: {:?}", e))?;
+
+    let mut local_done = false;
+    let mut remote_done = false;
+    while !local_done || !remote_done {
+        if !remote_done {
+            match remote
+                .next_detail_chunk(remote_detail_stream)
+                .await
+                .map_err(|e| eyre!("Couldn't read remote detail stream: {:?}", e))?
+            {
+                Some(frame) => local_applier.apply_frame(frame)?,
+                None => remote_done = true,
+            }
+        }
+
+        if !local_done {
+            match local_producer.next_frame()? {
+                Some(frame) => {
+                    remote
+                        .apply_detail_chunk(remote_apply_stream, frame)
+                        .await
+                        .map_err(|e| eyre!("Couldn't apply remote detail stream: {:?}", e))?;
+                }
+                None => local_done = true,
+            }
+        }
+    }
+
+    let local_all_old = local_applier.finish()?;
+    remote
+        .finish_apply_stream(remote_apply_stream)
+        .await
+        .map_err(|e| eyre!("Couldn't finish remote apply stream: {:?}", e))?;
+    Ok(local_all_old)
+}
+
+fn has_remote_capability(info: &rpc::ServerInfo, capability: &str) -> bool {
+    info.capabilities.iter().any(|c| c == capability)
+}
+
 fn server_info_error(error: RPCError) -> color_eyre::eyre::Report {
     match error.kind {
         RPCErrorKind::TransportEOF
@@ -262,7 +356,7 @@ fn server_info_error(error: RPCError) -> color_eyre::eyre::Report {
 }
 
 fn require_remote_capability(info: &rpc::ServerInfo, capability: &str) -> Result<()> {
-    if info.capabilities.iter().any(|c| c == capability) {
+    if has_remote_capability(info, capability) {
         return Ok(());
     }
 

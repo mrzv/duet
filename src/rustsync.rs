@@ -85,7 +85,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 const BLAKE2_SIZE: usize = 32;
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Blake2b([u8; BLAKE2_SIZE]);
 
 impl std::borrow::Borrow<[u8]> for Blake2b {
@@ -94,7 +94,7 @@ impl std::borrow::Borrow<[u8]> for Blake2b {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 /// The "signature" of the file, which is essentially a
 /// content-indexed description of the blocks in the file.
 pub struct Signature {
@@ -144,14 +144,13 @@ pub fn signature<R: Read, B: AsRef<[u8]> + AsMut<[u8]>>(
     })
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Block {
     FromSource(u64),
     Literal(Vec<u8>),
 }
 
 struct State {
-    result: Vec<Block>,
     block_oldest: usize,
     block_len: usize,
     pending: Vec<u8>,
@@ -160,7 +159,6 @@ struct State {
 impl State {
     fn new() -> Self {
         State {
-            result: Vec::new(),
             block_oldest: 0,
             block_len: 1,
             pending: Vec::new(),
@@ -177,6 +175,12 @@ pub struct Delta {
     pub window: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeltaOp {
+    FromSource(u64),
+    Literal(Vec<u8>),
+}
+
 /// Compare a signature with an existing file. This is the second step
 /// of the protocol, `r` is the local file when downloading, and the
 /// remote file when uploading.
@@ -187,9 +191,38 @@ pub fn compare<R: Read, B: AsRef<[u8]> + AsMut<[u8]>>(
     mut r: R,
     mut block: B,
 ) -> Result<Delta, std::io::Error> {
+    let mut blocks = Vec::new();
+    compare_stream(sig, &mut r, &mut block, usize::MAX, |op| {
+        match op {
+            DeltaOp::FromSource(offset) => blocks.push(Block::FromSource(offset)),
+            DeltaOp::Literal(bytes) => blocks.push(Block::Literal(bytes)),
+        }
+        Ok(())
+    })?;
+
+    Ok(Delta {
+        blocks,
+        window: sig.window,
+    })
+}
+
+pub fn compare_stream<R, B, F>(
+    sig: &Signature,
+    mut r: R,
+    mut block: B,
+    max_literal_bytes: usize,
+    mut emit: F,
+) -> Result<(), std::io::Error>
+where
+    R: Read,
+    B: AsRef<[u8]> + AsMut<[u8]>,
+    F: FnMut(DeltaOp) -> Result<(), std::io::Error>,
+{
     let mut st = State::new();
     let block = block.as_mut();
     assert_eq!(block.len(), sig.window);
+    let max_literal_bytes = max_literal_bytes.max(1);
+
     while st.block_len > 0 {
         let mut hash = {
             let mut j = 0;
@@ -211,7 +244,14 @@ pub fn compare<R: Read, B: AsRef<[u8]> + AsMut<[u8]>>(
         // Starting from the current block (with hash `hash`), find
         // the next block with a hash that appears in the signature.
         loop {
-            if matches(&mut st, sig, &block, &hash) {
+            if let Some(index) = matching_index(&st, sig, &block, &hash) {
+                if !st.pending.is_empty() {
+                    emit(DeltaOp::Literal(std::mem::replace(
+                        &mut st.pending,
+                        Vec::new(),
+                    )))?;
+                }
+                emit(DeltaOp::FromSource(index as u64))?;
                 break;
             }
             // The blocks are not equal. Move the hash by one byte
@@ -232,24 +272,33 @@ pub fn compare<R: Read, B: AsRef<[u8]> + AsMut<[u8]>>(
                 break;
             }
             st.pending.push(oldest);
+            if st.pending.len() >= max_literal_bytes {
+                emit(DeltaOp::Literal(std::mem::replace(
+                    &mut st.pending,
+                    Vec::new(),
+                )))?;
+            }
             st.block_oldest = (st.block_oldest + 1) % sig.window;
         }
         if !st.pending.is_empty() {
             // We've reached the end of the file, and have never found
             // a matching block again.
-            st.result.push(Block::Literal(std::mem::replace(
+            emit(DeltaOp::Literal(std::mem::replace(
                 &mut st.pending,
                 Vec::new(),
-            )))
+            )))?;
         }
     }
-    Ok(Delta {
-        blocks: st.result,
-        window: sig.window,
-    })
+
+    Ok(())
 }
 
-fn matches(st: &mut State, sig: &Signature, block: &[u8], hash: &adler32::RollingAdler32) -> bool {
+fn matching_index(
+    st: &State,
+    sig: &Signature,
+    block: &[u8],
+    hash: &adler32::RollingAdler32,
+) -> Option<usize> {
     if let Some(h) = sig.chunks.get(&hash.hash()) {
         let blake2 = {
             let mut b = blake2_rfc::blake2b::Blake2b::new(BLAKE2_SIZE);
@@ -263,19 +312,10 @@ fn matches(st: &mut State, sig: &Signature, block: &[u8], hash: &adler32::Rollin
         };
 
         if let Some(&index) = h.get(blake2.as_bytes()) {
-            // Matching hash found! If we have non-matching
-            // material before the match, add it.
-            if !st.pending.is_empty() {
-                st.result.push(Block::Literal(std::mem::replace(
-                    &mut st.pending,
-                    Vec::new(),
-                )));
-            }
-            st.result.push(Block::FromSource(index as u64));
-            return true;
+            return Some(index);
         }
     }
-    false
+    None
 }
 
 /// Restore a file, using a "delta" (resulting from

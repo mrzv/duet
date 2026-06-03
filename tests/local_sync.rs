@@ -67,8 +67,16 @@ fn write(path: &Path, contents: &str) {
     fs::write(path, contents).unwrap();
 }
 
+fn write_bytes(path: &Path, contents: &[u8]) {
+    fs::write(path, contents).unwrap();
+}
+
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
+}
+
+fn patterned_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
 }
 
 #[test]
@@ -159,4 +167,51 @@ fn batch_conflict_aborts_without_changing_files() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(read(&local_file), "local changed");
     assert_eq!(read(&remote_file), "remote changed");
+}
+
+#[test]
+fn large_local_added_file_streams_to_remote() {
+    let case = SyncCase::new();
+    let contents = patterned_bytes(3 * 1024 * 1024 + 17);
+    write_bytes(&case.local.join("a.txt"), &contents);
+
+    assert_success(case.sync());
+
+    assert_eq!(fs::read(case.remote.join("a.txt")).unwrap(), contents);
+}
+
+#[test]
+fn large_remote_modified_file_streams_to_local() {
+    let case = SyncCase::new();
+    let initial = patterned_bytes(3 * 1024 * 1024 + 17);
+    write_bytes(&case.local.join("a.txt"), &initial);
+    assert_success(case.sync());
+
+    let mut updated = initial;
+    for byte in &mut updated[1024 * 1024..1024 * 1024 + 64 * 1024] {
+        *byte = byte.wrapping_add(17);
+    }
+    write_bytes(&case.remote.join("a.txt"), &updated);
+
+    assert_success(case.sync());
+
+    assert_eq!(fs::read(case.local.join("a.txt")).unwrap(), updated);
+}
+
+#[test]
+fn large_local_modified_file_streams_to_remote() {
+    let case = SyncCase::new();
+    let initial = patterned_bytes(3 * 1024 * 1024 + 17);
+    write_bytes(&case.local.join("a.txt"), &initial);
+    assert_success(case.sync());
+
+    let mut updated = initial;
+    for byte in &mut updated[1024 * 1024..1024 * 1024 + 64 * 1024] {
+        *byte = byte.wrapping_add(17);
+    }
+    write_bytes(&case.local.join("a.txt"), &updated);
+
+    assert_success(case.sync());
+
+    assert_eq!(fs::read(case.remote.join("a.txt")).unwrap(), updated);
 }
