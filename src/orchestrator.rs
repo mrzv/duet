@@ -126,6 +126,7 @@ pub async fn sync(
             .filter(|a| !a.is_unresolved_conflict())
             .collect(),
     );
+    sync_ops::preflight_apply(&local_base, actions.as_ref())?;
     let remote_actions: Actions = reverse(&actions);
     let can_stream_details =
         has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAIL_BATCHES)

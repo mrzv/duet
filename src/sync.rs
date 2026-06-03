@@ -124,6 +124,76 @@ pub fn can_stream_details(actions: &[Action]) -> bool {
     })
 }
 
+pub fn preflight_apply(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
+    let readonly_metadata_changes = readonly_directory_metadata_changes(actions);
+    for target in apply_write_targets(actions) {
+        let Some(parent) = target.parent() else {
+            continue;
+        };
+        let parent_path = base.join(parent);
+        let Ok(meta) = fs::symlink_metadata(&parent_path) else {
+            continue;
+        };
+        if !meta.is_dir() || owner_writable(meta.permissions().mode()) {
+            continue;
+        }
+        if readonly_metadata_changes.iter().any(|path| path == parent) {
+            return Err(eyre!(
+                "destination parent {} is not writable",
+                parent_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn owner_writable(mode: u32) -> bool {
+    mode & 0o200 != 0
+}
+
+fn readonly_directory_metadata_changes(actions: &Vec<Action>) -> Vec<PathBuf> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Remote(Change::Modified(old, new))
+            | Action::ResolvedRemote((_, _), Change::Modified(old, new))
+                if old.is_dir()
+                    && new.is_dir()
+                    && owner_writable(old.mode())
+                    && !owner_writable(new.mode()) =>
+            {
+                Some(new.path().clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn apply_write_targets(actions: &Vec<Action>) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    for action in actions {
+        match action {
+            Action::Local(change) | Action::ResolvedLocal((_, _), change) => match change {
+                Change::Removed(e) | Change::Added(e) => targets.push(e.path().clone()),
+                Change::Modified(old, new) if old.is_file() && new.is_file() => {
+                    if !old.same_contents(new) {
+                        targets.push(new.path().clone());
+                    }
+                }
+                Change::Modified(old, new) if old.is_dir() && new.is_dir() => {}
+                Change::Modified(old, new) if old.is_symlink() && new.is_symlink() => {
+                    if old.target() != new.target() {
+                        targets.push(new.path().clone());
+                    }
+                }
+                Change::Modified(_, new) => targets.push(new.path().clone()),
+            },
+            _ => {}
+        }
+    }
+    targets
+}
+
 pub fn get_detailed_changes(
     base: &PathBuf,
     actions: &Vec<Action>,
@@ -433,6 +503,7 @@ struct TempOutput {
     final_path: PathBuf,
     temp_path: PathBuf,
     file: Option<fs::File>,
+    _parent_guard: Option<WritableDirGuard>,
 }
 
 impl TempOutput {
@@ -448,11 +519,17 @@ impl TempOutput {
             std::process::id(),
             thread::current().id()
         ));
-        let file = fs::File::create(&temp_path)?;
+        let parent_guard = match final_path.parent() {
+            Some(parent) => WritableDirGuard::new(parent)?,
+            None => None,
+        };
+        let file = fs::File::create(&temp_path)
+            .wrap_err_with(|| format!("failed to create temporary file {}", temp_path.display()))?;
         Ok(TempOutput {
             final_path,
             temp_path,
             file: Some(file),
+            _parent_guard: parent_guard,
         })
     }
 
@@ -461,10 +538,53 @@ impl TempOutput {
             .file
             .take()
             .ok_or_else(|| eyre!("temporary output is closed"))?;
-        file.flush()?;
+        file.flush().wrap_err_with(|| {
+            format!("failed to flush temporary file {}", self.temp_path.display())
+        })?;
         drop(file);
-        fs::rename(&self.temp_path, &self.final_path)?;
+        fs::rename(&self.temp_path, &self.final_path).wrap_err_with(|| {
+            format!(
+                "failed to rename temporary file {} to {}",
+                self.temp_path.display(),
+                self.final_path.display()
+            )
+        })?;
         Ok(())
+    }
+}
+
+struct WritableDirGuard {
+    path: PathBuf,
+    original_mode: u32,
+}
+
+impl WritableDirGuard {
+    fn new(path: &Path) -> Result<Option<Self>> {
+        let meta = fs::symlink_metadata(path).wrap_err_with(|| {
+            format!("failed to read directory metadata for {}", path.display())
+        })?;
+        let original_mode = meta.permissions().mode();
+        if owner_writable(original_mode) {
+            return Ok(None);
+        }
+        let mut perms = meta.permissions();
+        perms.set_mode(original_mode | 0o700);
+        fs::set_permissions(path, perms).wrap_err_with(|| {
+            format!(
+                "failed to make directory writable for sync {}",
+                path.display()
+            )
+        })?;
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            original_mode,
+        }))
+    }
+}
+
+impl Drop for WritableDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.original_mode));
     }
 }
 

@@ -222,6 +222,8 @@ impl DuetServer for DuetServerImpl {
 
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError> {
         log::debug!("Appling detailed changes, with {} details", details.len());
+        sync::preflight_apply(&self.base, &self.actions)
+            .map_err(|e| rpc_error("error preflighting detailed changes on the server", e))?;
         let result =
             sync::apply_detailed_changes(&self.base, &self.actions, &details, &mut self.all_old);
         match result {
@@ -327,6 +329,8 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn begin_apply_stream(&mut self) -> Result<ApplyStreamId, RPCError> {
+        sync::preflight_apply(&self.base, &self.actions)
+            .map_err(|e| rpc_error("error preflighting apply stream on the server", e))?;
         let id = self.next_apply_stream_id();
         let applier = sync::DetailApplier::new(
             self.base.clone(),
