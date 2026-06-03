@@ -3,7 +3,7 @@ use std::io::{self, BufWriter};
 use std::path::PathBuf;
 
 use bincode::serde::encode_into_std_write as serialize_into;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, WrapErr};
 use essrpc::essrpc;
 use essrpc::transports::{BincodeTransport, ReadWrite};
 use essrpc::{RPCError, RPCErrorKind, RPCServer};
@@ -134,6 +134,10 @@ impl DuetServerImpl {
     }
 }
 
+fn rpc_error(context: &str, error: impl std::fmt::Debug) -> RPCError {
+    RPCError::new(RPCErrorKind::Other, format!("{}: {:?}", context, error))
+}
+
 impl DuetServer for DuetServerImpl {
     fn set_base(&mut self, base: String) -> Result<(), RPCError> {
         self.base = match crate::full(&base) {
@@ -185,10 +189,7 @@ impl DuetServer for DuetServerImpl {
                 self.all_old = all_old;
                 Ok(changes)
             }
-            Err(_) => Err(RPCError::new(
-                RPCErrorKind::Other,
-                "error in getting changes from the server",
-            )),
+            Err(e) => Err(rpc_error("error getting changes from the server", e)),
         }
     }
 
@@ -197,10 +198,7 @@ impl DuetServer for DuetServerImpl {
         let result = sync::get_signatures(&self.base, &self.actions);
         match result {
             Ok(signatures) => Ok(signatures),
-            Err(_) => Err(RPCError::new(
-                RPCErrorKind::Other,
-                "error in getting signatures from the server",
-            )),
+            Err(e) => Err(rpc_error("error getting signatures from the server", e)),
         }
     }
 
@@ -215,29 +213,39 @@ impl DuetServer for DuetServerImpl {
         let result = sync::get_detailed_changes(&self.base, &self.actions, &signatures);
         match result {
             Ok(details) => Ok(details),
-            Err(_) => Err(RPCError::new(
-                RPCErrorKind::Other,
-                "error in getting detailed changes from the server",
+            Err(e) => Err(rpc_error(
+                "error getting detailed changes from the server",
+                e,
             )),
         }
     }
 
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError> {
         log::debug!("Appling detailed changes, with {} details", details.len());
+        sync::preflight_apply(&self.base, &self.actions)
+            .map_err(|e| rpc_error("error preflighting detailed changes on the server", e))?;
         let result =
             sync::apply_detailed_changes(&self.base, &self.actions, &details, &mut self.all_old);
         match result {
             Ok(()) => Ok(()),
-            Err(_) => Err(RPCError::new(
-                RPCErrorKind::Other,
-                "error in applying detailed changes on the server",
+            Err(e) => Err(rpc_error(
+                "error applying detailed changes on the server",
+                e,
             )),
         }
     }
 
     fn save_state(&self) -> Result<(), RPCError> {
         log::debug!("Saving state");
-        std::fs::create_dir_all(&self.remote_state_dir)?;
+        std::fs::create_dir_all(&self.remote_state_dir).map_err(|e| {
+            rpc_error(
+                &format!(
+                    "error creating remote state directory {}",
+                    self.remote_state_dir.display()
+                ),
+                e,
+            )
+        })?;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         log::info!(
             "Saving remote state {} with {} entries",
@@ -245,16 +253,16 @@ impl DuetServer for DuetServerImpl {
             &self.all_old.len()
         );
         use atomicwrites::{AllowOverwrite, AtomicFile};
-        let af = AtomicFile::new(remote_state, AllowOverwrite);
+        let af = AtomicFile::new(&remote_state, AllowOverwrite);
         let result = af.write(|f| {
             let mut f = BufWriter::new(f);
             serialize_into(&self.all_old, &mut f, bincode::config::legacy())
         });
         match result {
             Ok(_) => Ok(()),
-            Err(_) => Err(RPCError::new(
-                RPCErrorKind::Other,
-                "error in saving remote state on the server",
+            Err(e) => Err(rpc_error(
+                &format!("error saving remote state {}", remote_state.display()),
+                e,
             )),
         }
     }
@@ -321,6 +329,8 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn begin_apply_stream(&mut self) -> Result<ApplyStreamId, RPCError> {
+        sync::preflight_apply(&self.base, &self.actions)
+            .map_err(|e| rpc_error("error preflighting apply stream on the server", e))?;
         let id = self.next_apply_stream_id();
         let applier = sync::DetailApplier::new(
             self.base.clone(),
@@ -415,10 +425,16 @@ pub async fn server() -> Result<()> {
         crate::full(&"~/.config/duet/remote.log".to_string())?
     };
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).wrap_err_with(|| {
+            format!(
+                "unable to create remote server log directory {}",
+                parent.display()
+            )
+        })?;
     }
     use log::LevelFilter;
-    simple_logging::log_to_file(log_path, LevelFilter::Debug)?;
+    simple_logging::log_to_file(&log_path, LevelFilter::Debug)
+        .wrap_err_with(|| format!("unable to open remote server log {}", log_path.display()))?;
 
     let stdin = io::stdin();
     let stdout = io::stdout();

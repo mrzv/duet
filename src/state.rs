@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use bincode::serde::decode_from_std_read as deserialize_from;
 use bincode::serde::encode_into_std_write as serialize_into;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, WrapErr};
 use tokio::sync::mpsc;
 
 use crate::profile;
@@ -15,10 +15,17 @@ pub type Entries = Vec<DirEntryWithMeta>;
 pub type Changes = Vec<Change>;
 
 pub fn load_entries(statefile: &PathBuf) -> Result<Entries> {
-    let entries = if statefile.exists() {
+    let entries = if statefile
+        .try_exists()
+        .wrap_err_with(|| format!("unable to check state file {}", statefile.display()))?
+    {
         log::debug!("Loading: {}", statefile.display());
-        let mut f = BufReader::new(File::open(statefile)?);
-        deserialize_from(&mut f, bincode::config::legacy())?
+        let mut f = BufReader::new(
+            File::open(statefile)
+                .wrap_err_with(|| format!("unable to open state file {}", statefile.display()))?,
+        );
+        deserialize_from(&mut f, bincode::config::legacy())
+            .wrap_err_with(|| format!("unable to decode state file {}", statefile.display()))?
     } else {
         Vec::new()
     };
@@ -27,8 +34,12 @@ pub fn load_entries(statefile: &PathBuf) -> Result<Entries> {
 }
 
 pub fn save_entries(statefile: &PathBuf, entries: &Entries) -> Result<()> {
-    let mut f = BufWriter::new(File::create(statefile)?);
-    serialize_into(entries, &mut f, bincode::config::legacy())?;
+    let mut f = BufWriter::new(
+        File::create(statefile)
+            .wrap_err_with(|| format!("unable to create state file {}", statefile.display()))?,
+    );
+    serialize_into(entries, &mut f, bincode::config::legacy())
+        .wrap_err_with(|| format!("unable to encode state file {}", statefile.display()))?;
     Ok(())
 }
 
@@ -45,7 +56,8 @@ pub async fn scan_entries(
 
     let mut entries = async move {
         let (tx, mut rx) = mpsc::channel(32);
-        tokio::spawn(async move { scan::scan(&base, &path, &locations, &ignore, tx).await });
+        let scanner =
+            tokio::spawn(async move { scan::scan(&base, &path, &locations, &ignore, tx).await });
 
         let pb = indicatif::ProgressBar::new(1);
         pb.set_style(
@@ -60,9 +72,14 @@ pub async fn scan_entries(
         }
         pb.finish_and_clear();
 
-        entries
+        scanner
+            .await
+            .wrap_err("scanner task failed")?
+            .wrap_err("scanner failed")?;
+
+        Ok::<Entries, color_eyre::eyre::Report>(entries)
     }
-    .await;
+    .await?;
     log::debug!("Done scanning");
 
     entries.sort();
@@ -82,15 +99,24 @@ pub async fn old_and_changes(
     use tokio::fs::File;
     use tokio::io::AsyncReadExt;
     let all_old_entries = async {
-        let all_old_entries: Entries = if let Some(f) = statefile {
-            if f.exists() {
-                log::debug!("Loading: {}", f.display());
-                let mut f = File::open(f).await?;
+        let all_old_entries: Entries = if let Some(state_path) = statefile {
+            if state_path
+                .try_exists()
+                .wrap_err_with(|| format!("unable to check state file {}", state_path.display()))?
+            {
+                log::debug!("Loading: {}", state_path.display());
+                let mut f = File::open(state_path).await.wrap_err_with(|| {
+                    format!("unable to open state file {}", state_path.display())
+                })?;
                 let mut contents = vec![];
-                f.read_to_end(&mut contents).await?;
+                f.read_to_end(&mut contents).await.wrap_err_with(|| {
+                    format!("unable to read state file {}", state_path.display())
+                })?;
                 log::debug!("Done loading");
                 let mut contents = contents.as_slice();
-                deserialize_from(&mut contents, bincode::config::legacy())?
+                deserialize_from(&mut contents, bincode::config::legacy()).wrap_err_with(|| {
+                    format!("unable to decode state file {}", state_path.display())
+                })?
             } else {
                 Vec::new()
             }

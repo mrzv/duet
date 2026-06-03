@@ -1,5 +1,5 @@
 use super::scan::{Change, DirEntryWithMeta as Entry};
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -124,6 +124,76 @@ pub fn can_stream_details(actions: &[Action]) -> bool {
     })
 }
 
+pub fn preflight_apply(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
+    let readonly_metadata_changes = readonly_directory_metadata_changes(actions);
+    for target in apply_write_targets(actions) {
+        let Some(parent) = target.parent() else {
+            continue;
+        };
+        let parent_path = base.join(parent);
+        let Ok(meta) = fs::symlink_metadata(&parent_path) else {
+            continue;
+        };
+        if !meta.is_dir() || owner_writable(meta.permissions().mode()) {
+            continue;
+        }
+        if readonly_metadata_changes.iter().any(|path| path == parent) {
+            return Err(eyre!(
+                "destination parent {} is not writable",
+                parent_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn owner_writable(mode: u32) -> bool {
+    mode & 0o200 != 0
+}
+
+fn readonly_directory_metadata_changes(actions: &Vec<Action>) -> Vec<PathBuf> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Remote(Change::Modified(old, new))
+            | Action::ResolvedRemote((_, _), Change::Modified(old, new))
+                if old.is_dir()
+                    && new.is_dir()
+                    && owner_writable(old.mode())
+                    && !owner_writable(new.mode()) =>
+            {
+                Some(new.path().clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn apply_write_targets(actions: &Vec<Action>) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    for action in actions {
+        match action {
+            Action::Local(change) | Action::ResolvedLocal((_, _), change) => match change {
+                Change::Removed(e) | Change::Added(e) => targets.push(e.path().clone()),
+                Change::Modified(old, new) if old.is_file() && new.is_file() => {
+                    if !old.same_contents(new) {
+                        targets.push(new.path().clone());
+                    }
+                }
+                Change::Modified(old, new) if old.is_dir() && new.is_dir() => {}
+                Change::Modified(old, new) if old.is_symlink() && new.is_symlink() => {
+                    if old.target() != new.target() {
+                        targets.push(new.path().clone());
+                    }
+                }
+                Change::Modified(_, new) => targets.push(new.path().clone()),
+            },
+            _ => {}
+        }
+    }
+    targets
+}
+
 pub fn get_detailed_changes(
     base: &PathBuf,
     actions: &Vec<Action>,
@@ -148,7 +218,12 @@ pub fn get_detailed_changes(
                         if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
                             let block = [0; WINDOW];
                             let f = fs::File::open(base.join(e1.path()))?;
-                            let sig = &sig_iter.next().unwrap().1;
+                            let sig = &sig_iter
+                                .next()
+                                .ok_or_else(|| {
+                                    eyre!("missing signature for {}", e1.path().display())
+                                })?
+                                .1;
                             let delta = compare(sig, f, block)?;
                             details.push(ChangeDetails::Diff(delta))
                         } else if !e1.is_file() && e2.is_file() {
@@ -428,6 +503,7 @@ struct TempOutput {
     final_path: PathBuf,
     temp_path: PathBuf,
     file: Option<fs::File>,
+    _parent_guard: Option<WritableDirGuard>,
 }
 
 impl TempOutput {
@@ -443,11 +519,17 @@ impl TempOutput {
             std::process::id(),
             thread::current().id()
         ));
-        let file = fs::File::create(&temp_path)?;
+        let parent_guard = match final_path.parent() {
+            Some(parent) => WritableDirGuard::new(parent)?,
+            None => None,
+        };
+        let file = fs::File::create(&temp_path)
+            .wrap_err_with(|| format!("failed to create temporary file {}", temp_path.display()))?;
         Ok(TempOutput {
             final_path,
             temp_path,
             file: Some(file),
+            _parent_guard: parent_guard,
         })
     }
 
@@ -456,10 +538,53 @@ impl TempOutput {
             .file
             .take()
             .ok_or_else(|| eyre!("temporary output is closed"))?;
-        file.flush()?;
+        file.flush().wrap_err_with(|| {
+            format!("failed to flush temporary file {}", self.temp_path.display())
+        })?;
         drop(file);
-        fs::rename(&self.temp_path, &self.final_path)?;
+        fs::rename(&self.temp_path, &self.final_path).wrap_err_with(|| {
+            format!(
+                "failed to rename temporary file {} to {}",
+                self.temp_path.display(),
+                self.final_path.display()
+            )
+        })?;
         Ok(())
+    }
+}
+
+struct WritableDirGuard {
+    path: PathBuf,
+    original_mode: u32,
+}
+
+impl WritableDirGuard {
+    fn new(path: &Path) -> Result<Option<Self>> {
+        let meta = fs::symlink_metadata(path).wrap_err_with(|| {
+            format!("failed to read directory metadata for {}", path.display())
+        })?;
+        let original_mode = meta.permissions().mode();
+        if owner_writable(original_mode) {
+            return Ok(None);
+        }
+        let mut perms = meta.permissions();
+        perms.set_mode(original_mode | 0o700);
+        fs::set_permissions(path, perms).wrap_err_with(|| {
+            format!(
+                "failed to make directory writable for sync {}",
+                path.display()
+            )
+        })?;
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            original_mode,
+        }))
+    }
+}
+
+impl Drop for WritableDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.original_mode));
     }
 }
 
@@ -840,6 +965,15 @@ fn detail_filename(base: &Path, action: &Action) -> Result<PathBuf> {
     }
 }
 
+fn next_detail<'a, I>(details_iter: &mut I, path: &Path) -> Result<&'a ChangeDetails>
+where
+    I: Iterator<Item = &'a ChangeDetails>,
+{
+    details_iter
+        .next()
+        .ok_or_else(|| eyre!("missing detail for {}", path.display()))
+}
+
 fn copy_from_source(
     source: &mut fs::File,
     output: &mut fs::File,
@@ -906,8 +1040,9 @@ pub fn apply_detailed_changes(
                         let filename = base.join(e.path());
                         log::debug!("Removing {:?}", filename);
                         if !e.is_dir() {
-                            fs::remove_file(&filename)
-                                .expect(format!("failed to remove file {:?}", filename).as_str());
+                            fs::remove_file(&filename).wrap_err_with(|| {
+                                format!("failed to remove file {}", filename.display())
+                            })?;
                         } // else: removing directory;
                           //   must happen after all the files have been removed, which will happen
                           //   in the second pass
@@ -916,26 +1051,25 @@ pub fn apply_detailed_changes(
                     Change::Added(e) => {
                         let filename = base.join(e.path());
                         if let Some(p) = e.target() {
-                            std::os::unix::fs::symlink(p, &filename).expect(
-                                format!("failed to create symlink {:?} {:?}", p, filename).as_str(),
-                            );
-                            new_entries.push(update_meta(&filename, e).expect(
-                                format!("failed to update metadata for {:?}", filename).as_str(),
-                            ));
+                            std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
+                                format!(
+                                    "failed to create symlink {} -> {}",
+                                    filename.display(),
+                                    p.display()
+                                )
+                            })?;
+                            new_entries.push(update_meta(&filename, e)?);
                         } else if e.is_dir() {
-                            fs::create_dir(&filename).expect(
-                                format!("failed to create directory {:?}", filename).as_str(),
-                            );
+                            fs::create_dir(&filename).wrap_err_with(|| {
+                                format!("failed to create directory {}", filename.display())
+                            })?;
                             // new entry gets updated in the second pass, after all the updates in
                             // the directory are finished
                         } else {
                             log::debug!("Adding {}", e.path().display());
-                            let detail = &details_iter.next().unwrap();
-                            create_file(&filename, &detail)
-                                .expect(format!("failed to create file {:?}", filename).as_str());
-                            new_entries.push(update_meta(&filename, e).expect(
-                                format!("failed to update metadata for {:?}", filename).as_str(),
-                            ));
+                            let detail = next_detail(&mut details_iter, e.path())?;
+                            create_file(&filename, detail)?;
+                            new_entries.push(update_meta(&filename, e)?);
                         }
                     }
                     Change::Modified(e1, e2) => {
@@ -943,14 +1077,19 @@ pub fn apply_detailed_changes(
                         if e1.is_file() {
                             if e2.is_file() {
                                 if !e1.same_contents(&e2) {
-                                    let detail = &details_iter.next().unwrap();
+                                    let detail = next_detail(&mut details_iter, e2.path())?;
                                     match detail {
                                         ChangeDetails::Diff(delta) => {
                                             let block = [0; WINDOW];
                                             let mut updated = Vec::new();
                                             restore_seek(
                                                 &mut updated,
-                                                fs::File::open(&filename)?,
+                                                fs::File::open(&filename).wrap_err_with(|| {
+                                                    format!(
+                                                        "failed to open file {}",
+                                                        filename.display()
+                                                    )
+                                                })?,
                                                 block,
                                                 &delta,
                                             )?;
@@ -968,55 +1107,65 @@ pub fn apply_detailed_changes(
                             } else {
                                 // e2 not a file
                                 // remove the file
-                                fs::remove_file(&filename).expect(
-                                    format!("failed to remove file {:?}", filename).as_str(),
-                                );
+                                fs::remove_file(&filename).wrap_err_with(|| {
+                                    format!("failed to remove file {}", filename.display())
+                                })?;
                                 if let Some(p) = e2.target() {
-                                    std::os::unix::fs::symlink(p, &filename).expect(
-                                        format!("failed to create symlink {:?} {:?}", p, filename)
-                                            .as_str(),
-                                    );
+                                    std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
+                                        format!(
+                                            "failed to create symlink {} -> {}",
+                                            filename.display(),
+                                            p.display()
+                                        )
+                                    })?;
                                     new_entries.push(update_meta(&filename, e2)?);
                                 } else if e2.is_dir() {
-                                    fs::create_dir(&filename).expect(
-                                        format!("failed to create directory {:?}", filename)
-                                            .as_str(),
-                                    );
+                                    fs::create_dir(&filename).wrap_err_with(|| {
+                                        format!("failed to create directory {}", filename.display())
+                                    })?;
                                 } else {
-                                    panic!("Exhausted possibilities for the new entry");
+                                    return Err(eyre!(
+                                        "unsupported new entry for {}",
+                                        e2.path().display()
+                                    ));
                                 }
                             }
                         } else if e1.is_symlink() {
                             // remove the symlink
-                            fs::remove_file(&filename)
-                                .expect(format!("failed to remove file {:?}", filename).as_str());
+                            fs::remove_file(&filename).wrap_err_with(|| {
+                                format!("failed to remove file {}", filename.display())
+                            })?;
                             if e2.is_file() {
-                                let detail = &details_iter.next().unwrap();
-                                create_file(&filename, &detail).expect(
-                                    format!("failed to create file {:?}", filename).as_str(),
-                                );
+                                let detail = next_detail(&mut details_iter, e2.path())?;
+                                create_file(&filename, detail)?;
                                 new_entries.push(update_meta(&filename, e2)?);
                             } else if let Some(p) = e2.target() {
-                                std::os::unix::fs::symlink(p, &filename).expect(
-                                    format!("failed to create symlink {:?} {:?}", p, filename)
-                                        .as_str(),
-                                );
+                                std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
+                                    format!(
+                                        "failed to create symlink {} -> {}",
+                                        filename.display(),
+                                        p.display()
+                                    )
+                                })?;
                                 new_entries.push(update_meta(&filename, e2)?);
                             } else if e2.is_dir() {
-                                fs::create_dir(&filename).expect(
-                                    format!("failed to create directory {:?}", filename).as_str(),
-                                );
+                                fs::create_dir(&filename).wrap_err_with(|| {
+                                    format!("failed to create directory {}", filename.display())
+                                })?;
                                 // new entry gets updated in the second pass, after all the updates in
                                 // the directory are finished
                             }
                         } else if e1.is_dir() {
                             if e2.is_file() {
                                 // need to save the file contents for after we remove the directory
-                                let detail = &details_iter.next().unwrap();
+                                let detail = next_detail(&mut details_iter, e2.path())?;
                                 leftover_details.push(detail);
                             }
                         } else {
-                            panic!("Exhausted possibilities for the old entry");
+                            return Err(eyre!(
+                                "unsupported old entry for {}",
+                                e1.path().display()
+                            ));
                         }
                     }
                 }
@@ -1056,8 +1205,9 @@ pub fn apply_detailed_changes(
                 match change {
                     Change::Removed(e) => {
                         let dirname = base.join(e.path());
-                        fs::remove_dir(&dirname)
-                            .expect(format!("failed to remove directory {:?}", dirname).as_str());
+                        fs::remove_dir(&dirname).wrap_err_with(|| {
+                            format!("failed to remove directory {}", dirname.display())
+                        })?;
                     }
                     Change::Added(e) => {
                         let dirname = base.join(e.path());
@@ -1066,19 +1216,22 @@ pub fn apply_detailed_changes(
                     Change::Modified(e1, e2) => {
                         let dirname = base.join(e2.path());
                         if e1.is_dir() && !e2.is_dir() {
-                            fs::remove_dir(&dirname).expect(
-                                format!("failed to remove directory {:?}", dirname).as_str(),
-                            );
+                            fs::remove_dir(&dirname).wrap_err_with(|| {
+                                format!("failed to remove directory {}", dirname.display())
+                            })?;
                             if let Some(p) = e2.target() {
-                                std::os::unix::fs::symlink(p, &dirname).expect(
-                                    format!("failed to create symlink {:?} {:?}", p, dirname)
-                                        .as_str(),
-                                );
+                                std::os::unix::fs::symlink(p, &dirname).wrap_err_with(|| {
+                                    format!(
+                                        "failed to create symlink {} -> {}",
+                                        dirname.display(),
+                                        p.display()
+                                    )
+                                })?;
                             } else if e2.is_file() {
-                                let detail = details_iter.next().unwrap();
-                                create_file(&dirname, &detail).expect(
-                                    format!("failed to create file {:?}", dirname).as_str(),
-                                );
+                                let detail = details_iter.next().ok_or_else(|| {
+                                    eyre!("missing detail for {}", e2.path().display())
+                                })?;
+                                create_file(&dirname, detail)?;
                             }
                         }
                         new_entries.push(update_meta(&dirname, e2)?);
@@ -1122,19 +1275,19 @@ fn create_file_with_contents(filename: &Path, data: &Vec<u8>) -> Result<()> {
 
 fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
     let meta = fs::symlink_metadata(path)
-        .expect(format!("failed to acquire metadata for {:?}", path).as_str());
+        .wrap_err_with(|| format!("failed to read metadata for {}", path.display()))?;
     if !e.is_symlink() {
         let mut perms = meta.permissions();
         perms.set_mode(e.mode());
         fs::set_permissions(path, perms)
-            .expect(format!("failed to set permissions for {:?}", path).as_str());
+            .wrap_err_with(|| format!("failed to set permissions for {}", path.display()))?;
     }
     filetime::set_symlink_file_times(
         path,
         filetime::FileTime::from_unix_time(meta.atime(), 0),
         filetime::FileTime::from_unix_time(e.mtime(), 0),
     )
-    .expect(format!("failed to set time for {:?}", path).as_str());
+    .wrap_err_with(|| format!("failed to set time for {}", path.display()))?;
     let mut new_entry = e.clone();
     new_entry.set_ino(meta.ino());
     Ok(new_entry)

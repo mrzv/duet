@@ -2,7 +2,7 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use bincode::serde::encode_into_std_write as serialize_into;
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use colored::*;
 use essrpc::{RPCError, RPCErrorKind};
 use openssh::{KnownHosts, Session, SessionBuilder};
@@ -126,6 +126,7 @@ pub async fn sync(
             .filter(|a| !a.is_unresolved_conflict())
             .collect(),
     );
+    sync_ops::preflight_apply(&local_base, actions.as_ref())?;
     let remote_actions: Actions = reverse(&actions);
     let can_stream_details =
         has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAIL_BATCHES)
@@ -190,17 +191,17 @@ pub async fn sync(
                     &actions,
                     &remote_detailed_changes,
                     &mut local_all_old,
-                )
-                .expect("failed to apply local changes");
-                local_all_old
+                )?;
+                Ok::<state::Entries, color_eyre::eyre::Report>(local_all_old)
             })
         };
         let remote_apply_fut = remote.apply_detailed_changes(local_detailed_changes);
         let (local_apply, remote_apply) = tokio::join!(local_apply_fut, remote_apply_fut);
         let _ = remote_apply?;
-        local_apply?
+        local_apply.wrap_err("local apply task failed")??
     };
 
+    let local_state_display = local_state.display().to_string();
     let (remote_result, local_result) = tokio::join!(
         remote.save_state(),
         tokio::task::spawn_blocking(move || {
@@ -212,8 +213,10 @@ pub async fn sync(
             })
         })
     );
-    let _ = local_result.expect("Failed to save local state");
-    let _ = remote_result.expect("Failed to save remote state");
+    local_result
+        .wrap_err("local state save task failed")?
+        .wrap_err_with(|| format!("failed to save local state {}", local_state_display))?;
+    remote_result.map_err(|e| eyre!("failed to save remote state: {:?}", e))?;
 
     Ok(())
 }
