@@ -288,6 +288,10 @@ async fn stream_detailed_changes<R>(
 where
     R: DuetServerAsync,
 {
+    let total_transfer_bytes = sync_ops::detail_transfer_bytes(actions);
+    let progress = stream_progress_bar(total_transfer_bytes)?;
+    let mut progress_position = 0;
+
     let mut local_producer = sync_ops::DetailProducer::new(
         local_base.clone(),
         actions.clone(),
@@ -321,9 +325,16 @@ where
             if frames.is_empty() {
                 remote_done = true;
             } else {
+                let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
                 for frame in frames {
                     local_applier.apply_frame(frame)?;
                 }
+                advance_stream_progress(
+                    &progress,
+                    &mut progress_position,
+                    total_transfer_bytes,
+                    transfer_bytes,
+                );
             }
         }
 
@@ -333,10 +344,17 @@ where
             if frames.is_empty() {
                 local_done = true;
             } else {
+                let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
                 remote
                     .apply_detail_chunks(remote_apply_stream, frames)
                     .await
                     .map_err(|e| eyre!("Couldn't apply remote detail stream: {:?}", e))?;
+                advance_stream_progress(
+                    &progress,
+                    &mut progress_position,
+                    total_transfer_bytes,
+                    transfer_bytes,
+                );
             }
         }
     }
@@ -346,7 +364,45 @@ where
         .finish_apply_stream(remote_apply_stream)
         .await
         .map_err(|e| eyre!("Couldn't finish remote apply stream: {:?}", e))?;
+    progress.finish_and_clear();
     Ok(local_all_old)
+}
+
+fn stream_progress_bar(total_transfer_bytes: u64) -> Result<indicatif::ProgressBar> {
+    let progress = indicatif::ProgressBar::new(total_transfer_bytes);
+    let style = indicatif::ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {wide_msg}")?
+        .progress_chars("##-");
+    progress.set_style(style);
+    progress.set_message(format!(
+        "streaming changes {} / {}",
+        indicatif::HumanBytes(0),
+        indicatif::HumanBytes(total_transfer_bytes)
+    ));
+    Ok(progress)
+}
+
+fn advance_stream_progress(
+    progress: &indicatif::ProgressBar,
+    position: &mut u64,
+    total_transfer_bytes: u64,
+    transfer_bytes: u64,
+) {
+    if transfer_bytes == 0 {
+        return;
+    }
+
+    *position = position.saturating_add(transfer_bytes);
+    if total_transfer_bytes > 0 {
+        *position = (*position).min(total_transfer_bytes);
+    }
+
+    progress.set_position(*position);
+    progress.set_message(format!(
+        "streaming changes {} / {}",
+        indicatif::HumanBytes(*position),
+        indicatif::HumanBytes(total_transfer_bytes)
+    ));
 }
 
 fn has_remote_capability(info: &rpc::ServerInfo, capability: &str) -> bool {

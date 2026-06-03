@@ -69,6 +69,47 @@ pub enum DetailPayload {
     DiffEnd,
 }
 
+pub fn detail_transfer_bytes(actions: &[Action]) -> u64 {
+    actions.iter().map(action_detail_bytes).sum()
+}
+
+pub fn detail_frame_transfer_bytes(frame: &DetailFrame) -> u64 {
+    match &frame.payload {
+        DetailPayload::FileBytes(bytes) | DetailPayload::DiffBytes(bytes) => bytes.len() as u64,
+        DetailPayload::DiffCopy { len, .. } => *len,
+        DetailPayload::FileBegin
+        | DetailPayload::FileEnd
+        | DetailPayload::DiffBegin
+        | DetailPayload::DiffEnd => 0,
+    }
+}
+
+pub fn detail_frames_transfer_bytes(frames: &[DetailFrame]) -> u64 {
+    frames.iter().map(detail_frame_transfer_bytes).sum()
+}
+
+fn action_detail_bytes(action: &Action) -> u64 {
+    let change = match action {
+        Action::Local(change)
+        | Action::Remote(change)
+        | Action::ResolvedLocal((_, _), change)
+        | Action::ResolvedRemote((_, _), change) => change,
+        Action::Conflict(_, _) | Action::Identical(_, _) => return 0,
+    };
+
+    match change {
+        Change::Removed(_) => 0,
+        Change::Added(entry) => entry.is_file().then_some(entry.size()).unwrap_or(0),
+        Change::Modified(old, new) => {
+            if new.is_file() && (!old.is_file() || !old.same_contents(new)) {
+                new.size()
+            } else {
+                0
+            }
+        }
+    }
+}
+
 pub fn can_stream_details(actions: &[Action]) -> bool {
     actions.iter().all(|action| {
         let change = match action {
@@ -1130,5 +1171,33 @@ mod tests {
                 if len >= contents.len() as u64 && len <= (contents.len() + WINDOW) as u64
         ));
         assert!(matches!(frames[1].payload, DetailPayload::DiffEnd));
+    }
+
+    #[test]
+    fn detail_frames_transfer_bytes_counts_reconstructed_bytes() {
+        let frames = vec![
+            DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBegin,
+            },
+            DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBytes(vec![0; 7]),
+            },
+            DetailFrame {
+                action_index: 1,
+                payload: DetailPayload::DiffCopy { offset: 0, len: 11 },
+            },
+            DetailFrame {
+                action_index: 1,
+                payload: DetailPayload::DiffBytes(vec![0; 13]),
+            },
+            DetailFrame {
+                action_index: 1,
+                payload: DetailPayload::DiffEnd,
+            },
+        ];
+
+        assert_eq!(detail_frames_transfer_bytes(&frames), 31);
     }
 }
