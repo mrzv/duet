@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -17,6 +18,7 @@ use crate::rustsync::{compare, compare_stream, restore_seek, signature, DeltaOp}
 pub use crate::rustsync::{Delta, Signature};
 
 const WINDOW: usize = 1024; // TODO: figure out appropriate window size
+static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureWithPath(PathBuf, Signature);
@@ -509,15 +511,11 @@ struct TempOutput {
 impl TempOutput {
     fn new(final_path: PathBuf) -> Result<Self> {
         let mut temp_path = final_path.clone();
-        let file_name = final_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("duet-output");
+        let temp_id = TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
         temp_path.set_file_name(format!(
-            ".{}.duet-part-{}-{:?}",
-            file_name,
+            ".duet-part-{}-{}",
             std::process::id(),
-            thread::current().id()
+            temp_id
         ));
         let parent_guard = match final_path.parent() {
             Some(parent) => WritableDirGuard::new(parent)?,
@@ -1352,5 +1350,20 @@ mod tests {
         ];
 
         assert_eq!(detail_frames_transfer_bytes(&frames), 31);
+    }
+
+    #[test]
+    fn temp_output_name_stays_short_for_long_destination_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join(format!("{}.txt", "a".repeat(250)));
+
+        let output = TempOutput::new(final_path.clone()).unwrap();
+        let temp_name = output.temp_path.file_name().unwrap().to_string_lossy();
+
+        assert!(temp_name.len() < 64, "temp name was {}", temp_name);
+        assert!(output.temp_path.exists());
+
+        output.finish().unwrap();
+        assert!(final_path.exists());
     }
 }
