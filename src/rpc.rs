@@ -22,6 +22,14 @@ pub(crate) const SERVER_LOG_ENV: &str = "DUET_SERVER_LOG";
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
 pub(crate) const CAPABILITY_PROFILE_FILE_STATE_DIR: &str = "profile-file-state-dir";
 pub(crate) const CAPABILITY_STREAMED_DETAILS: &str = "streamed-details-v1";
+const CLIENT_CAPABILITIES: &[&str] = &[
+    CAPABILITY_PROFILE_FILE_STATE_DIR,
+    CAPABILITY_STREAMED_DETAILS,
+];
+
+pub(crate) fn client_capabilities() -> &'static [&'static str] {
+    CLIENT_CAPABILITIES
+}
 
 mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
@@ -248,10 +256,10 @@ impl DuetServer for DuetServerImpl {
         Ok(ServerInfo {
             protocol_version: PROTOCOL_VERSION,
             duet_version: built_info::PKG_VERSION.to_string(),
-            capabilities: vec![
-                CAPABILITY_PROFILE_FILE_STATE_DIR.to_string(),
-                CAPABILITY_STREAMED_DETAILS.to_string(),
-            ],
+            capabilities: client_capabilities()
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
         })
     }
 

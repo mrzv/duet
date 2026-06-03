@@ -27,6 +27,7 @@ FLAGS:
     -f, --force         in batch mode, apply what's possible, even if there are conflicts
     -v, --verbose       verbose output
     -n, --dry-run       don't apply changes
+        --debug-info    print protocol and capability negotiation details
 
         --profile-file <file>
                          read profile from a local file and keep state next to it

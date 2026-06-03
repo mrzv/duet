@@ -40,9 +40,14 @@ impl SyncCase {
     }
 
     fn sync(&self) -> Output {
+        self.sync_with_args(&[])
+    }
+
+    fn sync_with_args(&self, args: &[&str]) -> Output {
         Command::new(duet_bin())
             .arg("--profile-file")
             .arg(&self.profile)
+            .args(args)
             .arg("-b")
             .env("NO_COLOR", "1")
             .output()
@@ -167,6 +172,28 @@ fn batch_conflict_aborts_without_changing_files() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(read(&local_file), "local changed");
     assert_eq!(read(&remote_file), "remote changed");
+}
+
+#[test]
+fn debug_info_reports_negotiated_capabilities() {
+    let case = SyncCase::new();
+    write(&case.local.join("a.txt"), "from local");
+
+    let output = case.sync_with_args(&["--debug-info"]);
+
+    assert_success(output);
+
+    let output = case.sync_with_args(&["--debug-info"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert_success(output);
+    assert!(stdout.contains("Debug information:"), "{}", stdout);
+    assert!(stdout.contains("client protocol:"), "{}", stdout);
+    assert!(stdout.contains("server protocol:"), "{}", stdout);
+    assert!(
+        stdout.contains("agreed capabilities: profile-file-state-dir, streamed-details-v1"),
+        "{}",
+        stdout
+    );
 }
 
 #[test]

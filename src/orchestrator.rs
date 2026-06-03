@@ -107,6 +107,9 @@ pub async fn sync(
     let (remote_changes, remote_info) = remote_result?;
 
     let mut actions = build_actions(&local_changes, &remote_changes);
+    if options.debug_info {
+        show_debug_info(remote_info.as_ref());
+    }
     let resolution = resolve_actions(&mut actions, options)?;
 
     if let AllResolution::Abort = resolution {
@@ -343,6 +346,51 @@ fn has_remote_capability(info: &rpc::ServerInfo, capability: &str) -> bool {
     info.capabilities.iter().any(|c| c == capability)
 }
 
+fn agreed_capabilities(info: &rpc::ServerInfo) -> Vec<&'static str> {
+    rpc::client_capabilities()
+        .iter()
+        .copied()
+        .filter(|capability| has_remote_capability(info, capability))
+        .collect()
+}
+
+fn format_capabilities(capabilities: &[impl AsRef<str>]) -> String {
+    if capabilities.is_empty() {
+        "none".to_string()
+    } else {
+        capabilities
+            .iter()
+            .map(|capability| capability.as_ref())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn show_debug_info(remote_info: Option<&rpc::ServerInfo>) {
+    println!("Debug information:");
+    println!("  client protocol: {}", rpc::PROTOCOL_VERSION);
+    println!(
+        "  client capabilities: {}",
+        format_capabilities(rpc::client_capabilities())
+    );
+
+    if let Some(info) = remote_info {
+        println!("  server version: {}", info.duet_version);
+        println!("  server protocol: {}", info.protocol_version);
+        println!(
+            "  server capabilities: {}",
+            format_capabilities(&info.capabilities)
+        );
+        println!(
+            "  agreed capabilities: {}",
+            format_capabilities(&agreed_capabilities(info))
+        );
+    } else {
+        println!("  server negotiation: not attempted for named profile compatibility");
+        println!("  agreed capabilities: unknown");
+    }
+}
+
 fn server_info_error(error: RPCError) -> color_eyre::eyre::Report {
     match error.kind {
         RPCErrorKind::TransportEOF
@@ -409,6 +457,7 @@ fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllRes
         batch,
         force,
         verbose,
+        debug_info: _,
     } = options;
 
     if actions.is_empty() {
@@ -545,5 +594,29 @@ mod tests {
 
         assert!(error.contains("0.3.2"));
         assert!(error.contains(rpc::CAPABILITY_PROFILE_FILE_STATE_DIR));
+    }
+
+    #[test]
+    fn agreed_capabilities_intersects_client_and_server_capabilities() {
+        let info = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "0.3.2".to_string(),
+            capabilities: vec![
+                rpc::CAPABILITY_STREAMED_DETAILS.to_string(),
+                "server-only".to_string(),
+            ],
+        };
+
+        assert_eq!(
+            agreed_capabilities(&info),
+            vec![rpc::CAPABILITY_STREAMED_DETAILS]
+        );
+    }
+
+    #[test]
+    fn format_capabilities_reports_none_for_empty_list() {
+        let capabilities: [&str; 0] = [];
+
+        assert_eq!(format_capabilities(&capabilities), "none");
     }
 }
