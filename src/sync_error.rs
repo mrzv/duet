@@ -22,6 +22,16 @@ impl StructuredSyncError {
         error: impl fmt::Debug,
     ) -> Self {
         let message = format!("{:?}", error);
+        Self::from_message(side, operation, path, message)
+    }
+
+    pub fn from_message(
+        side: impl Into<String>,
+        operation: impl Into<String>,
+        path: Option<PathBuf>,
+        message: impl Into<String>,
+    ) -> Self {
+        let message = message.into();
         Self {
             version: 1,
             side: side.into(),
@@ -120,6 +130,24 @@ pub fn render_rpc_error(error: &RPCError) -> String {
     }
 }
 
+pub fn render_error(
+    side: impl Into<String>,
+    operation: impl Into<String>,
+    path: Option<PathBuf>,
+    error: impl fmt::Debug,
+) -> String {
+    StructuredSyncError::new(side, operation, path, error).render_for_user()
+}
+
+pub fn render_message(
+    side: impl Into<String>,
+    operation: impl Into<String>,
+    path: Option<PathBuf>,
+    message: impl Into<String>,
+) -> String {
+    StructuredSyncError::from_message(side, operation, path, message).render_for_user()
+}
+
 fn classify_error_message(message: &str) -> &'static str {
     let message = message.to_lowercase();
     if message.contains("permission denied")
@@ -212,5 +240,20 @@ mod tests {
         assert!(rendered.contains("remote check apply recovery failed"));
         assert!(rendered.contains("Recovery: filesystem changes were applied"));
         assert!(rendered.contains("state may not have been saved"));
+    }
+
+    #[test]
+    fn setup_message_rendering_keeps_human_hint() {
+        let rendered = render_message(
+            "setup",
+            "open SSH session",
+            None,
+            "Permission denied (publickey). Try chmod 600 ~/.ssh/id_ed25519.",
+        );
+
+        assert!(rendered.contains("setup open SSH session failed"));
+        assert!(rendered.contains("permission_denied"));
+        assert!(rendered.contains("Try chmod 600"));
+        assert!(!rendered.contains("\"Permission denied"));
     }
 }

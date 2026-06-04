@@ -84,11 +84,9 @@ pub async fn sync(
     let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
         .await
         .unwrap_or_else(|e| {
-            eprintln!(
-                "Failed to start server ({}). Server log: {}",
-                e.to_string().cyan(),
-                server_log.display().to_string().yellow()
-            );
+            let diagnostic =
+                sync_error::render_error("setup", "launch server", Some(server_log.clone()), e);
+            eprintln!("{}", diagnostic.cyan());
             quit::with_code(SERVER_ERROR_CODE);
         });
     let remote = remote::get_remote(&mut server)?;
@@ -585,7 +583,13 @@ async fn open_remote_session(remote_server: Option<String>) -> Option<Session> {
         match session_result {
             Ok(session) => Some(session),
             Err(e) => {
-                eprintln!("Unable to get SSH session ({})", ssh_diagnostic(&e).cyan());
+                let diagnostic = sync_error::render_message(
+                    "setup",
+                    "open SSH session",
+                    None,
+                    ssh_diagnostic(&e),
+                );
+                eprintln!("{}", diagnostic.cyan());
                 log::error!("Unable to get SSH session: {:?}", e);
                 quit::with_code(SSH_ERROR_CODE);
             }

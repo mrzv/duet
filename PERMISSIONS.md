@@ -44,7 +44,9 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
 - Setup/orchestration paths that previously used permission-triggerable
   `expect`/`unwrap` calls now return contextual errors.
 - SSH/session setup now adds targeted hints for common private-key and SSH config
-  permission failures, and server launch errors include command/log context.
+  permission failures, and server launch errors include command/log context. SSH
+  session and server-launch failures now use the shared structured error renderer
+  even when they occur before the RPC server is available.
 - Applied Unix modes are masked to permission/special bits before `chmod`, so
   file-type bits from `symlink_metadata` are not passed back to the OS.
 - `README.md` documents the user-facing metadata model: file contents,
@@ -135,17 +137,16 @@ Remote sync errors now use the shared `StructuredSyncError` envelope inside
 removes the earlier RPC-only error type boundary, but it is not a complete
 end-to-end error model yet.
 
-The client parses this envelope for concise remote error rendering. The original
-RPC payload remains line-oriented and machine-readable, but source chains are
-still carried as formatted debug text.
+The client parses this envelope for concise remote error rendering. Local setup
+paths can also use the same renderer for classified user-facing diagnostics. The
+original RPC payload remains line-oriented and machine-readable, but source
+chains are still carried as formatted debug text.
 
 Remaining work:
 
 - Preserve structured source chains without relying on formatted debug strings.
-- Extend client-side parsing/rendering to all sync/setup errors, not only remote
-  RPC errors.
-- Extend structured setup errors for server launch, SSH, profile, and log/state
-  setup paths that fail before the normal RPC server is running.
+- Extend structured setup errors to profile and log/state setup paths that fail
+  before the normal RPC server is running.
 
 ### 4. Permission Model Is Still Unix Mode Bits Only
 
@@ -165,13 +166,15 @@ Most permission-triggerable setup `expect`/`unwrap` paths in profile loading,
 remote command expansion, RPC setup, and orchestration have been converted to
 contextual errors. SSH setup adds hints for common key/config permission
 failures, and server launch errors include the command and server log path where
-available. Some setup failures still happen before normal sync error handling is
-established and can produce weak diagnostics.
+available. SSH session and server-launch diagnostics now use the shared
+structured renderer. Some setup failures still happen before normal sync error
+handling is established and can produce weak diagnostics.
 
 Known examples:
 
 - Server startup failures before RPC initialization still depend on child
-  process stderr/log context.
+  process stderr/log context, though their final setup error is now classified
+  and rendered consistently.
 
 Remaining work:
 
