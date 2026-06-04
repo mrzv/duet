@@ -1580,20 +1580,7 @@ pub fn apply_detailed_changes(
                                     let detail = next_detail(&mut details_iter, e2.path())?;
                                     match detail {
                                         ChangeDetails::Diff(delta) => {
-                                            let block = [0; WINDOW];
-                                            let mut updated = Vec::new();
-                                            restore_seek(
-                                                &mut updated,
-                                                fs::File::open(&filename).wrap_err_with(|| {
-                                                    format!(
-                                                        "failed to open file {}",
-                                                        filename.display()
-                                                    )
-                                                })?,
-                                                block,
-                                                &delta,
-                                            )?;
-                                            create_file_with_contents(&filename, &updated)?;
+                                            update_file_with_diff(&filename, delta)?;
                                         }
                                         _ => {
                                             return Err(eyre!(
@@ -1763,19 +1750,28 @@ fn create_file(filename: &Path, detail: &ChangeDetails) -> Result<()> {
     }
 }
 
-fn create_file_with_contents(filename: &Path, data: &Vec<u8>) -> Result<()> {
-    use atomicwrites::{AllowOverwrite, AtomicFile};
-    let _parent_guard = filename
-        .parent()
-        .map(WritableDirGuard::new)
-        .transpose()?
-        .flatten();
-    let af = AtomicFile::new(filename, AllowOverwrite);
-    let result = af.write(|f| f.write_all(data));
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) => Err(eyre!("unable to save {}: {}", filename.display(), e)),
-    }
+fn create_file_with_contents(filename: &Path, data: &[u8]) -> Result<()> {
+    let mut output = TempOutput::new(filename.to_path_buf())?;
+    output
+        .file
+        .as_mut()
+        .ok_or_else(|| eyre!("temporary output is closed"))?
+        .write_all(data)
+        .wrap_err_with(|| format!("failed to write temporary file for {}", filename.display()))?;
+    output.finish()
+}
+
+fn update_file_with_diff(filename: &Path, delta: &Delta) -> Result<()> {
+    let source = fs::File::open(filename)
+        .wrap_err_with(|| format!("failed to open file {}", filename.display()))?;
+    let mut output = TempOutput::new(filename.to_path_buf())?;
+    let output_file = output
+        .file
+        .as_mut()
+        .ok_or_else(|| eyre!("temporary output is closed"))?;
+    restore_seek(output_file, source, [0; WINDOW], delta)
+        .wrap_err_with(|| format!("failed to restore diff for {}", filename.display()))?;
+    output.finish()
 }
 
 fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {

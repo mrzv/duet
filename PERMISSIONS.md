@@ -42,6 +42,10 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   structured `source:` entries instead of relying only on formatted debug text.
 - Streamed apply temp files use bounded-length names, so long destination file
   names no longer create overlong temporary path components.
+- Streamed and non-streamed file-content writes now use the same side-local
+  temporary-output primitive before renaming into place. Non-streamed diff apply
+  restores directly into that temporary file instead of materializing the full
+  updated file in memory first.
 - Setup/orchestration paths that previously used permission-triggerable
   `expect`/`unwrap` calls now return contextual errors.
 - SSH/session setup now adds targeted hints for common private-key and SSH config
@@ -99,6 +103,9 @@ Remaining work:
 - Add RPC methods for `prepare`, `commit`, `finish`, and `recover`, advertised by
   a protocol capability.
 - Move streamed and non-streamed apply through the same staged apply engine.
+  File-content writes now share the same temporary-output primitive, but the full
+  staged engine still needs to cover directory, symlink, metadata, and removal
+  operations.
 - Stage or explicitly classify every operation that cannot be staged, especially
   directory removals, type replacements, chmod, and utime.
 - Persist enough committed-operation metadata to resume or provide deterministic
