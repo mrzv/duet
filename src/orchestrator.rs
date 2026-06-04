@@ -292,18 +292,32 @@ fn install_ctrlc_handler() -> Result<()> {
 
 fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncContext> {
     let config = profile::load(&source).unwrap_or_else(|e| {
-        eprintln!(
-            "Failed to read profile {} ({})",
-            profile_name(&source).yellow(),
-            e.to_string().cyan()
-        );
+        let diagnostic =
+            sync_error::render_error("setup", "load profile", profile_source_path(&source), e);
+        eprintln!("{}", diagnostic.cyan());
         quit::with_code(PROFILE_ERROR_CODE);
     });
 
     let local_id = local_id(&config.identity);
 
-    let local_base = crate::full(&config.profile.local)?;
-    let (remote_base, remote_server, remote_cmd) = remote::parse_remote(&config.profile.remote)?;
+    let local_base = crate::full(&config.profile.local).map_err(|e| {
+        eyre!(
+            "{}",
+            sync_error::render_error(
+                "setup",
+                "resolve local base",
+                Some(PathBuf::from(&config.profile.local)),
+                e
+            )
+        )
+    })?;
+    let (remote_base, remote_server, remote_cmd) = remote::parse_remote(&config.profile.remote)
+        .map_err(|e| {
+            eyre!(
+                "{}",
+                sync_error::render_error("setup", "parse remote", None, e)
+            )
+        })?;
 
     let path = normalize_path(&local_base, &path.unwrap_or(PathBuf::from("")))?;
     println!(
@@ -566,10 +580,10 @@ fn require_remote_capability(info: &rpc::ServerInfo, capability: &str) -> Result
     ))
 }
 
-fn profile_name(source: &ProfileSource) -> String {
+fn profile_source_path(source: &ProfileSource) -> Option<PathBuf> {
     match source {
-        ProfileSource::Named(name) => name.clone(),
-        ProfileSource::File(path) => path.display().to_string(),
+        ProfileSource::Named(name) => profile::location(name).ok(),
+        ProfileSource::File(path) => Some(path.clone()),
     }
 }
 
