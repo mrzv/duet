@@ -48,26 +48,49 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
 
 ## Remaining Work
 
-### 1. Apply Is Still Not Transactional
+### 1. Apply Needs A Prepare/Commit Protocol
 
 Current preflight catches common permission failures before mutation, but sync is
 not a true transaction. Local and remote apply can still mutate files before a
 later non-preflighted error, crash, or race is detected.
 
+Target design:
+
+- `prepare`: both sides validate the selected actions again, create a per-sync
+  apply attempt id, and stage all content writes into side-local temporary files.
+- `prepared`: both sides report staged paths, metadata operations, removals, and
+  any operation that cannot be safely staged.
+- `commit`: both sides perform the shortest possible rename/remove/chmod/utime
+  window. File content replacement should be rename-based wherever the platform
+  allows it.
+- `finish`: state is saved only after both sides report commit success.
+- `recover`: if a process dies after `prepare` or during `commit`, the next run
+  detects the attempt id, reports which phase may have partially completed, and
+  either cleans abandoned staged files or asks the user to inspect committed
+  paths before continuing.
+
 Remaining work:
 
-- Add a prepare/commit protocol for both sides.
-- Stage file writes and metadata changes before commit.
-- Define rollback or resumable recovery for failures after partial mutation.
-- Save state only after both sides have committed, with clear recovery guidance
-  if state save fails after filesystem mutation.
+- Add RPC methods for `prepare`, `commit`, `finish`, and `recover`, advertised by
+  a protocol capability.
+- Move streamed and non-streamed apply through the same staged apply engine.
+- Stage or explicitly classify every operation that cannot be staged, especially
+  directory removals, type replacements, chmod, and utime.
+- Persist enough attempt metadata to resume or provide deterministic recovery
+  instructions after a crash.
+- Keep state saving after both sides have committed successfully.
 
-### 2. Preflight Is Still Best-Effort
+### 2. Preflight And Apply Recovery Are Still Best-Effort
 
 Current preflight catches common permission failures before mutation, including
 source reads, destination parent/metadata checks, and local/remote state-save
 paths. It is still a snapshot: the filesystem can change after preflight, and
 some capabilities cannot be proven without attempting the operation.
+
+When a post-preflight apply or state-save error occurs, Duet now reports recovery
+advice explaining that filesystem changes may have been partially applied and
+state may not have been saved. This is guidance only; it is not a resumable apply
+protocol yet.
 
 Remaining work:
 
@@ -75,7 +98,9 @@ Remaining work:
   possible.
 - Expand preflight coverage for less common replacement/remove combinations as
   they are found.
-- Treat races between preflight and apply as normal errors with recovery advice.
+- Add tests for representative races between preflight and apply.
+- Replace generic recovery advice with phase/path-specific guidance once apply
+  attempts are persisted.
 
 ### 3. Remote Errors Are Only Partly Structured
 
@@ -83,13 +108,17 @@ Remote sync errors now use a structured `RemoteSyncError` envelope inside
 `RPCErrorKind::Other`. This is a practical improvement over generic strings, but
 it is not a complete end-to-end error model yet.
 
+The client parses this envelope for concise remote error rendering. The original
+RPC payload remains line-oriented and machine-readable, but source chains are
+still carried as formatted debug text.
+
 Remaining work:
 
 - Promote the envelope into a shared sync error type instead of an RPC-only
   wrapper.
 - Preserve structured source chains without relying on formatted debug strings.
-- Add client-side parsing/rendering so user-facing messages are concise while
-  retaining machine-readable fields.
+- Extend client-side parsing/rendering to all sync/setup errors, not only remote
+  RPC errors.
 - Extend structured setup errors for server launch, SSH, profile, and log/state
   setup paths that fail before the normal RPC server is running.
 
@@ -153,8 +182,9 @@ Remaining work:
 
 ## Current Priority Order
 
-1. Design a transactional or resumable apply protocol.
-2. Add recovery advice for races and post-preflight failures.
+1. Implement the transactional or resumable apply protocol described above.
+2. Add tests and phase/path-specific recovery advice for races and
+   post-preflight failures.
 3. Promote `RemoteSyncError` into an end-to-end structured error model with
    client-side rendering.
 4. Add targeted SSH/server-startup diagnostics.

@@ -27,6 +27,8 @@ const CTRLC_CODE: u8 = 6;
 const DETAIL_CHUNK_BYTES: usize = 1024 * 1024;
 const DETAIL_BATCH_FRAMES: usize = 256;
 const DETAIL_BATCH_PAYLOAD_BYTES: usize = DETAIL_CHUNK_BYTES;
+const POST_PREFLIGHT_RECOVERY_ADVICE: &str = "Recovery: filesystem changes may have been partially applied, but Duet state was not saved. Fix the reported problem, inspect both sides if needed, then rerun duet. If conflicts appear, resolve them manually.";
+const STATE_SAVE_RECOVERY_ADVICE: &str = "Recovery: filesystem changes were applied, but Duet state was not saved on both sides. Fix state storage permissions, then rerun duet before making unrelated changes.";
 
 struct SyncContext {
     profile: profile::Profile,
@@ -86,7 +88,7 @@ pub async fn sync(
         remote
             .set_base(remote_base)
             .await
-            .map_err(|e| eyre!("Couldn't set server base: {:?}", e))?;
+            .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
         let remote_info = remote.server_info().await.map_err(server_info_error)?;
         if let Some(remote_state_dir) = remote_state_dir {
             require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
@@ -98,7 +100,7 @@ pub async fn sync(
         let changes = remote
             .changes(remote_path, remote_locations, remote_ignore, local_id)
             .await
-            .map_err(|e| eyre!("Couldn't get remote changes: {:?}", e))?;
+            .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))?;
         Ok::<_, color_eyre::eyre::Report>((changes, remote_info))
     };
 
@@ -136,7 +138,7 @@ pub async fn sync(
     remote
         .set_actions(remote_actions)
         .await
-        .map_err(|e| eyre!("Failed to set remote actions: {:?}", e))?;
+        .map_err(|e| remote_rpc_error("Failed to set remote actions", e))?;
     log::debug!("set remote actions");
 
     let local_signatures_fut = {
@@ -149,7 +151,7 @@ pub async fn sync(
         tokio::join!(local_signatures_fut, remote_signatures_fut);
     let local_signatures = local_signatures.wrap_err("local signature task failed")??;
     let remote_signatures =
-        remote_signatures.map_err(|e| eyre!("couldn't get remote signatures: {:?}", e))?;
+        remote_signatures.map_err(|e| remote_rpc_error("couldn't get remote signatures", e))?;
     log::debug!(
         "{} local signatures; {} remote signatures",
         local_signatures.len(),
@@ -181,7 +183,7 @@ pub async fn sync(
         let local_detailed_changes =
             local_detailed_changes.wrap_err("local detailed changes task failed")??;
         let remote_detailed_changes = remote_detailed_changes
-            .map_err(|e| eyre!("couldn't get remote detailed changes: {:?}", e))?;
+            .map_err(|e| remote_rpc_error("couldn't get remote detailed changes", e))?;
         log::debug!("got detailed changes");
 
         let local_apply_fut = {
@@ -199,8 +201,11 @@ pub async fn sync(
         };
         let remote_apply_fut = remote.apply_detailed_changes(local_detailed_changes);
         let (local_apply, remote_apply) = tokio::join!(local_apply_fut, remote_apply_fut);
-        let _ = remote_apply?;
-        local_apply.wrap_err("local apply task failed")??
+        let _ = remote_apply
+            .map_err(|e| post_preflight_rpc_error("remote apply failed after preflight", e))?;
+        local_apply
+            .wrap_err("local apply task failed")?
+            .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?
     };
 
     let local_state_display = local_state.display().to_string();
@@ -217,8 +222,13 @@ pub async fn sync(
     );
     local_result
         .wrap_err("local state save task failed")?
-        .wrap_err_with(|| format!("failed to save local state {}", local_state_display))?;
-    remote_result.map_err(|e| eyre!("failed to save remote state: {:?}", e))?;
+        .wrap_err_with(|| {
+            format!(
+                "failed to save local state {}\n{}",
+                local_state_display, STATE_SAVE_RECOVERY_ADVICE
+            )
+        })?;
+    remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
 
     Ok(())
 }
@@ -279,8 +289,30 @@ fn remote_state_dir_error(error: RPCError) -> color_eyre::eyre::Report {
             "remote server does not support --profile-file state isolation; upgrade remote duet ({:?})",
             error
         ),
-        _ => eyre!("Couldn't set remote state dir: {:?}", error),
+        _ => remote_rpc_error("Couldn't set remote state dir", error),
     }
+}
+
+fn remote_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre::Report {
+    eyre!("{}: {}", context, rpc::render_rpc_error(&error))
+}
+
+fn post_preflight_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre::Report {
+    eyre!(
+        "{}: {}\n{}",
+        context,
+        rpc::render_rpc_error(&error),
+        POST_PREFLIGHT_RECOVERY_ADVICE
+    )
+}
+
+fn post_state_save_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre::Report {
+    eyre!(
+        "{}: {}\n{}",
+        context,
+        rpc::render_rpc_error(&error),
+        STATE_SAVE_RECOVERY_ADVICE
+    )
 }
 
 async fn stream_detailed_changes<R>(
@@ -310,11 +342,11 @@ where
     let remote_detail_stream = remote
         .begin_detail_stream(local_signatures, DETAIL_CHUNK_BYTES as u32)
         .await
-        .map_err(|e| eyre!("Couldn't begin remote detail stream: {:?}", e))?;
+        .map_err(|e| remote_rpc_error("Couldn't begin remote detail stream", e))?;
     let remote_apply_stream = remote
         .begin_apply_stream()
         .await
-        .map_err(|e| eyre!("Couldn't begin remote apply stream: {:?}", e))?;
+        .map_err(|e| remote_rpc_error("Couldn't begin remote apply stream", e))?;
 
     let mut local_done = false;
     let mut remote_done = false;
@@ -327,13 +359,15 @@ where
                     DETAIL_BATCH_PAYLOAD_BYTES as u32,
                 )
                 .await
-                .map_err(|e| eyre!("Couldn't read remote detail stream: {:?}", e))?;
+                .map_err(|e| post_preflight_rpc_error("Couldn't read remote detail stream", e))?;
             if frames.is_empty() {
                 remote_done = true;
             } else {
                 let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
                 for frame in frames {
-                    local_applier.apply_frame(frame)?;
+                    local_applier
+                        .apply_frame(frame)
+                        .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
                 }
                 advance_stream_progress(
                     &progress,
@@ -345,8 +379,9 @@ where
         }
 
         if !local_done {
-            let frames =
-                local_producer.next_frames(DETAIL_BATCH_FRAMES, DETAIL_BATCH_PAYLOAD_BYTES)?;
+            let frames = local_producer
+                .next_frames(DETAIL_BATCH_FRAMES, DETAIL_BATCH_PAYLOAD_BYTES)
+                .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
             if frames.is_empty() {
                 local_done = true;
             } else {
@@ -354,7 +389,9 @@ where
                 remote
                     .apply_detail_chunks(remote_apply_stream, frames)
                     .await
-                    .map_err(|e| eyre!("Couldn't apply remote detail stream: {:?}", e))?;
+                    .map_err(|e| {
+                        post_preflight_rpc_error("Couldn't apply remote detail stream", e)
+                    })?;
                 advance_stream_progress(
                     &progress,
                     &mut progress_position,
@@ -365,11 +402,13 @@ where
         }
     }
 
-    let local_all_old = local_applier.finish()?;
+    let local_all_old = local_applier
+        .finish()
+        .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
     remote
         .finish_apply_stream(remote_apply_stream)
         .await
-        .map_err(|e| eyre!("Couldn't finish remote apply stream: {:?}", e))?;
+        .map_err(|e| post_preflight_rpc_error("Couldn't finish remote apply stream", e))?;
     progress.finish_and_clear();
     Ok(local_all_old)
 }
@@ -462,7 +501,7 @@ fn server_info_error(error: RPCError) -> color_eyre::eyre::Report {
             "remote server does not support capability negotiation; upgrade remote duet ({:?})",
             error
         ),
-        _ => eyre!("Couldn't get remote server info: {:?}", error),
+        _ => remote_rpc_error("Couldn't get remote server info", error),
     }
 }
 

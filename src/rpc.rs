@@ -130,6 +130,63 @@ impl RemoteSyncError {
             message,
         }
     }
+
+    fn parse(message: &str) -> Option<Self> {
+        let mut lines = message.lines();
+        let version = lines
+            .next()?
+            .strip_prefix("duet-sync-error-v")?
+            .parse()
+            .ok()?;
+        let mut side = None;
+        let mut operation = None;
+        let mut path = None;
+        let mut kind = None;
+        let mut error_message = None;
+
+        while let Some(line) = lines.next() {
+            if let Some(value) = line.strip_prefix("side: ") {
+                side = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("operation: ") {
+                operation = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("path: ") {
+                path = Some(PathBuf::from(value));
+            } else if let Some(value) = line.strip_prefix("kind: ") {
+                kind = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("message: ") {
+                let mut full_message = value.to_string();
+                for continuation in lines {
+                    full_message.push('\n');
+                    full_message.push_str(continuation);
+                }
+                error_message = Some(full_message);
+                break;
+            }
+        }
+
+        Some(Self {
+            version,
+            side: side?,
+            operation: operation?,
+            path,
+            kind: kind?,
+            message: error_message?,
+        })
+    }
+
+    fn render_for_user(&self) -> String {
+        let mut rendered = format!("{} {} failed", self.side, self.operation);
+        if let Some(path) = &self.path {
+            rendered.push_str(&format!(" at {}", path.display()));
+        }
+        if self.kind != "other" {
+            rendered.push_str(&format!(" ({})", self.kind));
+        }
+        if let Some(summary) = first_error_line(&self.message) {
+            rendered.push_str(&format!(": {}", summary));
+        }
+        rendered
+    }
 }
 
 impl fmt::Display for RemoteSyncError {
@@ -158,6 +215,19 @@ fn classify_error_message(message: &str) -> &'static str {
         "not_directory"
     } else {
         "other"
+    }
+}
+
+fn first_error_line(message: &str) -> Option<&str> {
+    message.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+pub(crate) fn render_rpc_error(error: &RPCError) -> String {
+    let message = error.to_string();
+    if let Some(remote_error) = RemoteSyncError::parse(&message) {
+        remote_error.render_for_user()
+    } else {
+        format!("{:?}", error)
     }
 }
 
@@ -527,5 +597,24 @@ mod tests {
         assert!(formatted.contains("operation: save remote state"));
         assert!(formatted.contains("path: state.snp"));
         assert!(formatted.contains("kind: permission_denied"));
+    }
+
+    #[test]
+    fn remote_sync_error_parses_and_renders_for_users() {
+        let rpc_error = RPCError::new(
+            RPCErrorKind::Other,
+            RemoteSyncError::new(
+                "apply details",
+                Some(PathBuf::from("blocked/file.txt")),
+                io::Error::from(io::ErrorKind::PermissionDenied),
+            )
+            .to_string(),
+        );
+
+        let rendered = render_rpc_error(&rpc_error);
+
+        assert!(rendered.contains("remote apply details failed"));
+        assert!(rendered.contains("blocked/file.txt"));
+        assert!(rendered.contains("permission_denied"));
     }
 }
