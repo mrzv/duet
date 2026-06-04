@@ -55,7 +55,7 @@ pub(crate) async fn launch_server<'a>(
         Ok(Server::Remote(server))
     } else {
         let cmd = crate::full(&cmd)
-            .expect("Failed to expand command")
+            .map_err(|e| eyre!("failed to expand local server command {}: {}", cmd, e))?
             .to_string_lossy()
             .to_string();
         let server = TokioCommand::new(cmd)
@@ -74,26 +74,37 @@ pub(crate) async fn launch_server<'a>(
 
 pub(crate) fn get_remote<'a>(
     server: &'a mut Server,
-) -> crate::rpc::DuetServerAsyncRPCClient<
-    BincodeAsyncClientTransport<
-        ReadWriteTokio<AsyncBufReader<StdoutWrapper>, AsyncBufWriter<StdinWrapper>>,
+) -> Result<
+    crate::rpc::DuetServerAsyncRPCClient<
+        BincodeAsyncClientTransport<
+            ReadWriteTokio<AsyncBufReader<StdoutWrapper>, AsyncBufWriter<StdinWrapper>>,
+        >,
     >,
 > {
     let (server_in, server_out) = match server {
         Server::Local(server) => {
-            let server_in = server.stdin.take().expect("Failed to open local stdin");
-            let server_out = server.stdout.take().expect("Failed to read local stdout");
+            let server_in = server
+                .stdin
+                .take()
+                .ok_or_else(|| eyre!("failed to open local server stdin"))?;
+            let server_out = server
+                .stdout
+                .take()
+                .ok_or_else(|| eyre!("failed to open local server stdout"))?;
             (
                 StdinWrapper::TokioStdin(server_in),
                 StdoutWrapper::TokioStdout(server_out),
             )
         }
         Server::Remote(server) => {
-            let server_in = server.stdin().take().expect("Failed to open remote stdin");
+            let server_in = server
+                .stdin()
+                .take()
+                .ok_or_else(|| eyre!("failed to open remote server stdin"))?;
             let server_out = server
                 .stdout()
                 .take()
-                .expect("Failed to open remote stdout");
+                .ok_or_else(|| eyre!("failed to open remote server stdout"))?;
             (
                 StdinWrapper::OpensshStdin(server_in),
                 StdoutWrapper::OpensshStdout(server_out),
@@ -106,7 +117,9 @@ pub(crate) fn get_remote<'a>(
         AsyncBufWriter::new(server_in),
     );
 
-    DuetServerAsyncRPCClient::new(BincodeAsyncClientTransport::new(server_io))
+    Ok(DuetServerAsyncRPCClient::new(
+        BincodeAsyncClientTransport::new(server_io),
+    ))
 }
 
 use crate::rpc::DuetServerAsyncRPCClient;

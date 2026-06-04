@@ -23,7 +23,7 @@ use std::path::PathBuf;
 #[tokio::main]
 #[quit::main]
 pub async fn main() -> Result<()> {
-    color_eyre::install().unwrap();
+    color_eyre::install()?;
 
     match cli::parse_from_env()? {
         Command::Help => commands::show_help(),

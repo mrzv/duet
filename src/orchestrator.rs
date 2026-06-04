@@ -47,7 +47,7 @@ pub async fn sync(
     options: SyncOptions,
 ) -> Result<()> {
     env_logger::init();
-    install_ctrlc_handler();
+    install_ctrlc_handler()?;
 
     let SyncContext {
         profile: prf,
@@ -77,7 +77,7 @@ pub async fn sync(
             eprintln!("Failed to start server ({})", e.to_string().cyan());
             quit::with_code(SERVER_ERROR_CODE);
         });
-    let remote = remote::get_remote(&mut server);
+    let remote = remote::get_remote(&mut server)?;
 
     let remote_path = path.clone();
     let remote_locations = prf.locations.clone();
@@ -86,7 +86,7 @@ pub async fn sync(
         remote
             .set_base(remote_base)
             .await
-            .expect("Couldn't set server base");
+            .map_err(|e| eyre!("Couldn't set server base: {:?}", e))?;
         let remote_info = remote.server_info().await.map_err(server_info_error)?;
         if let Some(remote_state_dir) = remote_state_dir {
             require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
@@ -103,7 +103,7 @@ pub async fn sync(
     };
 
     let (local_result, remote_result) = tokio::join!(local_fut, remote_fut);
-    let (mut local_all_old, local_changes) = local_result.expect("Couldn't get local changes");
+    let (mut local_all_old, local_changes) = local_result?;
     let (remote_changes, remote_info) = remote_result?;
 
     let mut actions = build_actions(&local_changes, &remote_changes);
@@ -135,7 +135,7 @@ pub async fn sync(
     remote
         .set_actions(remote_actions)
         .await
-        .expect("Failed to set remote actions");
+        .map_err(|e| eyre!("Failed to set remote actions: {:?}", e))?;
     log::debug!("set remote actions");
 
     let local_signatures_fut = {
@@ -146,8 +146,9 @@ pub async fn sync(
     let remote_signatures_fut = remote.get_signatures();
     let (local_signatures, remote_signatures) =
         tokio::join!(local_signatures_fut, remote_signatures_fut);
-    let local_signatures = local_signatures?.expect("couldn't get local signatures");
-    let remote_signatures = remote_signatures.expect("couldn't get remote signatures");
+    let local_signatures = local_signatures.wrap_err("local signature task failed")??;
+    let remote_signatures =
+        remote_signatures.map_err(|e| eyre!("couldn't get remote signatures: {:?}", e))?;
     log::debug!(
         "{} local signatures; {} remote signatures",
         local_signatures.len(),
@@ -177,9 +178,9 @@ pub async fn sync(
         let (local_detailed_changes, remote_detailed_changes) =
             tokio::join!(local_detailed_changes_fut, remote_detailed_changes_fut);
         let local_detailed_changes =
-            local_detailed_changes?.expect("couldn't get local detailed changes");
-        let remote_detailed_changes =
-            remote_detailed_changes.expect("couldn't get remote detailed changes");
+            local_detailed_changes.wrap_err("local detailed changes task failed")??;
+        let remote_detailed_changes = remote_detailed_changes
+            .map_err(|e| eyre!("couldn't get remote detailed changes: {:?}", e))?;
         log::debug!("got detailed changes");
 
         let local_apply_fut = {
@@ -221,12 +222,13 @@ pub async fn sync(
     Ok(())
 }
 
-fn install_ctrlc_handler() {
+fn install_ctrlc_handler() -> Result<()> {
     ctrlc::set_handler(|| {
         eprintln!("\nQuitting");
         quit::with_code(CTRLC_CODE);
     })
-    .expect("Error setting Ctrl-C handler");
+    .wrap_err("failed to install Ctrl-C handler")?;
+    Ok(())
 }
 
 fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncContext> {

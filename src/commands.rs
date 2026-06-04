@@ -75,7 +75,10 @@ pub(crate) async fn snapshot(name: String, statefile: Option<PathBuf>) -> Result
     let current_entries =
         state::scan_entries(&local_base, &PathBuf::from(""), &prf.locations, &prf.ignore).await?;
 
-    let statefile = statefile.unwrap_or(profile::local_state(&name));
+    let statefile = match statefile {
+        Some(statefile) => statefile,
+        None => profile::local_state(&name)?,
+    };
     state::save_entries(&statefile, &current_entries)?;
     Ok(())
 }
@@ -87,7 +90,10 @@ pub(crate) async fn changes(name: String, statefile: Option<PathBuf>) -> Result<
 
     let local_base = full(&prf.local)?;
 
-    let statefile = statefile.unwrap_or(profile::local_state(&name));
+    let statefile = match statefile {
+        Some(statefile) => statefile,
+        None => profile::local_state(&name)?,
+    };
 
     let (_, changes) = state::old_and_changes(
         &local_base,
@@ -109,7 +115,7 @@ pub(crate) fn info(name: String) -> Result<()> {
     println!(
         "Profile {} located at {}",
         name.cyan(),
-        profile::location(&name).display().to_string().yellow()
+        profile::location(&name)?.display().to_string().yellow()
     );
     Ok(())
 }

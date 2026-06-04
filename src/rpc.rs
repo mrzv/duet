@@ -108,17 +108,17 @@ struct DuetServerImpl {
 }
 
 impl DuetServerImpl {
-    fn new() -> Self {
-        DuetServerImpl {
+    fn new() -> Result<Self> {
+        Ok(DuetServerImpl {
             base: PathBuf::from(""),
             remote_id: "".to_string(),
-            remote_state_dir: profile::remote_state_dir(),
+            remote_state_dir: profile::remote_state_dir()?,
             all_old: Vec::new(),
             actions: Vec::new(),
             detail_streams: HashMap::new(),
             apply_streams: HashMap::new(),
             next_stream_id: 1,
-        }
+        })
     }
 
     fn next_detail_stream_id(&mut self) -> DetailStreamId {
@@ -443,9 +443,10 @@ pub async fn server() -> Result<()> {
 
     log::debug!("in server()");
 
-    tokio::task::spawn_blocking(|| {
-        let mut serve =
-            DuetServerRPCServer::new(DuetServerImpl::new(), BincodeTransport::new(stdio));
+    let server_impl = DuetServerImpl::new()?;
+
+    tokio::task::spawn_blocking(move || {
+        let mut serve = DuetServerRPCServer::new(server_impl, BincodeTransport::new(stdio));
         if let Err(e) = serve.serve() {
             if e.kind != RPCErrorKind::TransportEOF {
                 log::error!("RPC server stopped with error: {:?}", e);
@@ -463,7 +464,7 @@ mod tests {
 
     #[test]
     fn server_info_advertises_protocol_and_capabilities() {
-        let info = DuetServerImpl::new().server_info().unwrap();
+        let info = DuetServerImpl::new().unwrap().server_info().unwrap();
 
         assert_eq!(info.protocol_version, PROTOCOL_VERSION);
         assert_eq!(info.duet_version, built_info::PKG_VERSION);
