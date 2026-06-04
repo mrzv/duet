@@ -18,6 +18,7 @@ use crate::rustsync::{compare, compare_stream, restore_seek, signature, DeltaOp}
 pub use crate::rustsync::{Delta, Signature};
 
 const WINDOW: usize = 1024; // TODO: figure out appropriate window size
+const SYNCED_MODE_MASK: u32 = 0o7777;
 static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1510,7 +1511,7 @@ fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
         .wrap_err_with(|| format!("failed to read metadata for {}", path.display()))?;
     if !e.is_symlink() {
         let mut perms = meta.permissions();
-        perms.set_mode(e.mode());
+        perms.set_mode(synced_mode(e.mode()));
         fs::set_permissions(path, perms)
             .wrap_err_with(|| format!("failed to set permissions for {}", path.display()))?;
     }
@@ -1523,6 +1524,10 @@ fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
     let mut new_entry = e.clone();
     new_entry.set_ino(meta.ino());
     Ok(new_entry)
+}
+
+fn synced_mode(mode: u32) -> u32 {
+    mode & SYNCED_MODE_MASK
 }
 
 #[cfg(test)]
@@ -1599,5 +1604,12 @@ mod tests {
 
         output.finish().unwrap();
         assert!(final_path.exists());
+    }
+
+    #[test]
+    fn synced_mode_masks_file_type_bits() {
+        assert_eq!(synced_mode(0o100644), 0o644);
+        assert_eq!(synced_mode(0o40755), 0o755);
+        assert_eq!(synced_mode(0o104755), 0o4755);
     }
 }

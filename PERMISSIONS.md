@@ -11,8 +11,8 @@ Duet has two separate permission concerns:
   launch the server, and save state.
 
 The highest-risk bugs around permission failures being mistaken for deletions
-have been fixed. The remaining work is mostly hardening, transactionality,
-structured diagnostics, and documenting the exact metadata model.
+have been fixed. The remaining work is mostly transactionality, recovery policy,
+and fuller diagnostics for setup and platform-specific permission models.
 
 ## Fixed And Tested
 
@@ -31,13 +31,20 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
 - Apply-side filesystem panics for remove/create/symlink/chmod/mtime paths were
   converted to `Result` errors with path context.
 - Local and remote apply both run a preflight check before applying detailed
-  changes.
+  changes. Preflight now checks source reads, destination metadata targets,
+  destination parent availability/writability for common mutations, and local and
+  remote state-save paths before filesystem mutation starts.
 - Already-synced read-only destination directories can be temporarily made
   writable for child file updates and then restored.
-- Remote RPC handlers preserve more underlying error context than the old
-  generic messages.
+- Remote RPC handlers wrap sync failures in a structured `RemoteSyncError`
+  envelope with side, operation, optional path, classified error kind, and source
+  message.
 - Streamed apply temp files use bounded-length names, so long destination file
   names no longer create overlong temporary path components.
+- Setup/orchestration paths that previously used permission-triggerable
+  `expect`/`unwrap` calls now return contextual errors.
+- Applied Unix modes are masked to permission/special bits before `chmod`, so
+  file-type bits from `symlink_metadata` are not passed back to the OS.
 
 ## Remaining Work
 
@@ -55,69 +62,67 @@ Remaining work:
 - Save state only after both sides have committed, with clear recovery guidance
   if state save fails after filesystem mutation.
 
-### 2. Preflight Coverage Is Incomplete
+### 2. Preflight Is Still Best-Effort
 
-The current preflight focuses on destination parent write failures caused by a
-directory being made read-only, plus support for temporarily chmodding existing
-read-only destination directories. It does not prove every later operation will
-succeed.
+Current preflight catches common permission failures before mutation, including
+source reads, destination parent/metadata checks, and local/remote state-save
+paths. It is still a snapshot: the filesystem can change after preflight, and
+some capabilities cannot be proven without attempting the operation.
 
 Remaining work:
 
-- Preflight source readability for all files that will be checksummed,
-  signatured, or transferred.
-- Preflight destination remove/create/rename capability for all affected paths.
-- Preflight chmod and utime capability for metadata-only changes.
-- Preflight local and remote state-file writability before filesystem mutation.
+- Improve chmod and utime preflight where ownership/platform support makes that
+  possible.
+- Expand preflight coverage for less common replacement/remove combinations as
+  they are found.
 - Treat races between preflight and apply as normal errors with recovery advice.
 
-### 3. Remote Errors Are Not Yet Structured
+### 3. Remote Errors Are Only Partly Structured
 
-Remote errors now include more context, but they are still serialized mostly as
-strings inside `RPCErrorKind::Other`. They do not consistently expose side,
-operation, path, OS error kind, and source chain as structured data.
+Remote sync errors now use a structured `RemoteSyncError` envelope inside
+`RPCErrorKind::Other`. This is a practical improvement over generic strings, but
+it is not a complete end-to-end error model yet.
 
 Remaining work:
 
-- Define a serializable sync error type with fields for side, operation, path,
-  OS error kind, and message/source chain.
-- Use that type across scan, state, transfer, apply, and server setup paths.
-- Preserve structured error details through streamed detail/apply RPCs.
-- Render concise user-facing messages from the structured errors.
+- Promote the envelope into a shared sync error type instead of an RPC-only
+  wrapper.
+- Preserve structured source chains without relying on formatted debug strings.
+- Add client-side parsing/rendering so user-facing messages are concise while
+  retaining machine-readable fields.
+- Extend structured setup errors for server launch, SSH, profile, and log/state
+  setup paths that fail before the normal RPC server is running.
 
 ### 4. Permission Model Is Still Unix Mode Bits Only
 
 Duet records and syncs mode bits, but it does not sync ownership, ACLs, xattrs,
 or platform-specific permission models. Symlink permissions are intentionally
-ignored.
+ignored. When applying metadata, Duet masks the recorded mode to Unix
+permission/special bits (`0o7777`) before calling `chmod`.
 
 Remaining work:
 
 - Document the supported metadata model in user-facing docs: Unix mode bits and
   mtimes, not ownership/ACLs/xattrs.
-- Mask modes to permission bits when calling `chmod` instead of applying the
-  full metadata mode from `symlink_metadata`.
 - Decide whether uid/gid support is in scope. If it is, gate it behind explicit
   capability checks and clear behavior for non-root users.
 
-### 5. Server, Profile, And SSH Setup Still Have Panic Or Weak-Diagnostic Paths
+### 5. Server, Profile, And SSH Setup Still Need Better Diagnostics
 
-Some setup paths can still panic or produce generic errors before normal sync
-error handling is established.
+Most permission-triggerable setup `expect`/`unwrap` paths in profile loading,
+remote command expansion, RPC setup, and orchestration have been converted to
+contextual errors. Some setup failures still happen before normal sync error
+handling is established and can produce weak diagnostics.
 
 Known examples:
 
-- `src/profile.rs` unwraps `shellexpand::full("~/.config/duet/")`.
-- `src/remote.rs` still uses `expect("Failed to expand command")` for local
-  server command expansion.
-- `src/orchestrator.rs` still uses `expect` around some remote RPC setup and
-  transfer calls such as `set_base`, `set_actions`, signatures, and details.
 - SSH key permission failures rely on OpenSSH output and do not provide a
   targeted `chmod 600` hint.
+- Server startup failures before RPC initialization still depend on child
+  process stderr/log context.
 
 Remaining work:
 
-- Convert setup `unwrap`/`expect` calls to `Result` with operation/path context.
 - Add targeted SSH diagnostics for common key-permission failures.
 - Preserve remote server startup failures with enough context to identify log,
   config, state, temp, and base-path permission problems.
@@ -148,11 +153,10 @@ Remaining work:
 
 ## Current Priority Order
 
-1. Replace remaining setup/orchestration `expect` calls that can be triggered by
-   permission or environment failures.
-2. Expand preflight to cover state writability, chmod/utime, source reads, and
-   destination operations.
-3. Add structured sync errors across RPC boundaries.
-4. Document and tighten the Unix mode-bit metadata model.
-5. Design a transactional or resumable apply protocol.
+1. Design a transactional or resumable apply protocol.
+2. Add recovery advice for races and post-preflight failures.
+3. Promote `RemoteSyncError` into an end-to-end structured error model with
+   client-side rendering.
+4. Add targeted SSH/server-startup diagnostics.
+5. Document the user-facing metadata model outside this internal status file.
 6. Decide whether permission-denied skip/per-file recovery is in scope.
