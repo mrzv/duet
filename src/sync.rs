@@ -370,6 +370,25 @@ fn record_committed_action(attempt_state: Option<&Path>, action: &Action) -> Res
     Ok(())
 }
 
+fn record_staged_file(attempt_state: Option<&Path>, path: &Path) -> Result<()> {
+    let Some(state_path) = attempt_state else {
+        return Ok(());
+    };
+    let marker_path = apply_attempt_path(state_path)?;
+    let line = format!("staged-file: {}\n", path.display());
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&marker_path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .wrap_err_with(|| {
+            format!(
+                "unable to record staged file in apply recovery marker {}",
+                marker_path.display()
+            )
+        })?;
+    Ok(())
+}
+
 fn applied_change(action: &Action) -> Option<&Change> {
     match action {
         Action::Local(change) | Action::ResolvedLocal((_, _), change) => Some(change),
@@ -507,6 +526,7 @@ fn entry_operation(prefix: &'static str, entry: &Entry) -> &'static str {
 struct ApplyAttemptMarker {
     phase: Option<String>,
     operations: Vec<String>,
+    staged_files: Vec<String>,
     committed_operations: Vec<String>,
 }
 
@@ -517,6 +537,8 @@ fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
             parsed.phase = Some(phase.to_string());
         } else if let Some(operation) = line.strip_prefix("operation: ") {
             parsed.operations.push(operation.to_string());
+        } else if let Some(path) = line.strip_prefix("staged-file: ") {
+            parsed.staged_files.push(path.to_string());
         } else if let Some(operation) = line.strip_prefix("committed-operation: ") {
             parsed.committed_operations.push(operation.to_string());
         }
@@ -568,6 +590,11 @@ fn apply_attempt_recovery_advice(marker: &str) -> String {
     if !marker.committed_operations.is_empty() {
         advice.push_str(
             " The marker records committed operations; inspect those paths first before removing the marker.",
+        );
+    }
+    if !marker.staged_files.is_empty() {
+        advice.push_str(
+            " The marker lists staged temporary files that may be safe to remove after inspection if they were not renamed into place.",
         );
     }
 
@@ -1122,6 +1149,10 @@ impl TempOutput {
         })?;
         Ok(())
     }
+
+    fn temp_path(&self) -> &Path {
+        &self.temp_path
+    }
 }
 
 struct WritableDirGuard {
@@ -1430,6 +1461,7 @@ impl DetailApplier {
         self.prepare_action(action_index);
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         let output = TempOutput::new(filename)?;
+        record_staged_file(self.attempt_state.as_deref(), output.temp_path())?;
         self.state = Some(ApplyState::File {
             action_index,
             output,
@@ -1442,6 +1474,7 @@ impl DetailApplier {
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         let source = fs::File::open(&filename)?;
         let output = TempOutput::new(filename)?;
+        record_staged_file(self.attempt_state.as_deref(), output.temp_path())?;
         self.state = Some(ApplyState::Diff {
             action_index,
             source,
@@ -1657,7 +1690,7 @@ pub fn apply_detailed_changes(
                         } else {
                             log::debug!("Adding {}", e.path().display());
                             let detail = next_detail(&mut details_iter, e.path())?;
-                            create_file(&filename, detail)?;
+                            create_file(&filename, detail, attempt_state)?;
                             new_entries.push(update_meta(&filename, e)?);
                         }
                     }
@@ -1669,7 +1702,7 @@ pub fn apply_detailed_changes(
                                     let detail = next_detail(&mut details_iter, e2.path())?;
                                     match detail {
                                         ChangeDetails::Diff(delta) => {
-                                            update_file_with_diff(&filename, delta)?;
+                                            update_file_with_diff(&filename, delta, attempt_state)?;
                                         }
                                         _ => {
                                             return Err(eyre!(
@@ -1713,7 +1746,7 @@ pub fn apply_detailed_changes(
                             })?;
                             if e2.is_file() {
                                 let detail = next_detail(&mut details_iter, e2.path())?;
-                                create_file(&filename, detail)?;
+                                create_file(&filename, detail, attempt_state)?;
                                 new_entries.push(update_meta(&filename, e2)?);
                             } else if let Some(p) = e2.target() {
                                 std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
@@ -1810,7 +1843,7 @@ pub fn apply_detailed_changes(
                                 let detail = details_iter.next().ok_or_else(|| {
                                     eyre!("missing detail for {}", e2.path().display())
                                 })?;
-                                create_file(&dirname, detail)?;
+                                create_file(&dirname, detail, attempt_state)?;
                             }
                         }
                         new_entries.push(update_meta(&dirname, e2)?);
@@ -1833,9 +1866,13 @@ pub fn apply_detailed_changes(
     Ok(())
 }
 
-fn create_file(filename: &Path, detail: &ChangeDetails) -> Result<()> {
+fn create_file(
+    filename: &Path,
+    detail: &ChangeDetails,
+    attempt_state: Option<&Path>,
+) -> Result<()> {
     match detail {
-        ChangeDetails::Contents(v) => create_file_with_contents(filename, v),
+        ChangeDetails::Contents(v) => create_file_with_contents(filename, v, attempt_state),
         _ => Err(eyre!(
             "mismatch when adding {}, expected Contents, but not found",
             filename.display()
@@ -1843,8 +1880,13 @@ fn create_file(filename: &Path, detail: &ChangeDetails) -> Result<()> {
     }
 }
 
-fn create_file_with_contents(filename: &Path, data: &[u8]) -> Result<()> {
+fn create_file_with_contents(
+    filename: &Path,
+    data: &[u8],
+    attempt_state: Option<&Path>,
+) -> Result<()> {
     let mut output = TempOutput::new(filename.to_path_buf())?;
+    record_staged_file(attempt_state, output.temp_path())?;
     output
         .file
         .as_mut()
@@ -1854,10 +1896,15 @@ fn create_file_with_contents(filename: &Path, data: &[u8]) -> Result<()> {
     output.finish()
 }
 
-fn update_file_with_diff(filename: &Path, delta: &Delta) -> Result<()> {
+fn update_file_with_diff(
+    filename: &Path,
+    delta: &Delta,
+    attempt_state: Option<&Path>,
+) -> Result<()> {
     let source = fs::File::open(filename)
         .wrap_err_with(|| format!("failed to open file {}", filename.display()))?;
     let mut output = TempOutput::new(filename.to_path_buf())?;
+    record_staged_file(attempt_state, output.temp_path())?;
     let output_file = output
         .file
         .as_mut()
@@ -1986,10 +2033,12 @@ mod tests {
         fs::create_dir(&base).unwrap();
 
         start_apply_attempt("local", &state, &base, &actions, Some("attempt-1")).unwrap();
+        record_staged_file(Some(&state), &base.join(".duet-part-test")).unwrap();
         record_committed_action(Some(&state), &actions[0]).unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("attempt-id: attempt-1"), "{}", marker);
         assert!(marker.contains("operation: add-file a.txt"), "{}", marker);
+        assert!(marker.contains("staged-file: "), "{}", marker);
         assert!(
             marker.contains("committed-operation: add-file a.txt"),
             "{}",
@@ -2005,6 +2054,7 @@ mod tests {
         mark_apply_attempt_state_save("local", &state, &base, &actions, Some("attempt-1")).unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("attempt-id: attempt-1"), "{}", marker);
+        assert!(!marker.contains("staged-file: "), "{}", marker);
         assert!(
             marker.contains("committed-operation: add-file a.txt"),
             "{}",
@@ -2021,7 +2071,7 @@ mod tests {
 
     #[test]
     fn apply_attempt_recovery_advice_uses_operation_summaries() {
-        let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\ncommitted-operation: modify-file contents.txt\n";
+        let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\nstaged-file: /tmp/.duet-part-test\ncommitted-operation: modify-file contents.txt\n";
 
         let advice = apply_attempt_recovery_advice(marker);
 
@@ -2033,5 +2083,6 @@ mod tests {
             advice
         );
         assert!(advice.contains("committed operations"), "{}", advice);
+        assert!(advice.contains("staged temporary files"), "{}", advice);
     }
 }
