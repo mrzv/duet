@@ -38,7 +38,8 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   writable for child file updates and then restored.
 - Remote RPC handlers wrap sync failures in a shared `StructuredSyncError`
   envelope with side, operation, optional path, classified error kind, and source
-  message.
+  message. Where errors expose a source chain, the envelope now preserves it as
+  structured `source:` entries instead of relying only on formatted debug text.
 - Streamed apply temp files use bounded-length names, so long destination file
   names no longer create overlong temporary path components.
 - Setup/orchestration paths that previously used permission-triggerable
@@ -140,12 +141,14 @@ end-to-end error model yet.
 
 The client parses this envelope for concise remote error rendering. Local setup
 paths can also use the same renderer for classified user-facing diagnostics. The
-original RPC payload remains line-oriented and machine-readable, but source
-chains are still carried as formatted debug text.
+original RPC payload remains line-oriented and machine-readable. Source chains
+are now preserved as structured `source:` lines when the error exposes them,
+though some call sites still only provide formatted messages.
 
 Remaining work:
 
-- Preserve structured source chains without relying on formatted debug strings.
+- Convert remaining formatted-message call sites to typed errors with structured
+  source chains where practical.
 - Extend structured setup errors to remaining log/state setup paths that fail
   before the normal RPC server is running.
 

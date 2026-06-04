@@ -85,7 +85,7 @@ pub async fn sync(
         .await
         .unwrap_or_else(|e| {
             let diagnostic =
-                sync_error::render_error("setup", "launch server", Some(server_log.clone()), e);
+                sync_error::render_report("setup", "launch server", Some(server_log.clone()), e);
             eprintln!("{}", diagnostic.cyan());
             quit::with_code(SERVER_ERROR_CODE);
         });
@@ -303,7 +303,7 @@ fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncC
     let local_base = crate::full(&config.profile.local).map_err(|e| {
         eyre!(
             "{}",
-            sync_error::render_error(
+            sync_error::render_report(
                 "setup",
                 "resolve local base",
                 Some(PathBuf::from(&config.profile.local)),
@@ -315,7 +315,7 @@ fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncC
         .map_err(|e| {
             eyre!(
                 "{}",
-                sync_error::render_error("setup", "parse remote", None, e)
+                sync_error::render_report("setup", "parse remote", None, e)
             )
         })?;
 

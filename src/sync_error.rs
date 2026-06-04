@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use color_eyre::eyre::Report;
 use essrpc::RPCError;
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +12,7 @@ pub struct StructuredSyncError {
     pub operation: String,
     pub path: Option<PathBuf>,
     pub kind: String,
+    pub sources: Vec<String>,
     pub message: String,
 }
 
@@ -31,19 +33,46 @@ impl StructuredSyncError {
         path: Option<PathBuf>,
         message: impl Into<String>,
     ) -> Self {
+        Self::from_message_and_sources(side, operation, path, message, Vec::new())
+    }
+
+    fn from_message_and_sources(
+        side: impl Into<String>,
+        operation: impl Into<String>,
+        path: Option<PathBuf>,
+        message: impl Into<String>,
+        sources: Vec<String>,
+    ) -> Self {
         let message = message.into();
+        let classification_text = if sources.is_empty() {
+            message.clone()
+        } else {
+            format!("{}\n{}", message, sources.join("\n"))
+        };
         Self {
             version: 1,
             side: side.into(),
             operation: operation.into(),
             path,
-            kind: classify_error_message(&message).to_string(),
+            kind: classify_error_message(&classification_text).to_string(),
+            sources,
             message,
         }
     }
 
     pub fn remote(operation: &str, path: Option<PathBuf>, error: impl fmt::Debug) -> Self {
         Self::new("remote", operation, path, error)
+    }
+
+    pub fn from_report(
+        side: impl Into<String>,
+        operation: impl Into<String>,
+        path: Option<PathBuf>,
+        report: Report,
+    ) -> Self {
+        let message = report.to_string();
+        let sources = report.chain().skip(1).map(ToString::to_string).collect();
+        Self::from_message_and_sources(side, operation, path, message, sources)
     }
 
     pub fn parse(message: &str) -> Option<Self> {
@@ -57,6 +86,7 @@ impl StructuredSyncError {
         let mut operation = None;
         let mut path = None;
         let mut kind = None;
+        let mut sources = Vec::new();
         let mut error_message = None;
 
         while let Some(line) = lines.next() {
@@ -68,6 +98,8 @@ impl StructuredSyncError {
                 path = Some(PathBuf::from(value));
             } else if let Some(value) = line.strip_prefix("kind: ") {
                 kind = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("source: ") {
+                sources.push(value.to_string());
             } else if let Some(value) = line.strip_prefix("message: ") {
                 let mut full_message = value.to_string();
                 for continuation in lines {
@@ -85,6 +117,7 @@ impl StructuredSyncError {
             operation: operation?,
             path,
             kind: kind?,
+            sources,
             message: error_message?,
         })
     }
@@ -99,6 +132,9 @@ impl StructuredSyncError {
         }
         if let Some(summary) = first_error_line(&self.message) {
             rendered.push_str(&format!(": {}", summary));
+        }
+        if let Some(source) = self.sources.first() {
+            rendered.push_str(&format!("; caused by: {}", source));
         }
         if let Some(recovery) = recovery_line(&self.message) {
             rendered.push('\n');
@@ -117,6 +153,9 @@ impl fmt::Display for StructuredSyncError {
             writeln!(f, "path: {}", path.display())?;
         }
         writeln!(f, "kind: {}", self.kind)?;
+        for source in &self.sources {
+            writeln!(f, "source: {}", single_line(source))?;
+        }
         write!(f, "message: {}", self.message)
     }
 }
@@ -137,6 +176,15 @@ pub fn render_error(
     error: impl fmt::Debug,
 ) -> String {
     StructuredSyncError::new(side, operation, path, error).render_for_user()
+}
+
+pub fn render_report(
+    side: impl Into<String>,
+    operation: impl Into<String>,
+    path: Option<PathBuf>,
+    report: Report,
+) -> String {
+    StructuredSyncError::from_report(side, operation, path, report).render_for_user()
 }
 
 pub fn render_message(
@@ -164,6 +212,10 @@ fn classify_error_message(message: &str) -> &'static str {
     }
 }
 
+fn single_line(value: &str) -> String {
+    value.replace('\n', " ")
+}
+
 fn first_error_line(message: &str) -> Option<&str> {
     message.lines().map(str::trim).find(|line| !line.is_empty())
 }
@@ -179,6 +231,7 @@ fn recovery_line(message: &str) -> Option<&str> {
 mod tests {
     use std::io;
 
+    use color_eyre::eyre::{eyre, WrapErr};
     use essrpc::{RPCError, RPCErrorKind};
 
     use super::*;
@@ -230,6 +283,7 @@ mod tests {
             operation: "check apply recovery".to_string(),
             path: Some(PathBuf::from("profile.remotes/state")),
             kind: "other".to_string(),
+            sources: Vec::new(),
             message: "previous Duet apply attempt did not finish\nRecovery: filesystem changes were applied, but Duet state may not have been saved on this side."
                 .to_string(),
         };
@@ -255,5 +309,26 @@ mod tests {
         assert!(rendered.contains("permission_denied"));
         assert!(rendered.contains("Try chmod 600"));
         assert!(!rendered.contains("\"Permission denied"));
+    }
+
+    #[test]
+    fn structured_sync_error_preserves_source_chain() {
+        let report = Err::<(), _>(eyre!("inner permission denied"))
+            .wrap_err("outer setup failed")
+            .unwrap_err();
+        let error = StructuredSyncError::from_report(
+            "setup",
+            "launch server",
+            Some(PathBuf::from("remote.log")),
+            report,
+        );
+        let formatted = error.to_string();
+        let parsed = StructuredSyncError::parse(&formatted).unwrap();
+        let rendered = parsed.render_for_user();
+
+        assert_eq!(parsed.kind, "permission_denied");
+        assert_eq!(parsed.sources, vec!["inner permission denied"]);
+        assert!(formatted.contains("source: inner permission denied"));
+        assert!(rendered.contains("caused by: inner permission denied"));
     }
 }
