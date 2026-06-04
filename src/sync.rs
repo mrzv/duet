@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -229,6 +229,85 @@ pub fn preflight_state_save(state_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn check_apply_attempt_clear(state_path: &Path) -> Result<()> {
+    let marker_path = apply_attempt_path(state_path)?;
+    if !marker_path.try_exists().wrap_err_with(|| {
+        format!(
+            "unable to check apply recovery marker {}",
+            marker_path.display()
+        )
+    })? {
+        return Ok(());
+    }
+
+    let marker = fs::read_to_string(&marker_path).wrap_err_with(|| {
+        format!(
+            "unable to read apply recovery marker {}",
+            marker_path.display()
+        )
+    })?;
+    Err(eyre!(
+        "previous Duet apply attempt did not finish: {}\n{}\nRecovery: inspect both sides for partially applied changes, fix any permission or state-storage problem, then remove this marker and rerun Duet.",
+        marker_path.display(),
+        marker.trim_end()
+    ))
+}
+
+pub fn start_apply_attempt(side: &str, state_path: &Path, base: &Path) -> Result<()> {
+    check_apply_attempt_clear(state_path)?;
+    let marker_path = apply_attempt_path(state_path)?;
+    if let Some(parent) = marker_path.parent() {
+        fs::create_dir_all(parent).wrap_err_with(|| {
+            format!(
+                "unable to create apply recovery marker directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let contents = format!(
+        "duet-apply-attempt-v1\nside: {}\nbase: {}\nstate: {}\nphase: apply-or-state-save\n",
+        side,
+        base.display(),
+        state_path.display()
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .wrap_err_with(|| {
+            format!(
+                "unable to create apply recovery marker {}",
+                marker_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+pub fn finish_apply_attempt(state_path: &Path) -> Result<()> {
+    let marker_path = apply_attempt_path(state_path)?;
+    match fs::remove_file(&marker_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).wrap_err_with(|| {
+            format!(
+                "unable to remove apply recovery marker {}",
+                marker_path.display()
+            )
+        }),
+    }
+}
+
+fn apply_attempt_path(state_path: &Path) -> Result<PathBuf> {
+    let file_name = state_path.file_name().ok_or_else(|| {
+        eyre!(
+            "state file {} has no file name for apply recovery marker",
+            state_path.display()
+        )
+    })?;
+    Ok(state_path.with_file_name(format!(".{}.duet-apply", file_name.to_string_lossy())))
 }
 
 fn preflight_directory_writable_or_creatable(path: &Path, description: &str) -> Result<()> {
@@ -1611,5 +1690,22 @@ mod tests {
         assert_eq!(synced_mode(0o100644), 0o644);
         assert_eq!(synced_mode(0o40755), 0o755);
         assert_eq!(synced_mode(0o104755), 0o4755);
+    }
+
+    #[test]
+    fn apply_attempt_marker_blocks_until_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+
+        start_apply_attempt("local", &state, &base).unwrap();
+        let error = check_apply_attempt_clear(&state).unwrap_err().to_string();
+
+        assert!(error.contains("previous Duet apply attempt did not finish"));
+        assert!(error.contains("side: local"));
+
+        finish_apply_attempt(&state).unwrap();
+        check_apply_attempt_clear(&state).unwrap();
     }
 }

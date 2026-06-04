@@ -64,6 +64,8 @@ pub async fn sync(
         server_log,
     } = prepare_context(source, path)?;
 
+    sync_ops::check_apply_attempt_clear(&local_state)?;
+
     let local_fut = state::old_and_changes(
         &local_base,
         &path,
@@ -164,6 +166,7 @@ pub async fn sync(
 
     let local_all_old = if can_stream_details {
         log::debug!("streaming detailed changes");
+        sync_ops::start_apply_attempt("local", &local_state, &local_base)?;
         stream_detailed_changes(
             &remote,
             &local_base,
@@ -190,6 +193,7 @@ pub async fn sync(
             .map_err(|e| remote_rpc_error("couldn't get remote detailed changes", e))?;
         log::debug!("got detailed changes");
 
+        sync_ops::start_apply_attempt("local", &local_state, &local_base)?;
         let local_apply_fut = {
             let local_base = local_base.clone();
             let actions = actions.clone();
@@ -213,11 +217,12 @@ pub async fn sync(
     };
 
     let local_state_display = local_state.display().to_string();
+    let local_state_for_save = local_state.clone();
     let (remote_result, local_result) = tokio::join!(
         remote.save_state(),
         tokio::task::spawn_blocking(move || {
             use atomicwrites::{AllowOverwrite, AtomicFile};
-            let af = AtomicFile::new(local_state, AllowOverwrite);
+            let af = AtomicFile::new(local_state_for_save, AllowOverwrite);
             af.write(|f| {
                 let mut f = BufWriter::new(f);
                 serialize_into(&local_all_old, &mut f, bincode::config::legacy())
@@ -232,6 +237,7 @@ pub async fn sync(
                 local_state_display, STATE_SAVE_RECOVERY_ADVICE
             )
         })?;
+    sync_ops::finish_apply_attempt(&local_state)?;
     remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
 
     Ok(())

@@ -51,14 +51,21 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   directories, symlink targets, Unix mode bits, and mtimes are synchronized;
   ownership, ACLs, xattrs, platform-specific permission models, and symlink
   permissions are not.
+- Local and remote apply now create a side-local recovery marker before applying
+  changes and remove it after state save succeeds. A later sync refuses to run if
+  the marker remains, with recovery instructions instead of silently continuing
+  from an unknown partial-apply state.
 
 ## Remaining Work
 
 ### 1. Apply Needs A Prepare/Commit Protocol
 
-Current preflight catches common permission failures before mutation, but sync is
-not a true transaction. Local and remote apply can still mutate files before a
-later non-preflighted error, crash, or race is detected.
+Current preflight catches common permission failures before mutation, and apply
+now records coarse recovery markers while filesystem changes and state saves are
+in progress. This prevents a later run from silently continuing after an
+interrupted apply. Sync is still not a true transaction: local and remote apply
+can still mutate files before a later non-preflighted error, crash, or race is
+detected.
 
 Target design:
 
@@ -82,8 +89,9 @@ Remaining work:
 - Move streamed and non-streamed apply through the same staged apply engine.
 - Stage or explicitly classify every operation that cannot be staged, especially
   directory removals, type replacements, chmod, and utime.
-- Persist enough attempt metadata to resume or provide deterministic recovery
-  instructions after a crash.
+- Persist richer phase/path attempt metadata to resume or provide deterministic
+  recovery instructions after a crash. The current marker only identifies that a
+  side may have applied changes or failed during state save.
 - Keep state saving after both sides have committed successfully.
 
 ### 2. Preflight And Apply Recovery Are Still Best-Effort
@@ -95,8 +103,9 @@ some capabilities cannot be proven without attempting the operation.
 
 When a post-preflight apply or state-save error occurs, Duet now reports recovery
 advice explaining that filesystem changes may have been partially applied and
-state may not have been saved. This is guidance only; it is not a resumable apply
-protocol yet.
+state may not have been saved. If a process exits before cleanup, the recovery
+marker blocks the next sync until the user inspects the state and removes the
+marker. This is still not a resumable apply protocol.
 
 Remaining work:
 
@@ -105,8 +114,8 @@ Remaining work:
 - Expand preflight coverage for less common replacement/remove combinations as
   they are found.
 - Add tests for representative races between preflight and apply.
-- Replace generic recovery advice with phase/path-specific guidance once apply
-  attempts are persisted.
+- Replace generic marker guidance with phase/path-specific recovery advice once
+  apply attempts record staged paths and committed operations.
 
 ### 3. Remote Errors Are Only Partly Structured
 
@@ -190,7 +199,7 @@ Remaining work:
 
 ## Current Priority Order
 
-1. Implement the transactional or resumable apply protocol described above.
+1. Complete the transactional or resumable apply protocol described above.
 2. Add tests and phase/path-specific recovery advice for races and
    post-preflight failures.
 3. Promote `RemoteSyncError` into an end-to-end structured error model with

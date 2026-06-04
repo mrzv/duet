@@ -105,6 +105,20 @@ fn mode(path: &Path) -> u32 {
     fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+fn apply_marker_for(state_path: &Path) -> PathBuf {
+    let file_name = state_path.file_name().unwrap().to_string_lossy();
+    state_path.with_file_name(format!(".{}.duet-apply", file_name))
+}
+
+fn remote_state_file(case: &SyncCase) -> PathBuf {
+    fs::read_dir(case.remote_state_dir())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+}
+
 struct PermissionGuard {
     path: PathBuf,
     mode: u32,
@@ -349,18 +363,59 @@ fn unreadable_local_state_file_fails_without_remote_mutation() {
 }
 
 #[test]
+fn unfinished_local_apply_marker_blocks_next_sync() {
+    let case = SyncCase::new(&["+a.txt"]);
+    let local_file = case.local.join("a.txt");
+    let remote_file = case.remote.join("a.txt");
+    write(&local_file, "initial");
+    assert_success(case.sync());
+
+    let marker = apply_marker_for(&case.local_state());
+    write(
+        &marker,
+        "duet-apply-attempt-v1\nside: local\nphase: apply-or-state-save\n",
+    );
+    write(&local_file, "updated");
+
+    let output = case.sync();
+
+    assert_failure(&output);
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("previous Duet apply attempt did not finish"));
+    assert_eq!(read(&remote_file), "initial");
+}
+
+#[test]
+fn unfinished_remote_apply_marker_blocks_next_sync() {
+    let case = SyncCase::new(&["+a.txt"]);
+    let local_file = case.local.join("a.txt");
+    let remote_file = case.remote.join("a.txt");
+    write(&local_file, "initial");
+    assert_success(case.sync());
+
+    let marker = apply_marker_for(&remote_state_file(&case));
+    write(
+        &marker,
+        "duet-apply-attempt-v1\nside: remote\nphase: apply-or-state-save\n",
+    );
+    write(&local_file, "updated");
+
+    let output = case.sync();
+
+    assert_failure(&output);
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("previous Duet apply attempt did not finish"));
+    assert_eq!(read(&remote_file), "initial");
+}
+
+#[test]
 fn unreadable_remote_state_file_reports_path_aware_error() {
     let case = SyncCase::new(&["+a.txt"]);
     let local_file = case.local.join("a.txt");
     let remote_file = case.remote.join("a.txt");
     write(&local_file, "initial");
     assert_success(case.sync());
-    let remote_state_file = fs::read_dir(case.remote_state_dir())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let remote_state_file = remote_state_file(&case);
 
     let _guard = deny_read_file(&remote_state_file);
     write(&remote_file, "updated remotely");
