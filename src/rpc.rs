@@ -156,6 +156,11 @@ impl DuetServer for DuetServerImpl {
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError> {
         log::debug!("Setting {} actions", actions.len());
         self.actions = actions;
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::preflight_state_save(&remote_state)
+            .map_err(|e| rpc_error("error preflighting remote state save", e))?;
+        sync::preflight_apply(&self.base, &self.actions)
+            .map_err(|e| rpc_error("error preflighting remote apply", e))?;
         Ok(())
     }
 

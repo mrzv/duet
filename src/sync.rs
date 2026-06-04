@@ -2,7 +2,7 @@ use super::scan::{Change, DirEntryWithMeta as Entry};
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
@@ -127,19 +127,57 @@ pub fn can_stream_details(actions: &[Action]) -> bool {
 }
 
 pub fn preflight_apply(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
+    preflight_source_reads(base, actions)?;
+
     let readonly_metadata_changes = readonly_directory_metadata_changes(actions);
-    for target in apply_write_targets(actions) {
+    let planned_directories = planned_destination_directories(actions);
+    for target in apply_metadata_targets(actions) {
+        let target_path = base.join(&target);
+        fs::symlink_metadata(&target_path).wrap_err_with(|| {
+            format!(
+                "unable to preflight destination metadata for {}",
+                target_path.display()
+            )
+        })?;
+    }
+
+    for mutation in apply_parent_mutations(actions) {
+        let target = mutation.path;
         let Some(parent) = target.parent() else {
             continue;
         };
         let parent_path = base.join(parent);
-        let Ok(meta) = fs::symlink_metadata(&parent_path) else {
-            continue;
-        };
-        if !meta.is_dir() || owner_writable(meta.permissions().mode()) {
+        if !parent_path.try_exists().wrap_err_with(|| {
+            format!(
+                "unable to preflight destination parent {}",
+                parent_path.display()
+            )
+        })? {
+            if planned_directories.contains(parent) {
+                continue;
+            }
+            return Err(eyre!(
+                "destination parent {} does not exist",
+                parent_path.display()
+            ));
+        }
+        let meta = fs::symlink_metadata(&parent_path).wrap_err_with(|| {
+            format!(
+                "unable to preflight destination parent {}",
+                parent_path.display()
+            )
+        })?;
+        if !meta.is_dir() {
+            return Err(eyre!(
+                "destination parent {} is not a directory",
+                parent_path.display()
+            ));
+        }
+        if owner_write_execute(meta.permissions().mode()) {
             continue;
         }
-        if readonly_metadata_changes.iter().any(|path| path == parent) {
+
+        if !mutation.allow_writable_guard || readonly_metadata_changes.contains(parent) {
             return Err(eyre!(
                 "destination parent {} is not writable",
                 parent_path.display()
@@ -149,11 +187,109 @@ pub fn preflight_apply(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
     Ok(())
 }
 
+pub fn preflight_state_save(state_path: &Path) -> Result<()> {
+    let parent = state_path.parent().ok_or_else(|| {
+        eyre!(
+            "state file {} has no parent directory",
+            state_path.display()
+        )
+    })?;
+
+    preflight_directory_writable_or_creatable(parent, "state directory")?;
+
+    if state_path
+        .try_exists()
+        .wrap_err_with(|| format!("unable to preflight state file {}", state_path.display()))?
+    {
+        let meta = fs::symlink_metadata(state_path).wrap_err_with(|| {
+            format!(
+                "unable to preflight state file metadata for {}",
+                state_path.display()
+            )
+        })?;
+        if !meta.is_file() {
+            return Err(eyre!(
+                "state path {} is not a regular file",
+                state_path.display()
+            ));
+        }
+        if !owner_writable(meta.permissions().mode()) {
+            return Err(eyre!("state file {} is not writable", state_path.display()));
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .open(state_path)
+            .wrap_err_with(|| {
+                format!(
+                    "unable to open state file {} for writing",
+                    state_path.display()
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
+fn preflight_directory_writable_or_creatable(path: &Path, description: &str) -> Result<()> {
+    if path
+        .try_exists()
+        .wrap_err_with(|| format!("unable to preflight {} {}", description, path.display()))?
+    {
+        return preflight_existing_writable_directory(path, description);
+    }
+
+    let ancestor = nearest_existing_ancestor(path).ok_or_else(|| {
+        eyre!(
+            "unable to find existing ancestor for {} {}",
+            description,
+            path.display()
+        )
+    })?;
+    preflight_existing_writable_directory(&ancestor, "state directory ancestor")
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.try_exists().ok()? {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn preflight_existing_writable_directory(path: &Path, description: &str) -> Result<()> {
+    let meta = fs::symlink_metadata(path).wrap_err_with(|| {
+        format!(
+            "unable to preflight {} metadata for {}",
+            description,
+            path.display()
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(eyre!(
+            "{} {} is not a directory",
+            description,
+            path.display()
+        ));
+    }
+    if !owner_write_execute(meta.permissions().mode()) {
+        return Err(eyre!("{} {} is not writable", description, path.display()));
+    }
+    Ok(())
+}
+
 fn owner_writable(mode: u32) -> bool {
     mode & 0o200 != 0
 }
 
-fn readonly_directory_metadata_changes(actions: &Vec<Action>) -> Vec<PathBuf> {
+fn owner_write_execute(mode: u32) -> bool {
+    mode & 0o300 == 0o300
+}
+
+fn readonly_directory_metadata_changes(actions: &Vec<Action>) -> HashSet<PathBuf> {
     actions
         .iter()
         .filter_map(|action| match action {
@@ -171,29 +307,122 @@ fn readonly_directory_metadata_changes(actions: &Vec<Action>) -> Vec<PathBuf> {
         .collect()
 }
 
-fn apply_write_targets(actions: &Vec<Action>) -> Vec<PathBuf> {
-    let mut targets = Vec::new();
+fn planned_destination_directories(actions: &Vec<Action>) -> HashSet<PathBuf> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Local(Change::Added(entry))
+            | Action::ResolvedLocal((_, _), Change::Added(entry))
+                if entry.is_dir() =>
+            {
+                Some(entry.path().clone())
+            }
+            Action::Local(Change::Modified(old, new))
+            | Action::ResolvedLocal((_, _), Change::Modified(old, new))
+                if !old.is_dir() && new.is_dir() =>
+            {
+                Some(new.path().clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+struct ParentMutation {
+    path: PathBuf,
+    allow_writable_guard: bool,
+}
+
+fn apply_parent_mutations(actions: &Vec<Action>) -> Vec<ParentMutation> {
+    let mut mutations = Vec::new();
     for action in actions {
         match action {
             Action::Local(change) | Action::ResolvedLocal((_, _), change) => match change {
-                Change::Removed(e) | Change::Added(e) => targets.push(e.path().clone()),
+                Change::Removed(e) => mutations.push(ParentMutation {
+                    path: e.path().clone(),
+                    allow_writable_guard: false,
+                }),
+                Change::Added(e) => mutations.push(ParentMutation {
+                    path: e.path().clone(),
+                    allow_writable_guard: e.is_file(),
+                }),
                 Change::Modified(old, new) if old.is_file() && new.is_file() => {
                     if !old.same_contents(new) {
-                        targets.push(new.path().clone());
+                        mutations.push(ParentMutation {
+                            path: new.path().clone(),
+                            allow_writable_guard: true,
+                        });
                     }
                 }
                 Change::Modified(old, new) if old.is_dir() && new.is_dir() => {}
                 Change::Modified(old, new) if old.is_symlink() && new.is_symlink() => {
                     if old.target() != new.target() {
-                        targets.push(new.path().clone());
+                        mutations.push(ParentMutation {
+                            path: new.path().clone(),
+                            allow_writable_guard: false,
+                        });
                     }
                 }
-                Change::Modified(_, new) => targets.push(new.path().clone()),
+                Change::Modified(_, new) => mutations.push(ParentMutation {
+                    path: new.path().clone(),
+                    allow_writable_guard: new.is_file(),
+                }),
             },
             _ => {}
         }
     }
+    mutations
+}
+
+fn apply_metadata_targets(actions: &Vec<Action>) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    for action in actions {
+        match action {
+            Action::Local(Change::Modified(_, new))
+            | Action::ResolvedLocal((_, _), Change::Modified(_, new)) => {
+                targets.push(new.path().clone())
+            }
+            Action::Local(Change::Removed(e))
+            | Action::ResolvedLocal((_, _), Change::Removed(e)) => targets.push(e.path().clone()),
+            _ => {}
+        }
+    }
     targets
+}
+
+fn preflight_source_reads(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
+    for action in actions {
+        if let Some(kind) = source_detail_kind(action) {
+            match kind {
+                SourceDetailKind::File(path) | SourceDetailKind::Diff(path) => {
+                    preflight_read_file(base, path, "source detail")?;
+                }
+            }
+        }
+
+        match action {
+            Action::Local(Change::Modified(old, new))
+            | Action::ResolvedLocal((_, _), Change::Modified(old, new))
+                if old.is_file() && new.is_file() && !old.same_contents(new) =>
+            {
+                preflight_read_file(base, old.path(), "destination signature")?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn preflight_read_file(base: &Path, path: &Path, description: &str) -> Result<()> {
+    let filename = base.join(path);
+    fs::File::open(&filename).wrap_err_with(|| {
+        format!(
+            "unable to preflight {} read for {}",
+            description,
+            filename.display()
+        )
+    })?;
+    Ok(())
 }
 
 pub fn get_detailed_changes(
@@ -1263,6 +1492,11 @@ fn create_file(filename: &Path, detail: &ChangeDetails) -> Result<()> {
 
 fn create_file_with_contents(filename: &Path, data: &Vec<u8>) -> Result<()> {
     use atomicwrites::{AllowOverwrite, AtomicFile};
+    let _parent_guard = filename
+        .parent()
+        .map(WritableDirGuard::new)
+        .transpose()?
+        .flatten();
     let af = AtomicFile::new(filename, AllowOverwrite);
     let result = af.write(|f| f.write_all(data));
     match result {

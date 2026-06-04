@@ -378,7 +378,7 @@ fn unreadable_remote_state_file_reports_path_aware_error() {
 }
 
 #[test]
-fn unwritable_profile_directory_save_failure_is_reported_after_mutation() {
+fn unwritable_profile_directory_fails_before_remote_mutation() {
     let case = SyncCase::new(&["+a.txt"]);
     let local_file = case.local.join("a.txt");
     let remote_file = case.remote.join("a.txt");
@@ -391,7 +391,7 @@ fn unwritable_profile_directory_save_failure_is_reported_after_mutation() {
     let output = case.sync();
 
     assert_failure(&output);
-    assert_eq!(read(&remote_file), "updated contents");
+    assert_eq!(read(&remote_file), "initial");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.to_lowercase().contains("state") || stderr.to_lowercase().contains("save"),
