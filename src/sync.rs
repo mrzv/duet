@@ -232,6 +232,13 @@ pub fn preflight_state_save(state_path: &Path) -> Result<()> {
 }
 
 pub fn check_apply_attempt_clear(state_path: &Path) -> Result<()> {
+    if let Some(description) = describe_apply_attempt(state_path)? {
+        return Err(eyre!("{}", description));
+    }
+    Ok(())
+}
+
+pub fn describe_apply_attempt(state_path: &Path) -> Result<Option<String>> {
     let marker_path = apply_attempt_path(state_path)?;
     if !marker_path.try_exists().wrap_err_with(|| {
         format!(
@@ -239,7 +246,7 @@ pub fn check_apply_attempt_clear(state_path: &Path) -> Result<()> {
             marker_path.display()
         )
     })? {
-        return Ok(());
+        return Ok(None);
     }
 
     let marker = fs::read_to_string(&marker_path).wrap_err_with(|| {
@@ -249,12 +256,12 @@ pub fn check_apply_attempt_clear(state_path: &Path) -> Result<()> {
         )
     })?;
     let recovery_advice = apply_attempt_recovery_advice(&marker);
-    Err(eyre!(
+    Ok(Some(format!(
         "previous Duet apply attempt did not finish: {}\n{}\n{}",
         marker_path.display(),
         marker.trim_end(),
         recovery_advice
-    ))
+    )))
 }
 
 pub fn start_apply_attempt(

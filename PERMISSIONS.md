@@ -76,6 +76,8 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
 - Permission tests now cover a representative race where the remote destination
   becomes unwritable after remote apply recovery is prepared; the next sync is
   blocked by the recovery marker instead of proceeding from unknown state.
+- The hidden maintenance command `_recover <statefile>` prints any unfinished
+  apply marker and the same recovery advice used by sync failure reporting.
 
 ## Remaining Work
 
@@ -144,7 +146,9 @@ marker blocks the next sync until the user inspects the listed paths and removes
 the marker. Marker recovery advice is tailored to the recorded phase and to
 planned destructive, metadata, or file-content operations, and it calls out when
 staged-file, unstaged-operation, committed-step, or committed-operation records
-are present. This is still not a resumable apply protocol.
+are present. The hidden `_recover <statefile>` maintenance command can print the
+same marker and advice without starting a sync. This is still not a resumable
+apply protocol.
 
 Remaining work:
 

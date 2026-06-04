@@ -4,7 +4,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use colored::*;
 use tokio::sync::mpsc;
 
-use crate::{full, profile, scan, state};
+use crate::{full, profile, scan, state, sync};
 
 mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
@@ -128,6 +128,17 @@ pub(crate) async fn walk(path: PathBuf) -> Result<()> {
 
     while let Some(e) = rx.recv().await {
         println!("{}", e.path().display());
+    }
+    Ok(())
+}
+
+pub(crate) fn recover(statefile: PathBuf) -> Result<()> {
+    match sync::describe_apply_attempt(&statefile)? {
+        Some(description) => println!("{}", description),
+        None => println!(
+            "No unfinished Duet apply attempt for {}",
+            statefile.display()
+        ),
     }
     Ok(())
 }
