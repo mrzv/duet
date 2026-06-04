@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, BufWriter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::{Result, WrapErr};
@@ -107,6 +108,59 @@ struct DuetServerImpl {
     next_stream_id: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteSyncError {
+    pub version: u8,
+    pub side: String,
+    pub operation: String,
+    pub path: Option<PathBuf>,
+    pub kind: String,
+    pub message: String,
+}
+
+impl RemoteSyncError {
+    fn new(operation: &str, path: Option<PathBuf>, error: impl fmt::Debug) -> Self {
+        let message = format!("{:?}", error);
+        Self {
+            version: 1,
+            side: "remote".to_string(),
+            operation: operation.to_string(),
+            path,
+            kind: classify_error_message(&message).to_string(),
+            message,
+        }
+    }
+}
+
+impl fmt::Display for RemoteSyncError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "duet-sync-error-v{}", self.version)?;
+        writeln!(f, "side: {}", self.side)?;
+        writeln!(f, "operation: {}", self.operation)?;
+        if let Some(path) = &self.path {
+            writeln!(f, "path: {}", path.display())?;
+        }
+        writeln!(f, "kind: {}", self.kind)?;
+        write!(f, "message: {}", self.message)
+    }
+}
+
+fn classify_error_message(message: &str) -> &'static str {
+    let message = message.to_lowercase();
+    if message.contains("permission denied")
+        || message.contains("permissiondenied")
+        || message.contains("os error 13")
+    {
+        "permission_denied"
+    } else if message.contains("no such file or directory") || message.contains("os error 2") {
+        "not_found"
+    } else if message.contains("not a directory") || message.contains("os error 20") {
+        "not_directory"
+    } else {
+        "other"
+    }
+}
+
 impl DuetServerImpl {
     fn new() -> Result<Self> {
         Ok(DuetServerImpl {
@@ -134,20 +188,18 @@ impl DuetServerImpl {
     }
 }
 
-fn rpc_error(context: &str, error: impl std::fmt::Debug) -> RPCError {
-    RPCError::new(RPCErrorKind::Other, format!("{}: {:?}", context, error))
+fn rpc_error(operation: &str, path: Option<&Path>, error: impl fmt::Debug) -> RPCError {
+    RPCError::new(
+        RPCErrorKind::Other,
+        RemoteSyncError::new(operation, path.map(Path::to_path_buf), error).to_string(),
+    )
 }
 
 impl DuetServer for DuetServerImpl {
     fn set_base(&mut self, base: String) -> Result<(), RPCError> {
         self.base = match crate::full(&base) {
             Ok(s) => s,
-            Err(_) => {
-                return Err(RPCError::new(
-                    RPCErrorKind::Other,
-                    "cannot expand base path, when setting remote base",
-                ));
-            }
+            Err(e) => return Err(rpc_error("set base", Some(Path::new(&base)), e)),
         };
         log::debug!("Set base {}", self.base.display());
         Ok(())
@@ -158,9 +210,9 @@ impl DuetServer for DuetServerImpl {
         self.actions = actions;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         sync::preflight_state_save(&remote_state)
-            .map_err(|e| rpc_error("error preflighting remote state save", e))?;
+            .map_err(|e| rpc_error("preflight state save", Some(&remote_state), e))?;
         sync::preflight_apply(&self.base, &self.actions)
-            .map_err(|e| rpc_error("error preflighting remote apply", e))?;
+            .map_err(|e| rpc_error("preflight apply", Some(&self.base), e))?;
         Ok(())
     }
 
@@ -194,7 +246,7 @@ impl DuetServer for DuetServerImpl {
                 self.all_old = all_old;
                 Ok(changes)
             }
-            Err(e) => Err(rpc_error("error getting changes from the server", e)),
+            Err(e) => Err(rpc_error("scan changes", Some(&self.base.join(path)), e)),
         }
     }
 
@@ -203,7 +255,7 @@ impl DuetServer for DuetServerImpl {
         let result = sync::get_signatures(&self.base, &self.actions);
         match result {
             Ok(signatures) => Ok(signatures),
-            Err(e) => Err(rpc_error("error getting signatures from the server", e)),
+            Err(e) => Err(rpc_error("read signatures", Some(&self.base), e)),
         }
     }
 
@@ -218,25 +270,19 @@ impl DuetServer for DuetServerImpl {
         let result = sync::get_detailed_changes(&self.base, &self.actions, &signatures);
         match result {
             Ok(details) => Ok(details),
-            Err(e) => Err(rpc_error(
-                "error getting detailed changes from the server",
-                e,
-            )),
+            Err(e) => Err(rpc_error("read detailed changes", Some(&self.base), e)),
         }
     }
 
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError> {
         log::debug!("Appling detailed changes, with {} details", details.len());
         sync::preflight_apply(&self.base, &self.actions)
-            .map_err(|e| rpc_error("error preflighting detailed changes on the server", e))?;
+            .map_err(|e| rpc_error("preflight apply details", Some(&self.base), e))?;
         let result =
             sync::apply_detailed_changes(&self.base, &self.actions, &details, &mut self.all_old);
         match result {
             Ok(()) => Ok(()),
-            Err(e) => Err(rpc_error(
-                "error applying detailed changes on the server",
-                e,
-            )),
+            Err(e) => Err(rpc_error("apply details", Some(&self.base), e)),
         }
     }
 
@@ -244,10 +290,8 @@ impl DuetServer for DuetServerImpl {
         log::debug!("Saving state");
         std::fs::create_dir_all(&self.remote_state_dir).map_err(|e| {
             rpc_error(
-                &format!(
-                    "error creating remote state directory {}",
-                    self.remote_state_dir.display()
-                ),
+                "create remote state directory",
+                Some(&self.remote_state_dir),
                 e,
             )
         })?;
@@ -265,10 +309,7 @@ impl DuetServer for DuetServerImpl {
         });
         match result {
             Ok(_) => Ok(()),
-            Err(e) => Err(rpc_error(
-                &format!("error saving remote state {}", remote_state.display()),
-                e,
-            )),
+            Err(e) => Err(rpc_error("save remote state", Some(&remote_state), e)),
         }
     }
 
@@ -320,11 +361,7 @@ impl DuetServer for DuetServerImpl {
                 }
                 Ok(frame)
             }
-            Err(e) => Err(RPCError::with_cause(
-                RPCErrorKind::Other,
-                "error reading detail stream",
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-            )),
+            Err(e) => Err(rpc_error("read detail stream", Some(&self.base), e)),
         }
     }
 
@@ -335,7 +372,7 @@ impl DuetServer for DuetServerImpl {
 
     fn begin_apply_stream(&mut self) -> Result<ApplyStreamId, RPCError> {
         sync::preflight_apply(&self.base, &self.actions)
-            .map_err(|e| rpc_error("error preflighting apply stream on the server", e))?;
+            .map_err(|e| rpc_error("preflight apply stream", Some(&self.base), e))?;
         let id = self.next_apply_stream_id();
         let applier = sync::DetailApplier::new(
             self.base.clone(),
@@ -351,16 +388,14 @@ impl DuetServer for DuetServerImpl {
         stream_id: ApplyStreamId,
         frame: DetailFrame,
     ) -> Result<(), RPCError> {
+        let base = self.base.clone();
         let applier = self
             .apply_streams
             .get_mut(&stream_id)
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
-        applier.apply_frame(frame).map_err(|e| {
-            RPCError::new(
-                RPCErrorKind::Other,
-                format!("error applying detail stream: {}", e),
-            )
-        })
+        applier
+            .apply_frame(frame)
+            .map_err(|e| rpc_error("apply detail stream", Some(&base), e))
     }
 
     fn finish_apply_stream(&mut self, stream_id: ApplyStreamId) -> Result<(), RPCError> {
@@ -368,12 +403,9 @@ impl DuetServer for DuetServerImpl {
             .apply_streams
             .remove(&stream_id)
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
-        self.all_old = applier.finish().map_err(|e| {
-            RPCError::new(
-                RPCErrorKind::Other,
-                format!("error finishing apply stream: {}", e),
-            )
-        })?;
+        self.all_old = applier
+            .finish()
+            .map_err(|e| rpc_error("finish apply stream", Some(&self.base), e))?;
         Ok(())
     }
 
@@ -394,11 +426,7 @@ impl DuetServer for DuetServerImpl {
                 }
                 Ok(frames)
             }
-            Err(e) => Err(RPCError::with_cause(
-                RPCErrorKind::Other,
-                "error reading detail stream",
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-            )),
+            Err(e) => Err(rpc_error("read detail stream", Some(&self.base), e)),
         }
     }
 
@@ -407,17 +435,15 @@ impl DuetServer for DuetServerImpl {
         stream_id: ApplyStreamId,
         frames: Vec<DetailFrame>,
     ) -> Result<(), RPCError> {
+        let base = self.base.clone();
         let applier = self
             .apply_streams
             .get_mut(&stream_id)
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
         for frame in frames {
-            applier.apply_frame(frame).map_err(|e| {
-                RPCError::new(
-                    RPCErrorKind::Other,
-                    format!("error applying detail stream: {}", e),
-                )
-            })?;
+            applier
+                .apply_frame(frame)
+                .map_err(|e| rpc_error("apply detail stream", Some(&base), e))?;
         }
         Ok(())
     }
@@ -481,5 +507,25 @@ mod tests {
                 CAPABILITY_STREAMED_DETAIL_BATCHES.to_string()
             ]
         );
+    }
+
+    #[test]
+    fn remote_sync_error_formats_structured_permission_context() {
+        let error = RemoteSyncError::new(
+            "save remote state",
+            Some(PathBuf::from("state.snp")),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        let formatted = error.to_string();
+
+        assert_eq!(error.side, "remote");
+        assert_eq!(error.operation, "save remote state");
+        assert_eq!(error.path, Some(PathBuf::from("state.snp")));
+        assert_eq!(error.kind, "permission_denied");
+        assert!(formatted.contains("duet-sync-error-v1"));
+        assert!(formatted.contains("side: remote"));
+        assert!(formatted.contains("operation: save remote state"));
+        assert!(formatted.contains("path: state.snp"));
+        assert!(formatted.contains("kind: permission_denied"));
     }
 }
