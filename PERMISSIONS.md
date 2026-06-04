@@ -56,6 +56,8 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   marker after state save succeeds. A later sync refuses to run if the marker
   remains, with recovery instructions instead of silently continuing from an
   unknown partial-apply state.
+- New peers prepare the remote apply marker before local mutation starts, so both
+  sides have recovery markers before the concurrent apply phase begins.
 
 ## Remaining Work
 
@@ -64,7 +66,8 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
 Current preflight catches common permission failures before mutation, and apply
 now records recovery markers while filesystem changes and state saves are in
 progress. The markers include the side, base, state file, current phase, and
-affected paths. This prevents a later run from silently continuing after an
+affected paths. New peers prepare both local and remote markers before concurrent
+apply begins. This prevents a later run from silently continuing after an
 interrupted apply. Sync is still not a true transaction: local and remote apply
 can still mutate files before a later non-preflighted error, crash, or race is
 detected.

@@ -142,6 +142,8 @@ pub async fn sync(
         has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAIL_BATCHES)
             && sync_ops::can_stream_details(&actions)
             && sync_ops::can_stream_details(&remote_actions);
+    let can_prepare_remote_apply =
+        has_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_ATTEMPT_PREPARE);
     remote
         .set_actions(remote_actions)
         .await
@@ -167,6 +169,7 @@ pub async fn sync(
 
     let local_all_old = if can_stream_details {
         log::debug!("streaming detailed changes");
+        prepare_remote_apply_attempt(&remote, can_prepare_remote_apply).await?;
         sync_ops::start_apply_attempt("local", &local_state, &local_base, actions.as_ref())?;
         stream_detailed_changes(
             &remote,
@@ -194,6 +197,7 @@ pub async fn sync(
             .map_err(|e| remote_rpc_error("couldn't get remote detailed changes", e))?;
         log::debug!("got detailed changes");
 
+        prepare_remote_apply_attempt(&remote, can_prepare_remote_apply).await?;
         sync_ops::start_apply_attempt("local", &local_state, &local_base, actions.as_ref())?;
         let local_apply_fut = {
             let local_base = local_base.clone();
@@ -243,6 +247,19 @@ pub async fn sync(
     sync_ops::finish_apply_attempt(&local_state)?;
     remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
 
+    Ok(())
+}
+
+async fn prepare_remote_apply_attempt<R>(remote: &R, supported: bool) -> Result<()>
+where
+    R: DuetServerAsync,
+{
+    if supported {
+        remote
+            .prepare_apply_attempt()
+            .await
+            .map_err(|e| remote_rpc_error("Couldn't prepare remote apply recovery", e))?;
+    }
     Ok(())
 }
 

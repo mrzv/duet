@@ -24,10 +24,12 @@ pub(crate) const PROTOCOL_VERSION: u32 = 2;
 pub(crate) const CAPABILITY_PROFILE_FILE_STATE_DIR: &str = "profile-file-state-dir";
 pub(crate) const CAPABILITY_STREAMED_DETAILS: &str = "streamed-details-v1";
 pub(crate) const CAPABILITY_STREAMED_DETAIL_BATCHES: &str = "streamed-detail-batches-v1";
+pub(crate) const CAPABILITY_APPLY_ATTEMPT_PREPARE: &str = "apply-attempt-prepare-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
     CAPABILITY_STREAMED_DETAIL_BATCHES,
+    CAPABILITY_APPLY_ATTEMPT_PREPARE,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -95,6 +97,7 @@ pub trait DuetServer {
         stream_id: ApplyStreamId,
         frames: Vec<DetailFrame>,
     ) -> Result<(), RPCError>;
+    fn prepare_apply_attempt(&mut self) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -416,6 +419,12 @@ impl DuetServer for DuetServerImpl {
         }
         Ok(())
     }
+
+    fn prepare_apply_attempt(&mut self) -> Result<(), RPCError> {
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions)
+            .map_err(|e| rpc_error("prepare apply recovery", Some(&remote_state), e))
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -473,7 +482,8 @@ mod tests {
             vec![
                 CAPABILITY_PROFILE_FILE_STATE_DIR.to_string(),
                 CAPABILITY_STREAMED_DETAILS.to_string(),
-                CAPABILITY_STREAMED_DETAIL_BATCHES.to_string()
+                CAPABILITY_STREAMED_DETAIL_BATCHES.to_string(),
+                CAPABILITY_APPLY_ATTEMPT_PREPARE.to_string()
             ]
         );
     }

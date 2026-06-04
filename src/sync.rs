@@ -263,7 +263,6 @@ pub fn start_apply_attempt(
     base: &Path,
     actions: &[Action],
 ) -> Result<()> {
-    check_apply_attempt_clear(state_path)?;
     let marker_path = apply_attempt_path(state_path)?;
     if let Some(parent) = marker_path.parent() {
         fs::create_dir_all(parent).wrap_err_with(|| {
@@ -274,18 +273,38 @@ pub fn start_apply_attempt(
         })?;
     }
     let contents = apply_attempt_contents(side, state_path, base, "apply", actions);
-    fs::OpenOptions::new()
+    match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&marker_path)
         .and_then(|mut file| file.write_all(contents.as_bytes()))
-        .wrap_err_with(|| {
+    {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let existing = fs::read_to_string(&marker_path).wrap_err_with(|| {
+                format!(
+                    "unable to read apply recovery marker {}",
+                    marker_path.display()
+                )
+            })?;
+            if existing == contents {
+                Ok(())
+            } else {
+                Err(eyre!(
+                    "previous Duet apply attempt did not finish: {}\n{}\n{}",
+                    marker_path.display(),
+                    existing.trim_end(),
+                    apply_attempt_recovery_advice(&existing)
+                ))
+            }
+        }
+        Err(e) => Err(e).wrap_err_with(|| {
             format!(
                 "unable to create apply recovery marker {}",
                 marker_path.display()
             )
-        })?;
-    Ok(())
+        }),
+    }
 }
 
 pub fn mark_apply_attempt_state_save(
