@@ -4,16 +4,16 @@ use std::path::{Path, PathBuf};
 
 use shellexpand;
 
-use crate::scan::location::{Location,Locations};
+use crate::scan::location::{Location, Locations};
 
 pub type Ignore = Vec<String>;
 
 #[derive(Debug)]
 pub struct Profile {
-    pub local:      String,
-    pub remote:     String,
-    pub locations:  Locations,
-    pub ignore:     Ignore,
+    pub local: String,
+    pub remote: String,
+    pub locations: Locations,
+    pub ignore: Ignore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,22 +32,32 @@ pub struct ProfileConfig {
     pub server_log: PathBuf,
 }
 
-pub fn location(name: &str) -> PathBuf {
-    let mut base = PathBuf::from(shellexpand::full("~/.config/duet/").unwrap().to_string());
+fn config_dir() -> Result<PathBuf, io::Error> {
+    let expanded = shellexpand::full("~/.config/duet/").map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unable to expand ~/.config/duet/: {}", e),
+        )
+    })?;
+    Ok(PathBuf::from(expanded.into_owned()))
+}
+
+pub fn location(name: &str) -> Result<PathBuf, io::Error> {
+    let mut base = config_dir()?;
     base.push(name.to_owned() + ".prf");
-    base
+    Ok(base)
 }
 
-pub fn local_state(name: &str) -> PathBuf {
-    let mut profile_location = location(name);
+pub fn local_state(name: &str) -> Result<PathBuf, io::Error> {
+    let mut profile_location = location(name)?;
     profile_location.set_extension("snp");
-    profile_location
+    Ok(profile_location)
 }
 
-pub fn remote_state_dir() -> PathBuf {
-    let mut base = PathBuf::from(shellexpand::full("~/.config/duet/").unwrap().to_string());
+pub fn remote_state_dir() -> Result<PathBuf, io::Error> {
+    let mut base = config_dir()?;
     base.push("remotes");
-    base
+    Ok(base)
 }
 
 pub fn remote_state_in(dir: &Path, id: &str) -> PathBuf {
@@ -60,9 +70,9 @@ pub fn load(source: &ProfileSource) -> Result<ProfileConfig, io::Error> {
             display_name: name.clone(),
             identity: name.clone(),
             profile: parse(name)?,
-            local_state: local_state(name),
-            remote_state_dir: remote_state_dir(),
-            server_log: default_server_log(),
+            local_state: local_state(name)?,
+            remote_state_dir: remote_state_dir()?,
+            server_log: default_server_log()?,
         }),
         ProfileSource::File(path) => {
             let path = std::fs::canonicalize(path)?;
@@ -86,14 +96,14 @@ pub fn load(source: &ProfileSource) -> Result<ProfileConfig, io::Error> {
     }
 }
 
-fn default_server_log() -> PathBuf {
-    let mut base = PathBuf::from(shellexpand::full("~/.config/duet/").unwrap().to_string());
+fn default_server_log() -> Result<PathBuf, io::Error> {
+    let mut base = config_dir()?;
     base.push("remote.log");
-    base
+    Ok(base)
 }
 
 pub fn parse(name: &str) -> Result<Profile, io::Error> {
-    let profile_location = location(name);
+    let profile_location = location(name)?;
     log::debug!("Loading {:?}", profile_location);
 
     parse_file(&profile_location)
@@ -102,14 +112,14 @@ pub fn parse(name: &str) -> Result<Profile, io::Error> {
 pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
     log::debug!("Loading {:?}", profile_location);
 
-    let f      = File::open(profile_location)?;
+    let f = File::open(profile_location)?;
     let reader = BufReader::new(f);
 
     let mut p = Profile {
-        local:      String::new(),
-        remote:     String::new(),
-        locations:  vec![Location::Exclude(PathBuf::from("."))],    // implicitly exclude .
-        ignore:     Vec::new(),
+        local: String::new(),
+        remote: String::new(),
+        locations: vec![Location::Exclude(PathBuf::from("."))], // implicitly exclude .
+        ignore: Vec::new(),
     };
 
     let mut locations = 0;
@@ -132,9 +142,11 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
         // includes/excludes
         if locations == 2 {
             if line.trim().starts_with('+') {
-                p.locations.push(Location::Include(PathBuf::from(&line[1..])));
+                p.locations
+                    .push(Location::Include(PathBuf::from(&line[1..])));
             } else if line.trim().starts_with('-') {
-                p.locations.push(Location::Exclude(PathBuf::from(&line[1..])));
+                p.locations
+                    .push(Location::Exclude(PathBuf::from(&line[1..])));
             } else if line == "[ignore]" {
                 locations += 1;
             } else {
@@ -149,5 +161,8 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
 }
 
 fn parse_error(line: &str) -> Result<Profile, io::Error> {
-    return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("can't parse line: {}", line)));
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("can't parse line: {}", line),
+    ))
 }

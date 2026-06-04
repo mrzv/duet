@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::io::{self, BufWriter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bincode::serde::encode_into_std_write as serialize_into;
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{eyre, Report, Result};
 use essrpc::essrpc;
 use essrpc::transports::{BincodeTransport, ReadWrite};
 use essrpc::{RPCError, RPCErrorKind, RPCServer};
@@ -17,16 +17,21 @@ use crate::sync::{
     self, ApplyStreamId, ChangeDetails, DetailFrame, DetailProducer, DetailStreamId,
     SignatureWithPath,
 };
+use crate::sync_error::{self, StructuredSyncError};
 
 pub(crate) const SERVER_LOG_ENV: &str = "DUET_SERVER_LOG";
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
 pub(crate) const CAPABILITY_PROFILE_FILE_STATE_DIR: &str = "profile-file-state-dir";
 pub(crate) const CAPABILITY_STREAMED_DETAILS: &str = "streamed-details-v1";
 pub(crate) const CAPABILITY_STREAMED_DETAIL_BATCHES: &str = "streamed-detail-batches-v1";
+pub(crate) const CAPABILITY_APPLY_ATTEMPT_PREPARE: &str = "apply-attempt-prepare-v1";
+pub(crate) const CAPABILITY_APPLY_ATTEMPT_ID: &str = "apply-attempt-id-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
     CAPABILITY_STREAMED_DETAIL_BATCHES,
+    CAPABILITY_APPLY_ATTEMPT_PREPARE,
+    CAPABILITY_APPLY_ATTEMPT_ID,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -94,6 +99,8 @@ pub trait DuetServer {
         stream_id: ApplyStreamId,
         frames: Vec<DetailFrame>,
     ) -> Result<(), RPCError>;
+    fn prepare_apply_attempt(&mut self) -> Result<(), RPCError>;
+    fn prepare_apply_attempt_with_id(&mut self, attempt_id: String) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -102,23 +109,25 @@ struct DuetServerImpl {
     remote_state_dir: PathBuf,
     all_old: Entries,
     actions: Actions,
+    apply_attempt_id: Option<String>,
     detail_streams: HashMap<DetailStreamId, DetailProducer>,
     apply_streams: HashMap<ApplyStreamId, sync::DetailApplier>,
     next_stream_id: u64,
 }
 
 impl DuetServerImpl {
-    fn new() -> Self {
-        DuetServerImpl {
+    fn new() -> Result<Self> {
+        Ok(DuetServerImpl {
             base: PathBuf::from(""),
             remote_id: "".to_string(),
-            remote_state_dir: profile::remote_state_dir(),
+            remote_state_dir: profile::remote_state_dir()?,
             all_old: Vec::new(),
             actions: Vec::new(),
+            apply_attempt_id: None,
             detail_streams: HashMap::new(),
             apply_streams: HashMap::new(),
             next_stream_id: 1,
-        }
+        })
     }
 
     fn next_detail_stream_id(&mut self) -> DetailStreamId {
@@ -132,22 +141,32 @@ impl DuetServerImpl {
         self.next_stream_id += 1;
         id
     }
+
+    fn apply_attempt_id(&self) -> Option<&str> {
+        self.apply_attempt_id.as_deref()
+    }
 }
 
-fn rpc_error(context: &str, error: impl std::fmt::Debug) -> RPCError {
-    RPCError::new(RPCErrorKind::Other, format!("{}: {:?}", context, error))
+fn rpc_error(operation: &str, path: Option<&Path>, error: impl std::fmt::Debug) -> RPCError {
+    RPCError::new(
+        RPCErrorKind::Other,
+        StructuredSyncError::remote(operation, path.map(Path::to_path_buf), error).to_string(),
+    )
+}
+
+fn rpc_report_error(operation: &str, path: Option<&Path>, error: Report) -> RPCError {
+    RPCError::new(
+        RPCErrorKind::Other,
+        StructuredSyncError::from_report("remote", operation, path.map(Path::to_path_buf), error)
+            .to_string(),
+    )
 }
 
 impl DuetServer for DuetServerImpl {
     fn set_base(&mut self, base: String) -> Result<(), RPCError> {
         self.base = match crate::full(&base) {
             Ok(s) => s,
-            Err(_) => {
-                return Err(RPCError::new(
-                    RPCErrorKind::Other,
-                    "cannot expand base path, when setting remote base",
-                ));
-            }
+            Err(e) => return Err(rpc_report_error("set base", Some(Path::new(&base)), e)),
         };
         log::debug!("Set base {}", self.base.display());
         Ok(())
@@ -156,6 +175,11 @@ impl DuetServer for DuetServerImpl {
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError> {
         log::debug!("Setting {} actions", actions.len());
         self.actions = actions;
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::preflight_state_save(&remote_state)
+            .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
+        sync::preflight_apply(&self.base, &self.actions)
+            .map_err(|e| rpc_report_error("preflight apply", Some(&self.base), e))?;
         Ok(())
     }
 
@@ -168,6 +192,10 @@ impl DuetServer for DuetServerImpl {
     ) -> Result<Changes, RPCError> {
         log::debug!("remote id = {}", remote_id);
         self.remote_id = remote_id;
+        self.apply_attempt_id = None;
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::check_apply_attempt_clear(&remote_state)
+            .map_err(|e| rpc_report_error("check apply recovery", Some(&remote_state), e))?;
 
         let handle = tokio::runtime::Handle::current();
         let result = handle.block_on(async {
@@ -176,10 +204,7 @@ impl DuetServer for DuetServerImpl {
                 &path,
                 &locations,
                 &ignore,
-                Some(&profile::remote_state_in(
-                    &self.remote_state_dir,
-                    &self.remote_id,
-                )),
+                Some(&remote_state),
             )
             .await
         });
@@ -189,7 +214,11 @@ impl DuetServer for DuetServerImpl {
                 self.all_old = all_old;
                 Ok(changes)
             }
-            Err(e) => Err(rpc_error("error getting changes from the server", e)),
+            Err(e) => Err(rpc_report_error(
+                "scan changes",
+                Some(&self.base.join(path)),
+                e,
+            )),
         }
     }
 
@@ -198,7 +227,7 @@ impl DuetServer for DuetServerImpl {
         let result = sync::get_signatures(&self.base, &self.actions);
         match result {
             Ok(signatures) => Ok(signatures),
-            Err(e) => Err(rpc_error("error getting signatures from the server", e)),
+            Err(e) => Err(rpc_report_error("read signatures", Some(&self.base), e)),
         }
     }
 
@@ -213,8 +242,9 @@ impl DuetServer for DuetServerImpl {
         let result = sync::get_detailed_changes(&self.base, &self.actions, &signatures);
         match result {
             Ok(details) => Ok(details),
-            Err(e) => Err(rpc_error(
-                "error getting detailed changes from the server",
+            Err(e) => Err(rpc_report_error(
+                "read detailed changes",
+                Some(&self.base),
                 e,
             )),
         }
@@ -223,15 +253,38 @@ impl DuetServer for DuetServerImpl {
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError> {
         log::debug!("Appling detailed changes, with {} details", details.len());
         sync::preflight_apply(&self.base, &self.actions)
-            .map_err(|e| rpc_error("error preflighting detailed changes on the server", e))?;
-        let result =
-            sync::apply_detailed_changes(&self.base, &self.actions, &details, &mut self.all_old);
+            .map_err(|e| rpc_report_error("preflight apply details", Some(&self.base), e))?;
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::start_apply_attempt(
+            "remote",
+            &remote_state,
+            &self.base,
+            &self.actions,
+            self.apply_attempt_id(),
+        )
+        .map_err(|e| rpc_report_error("start apply recovery", Some(&remote_state), e))?;
+        let result = sync::apply_detailed_changes(
+            &self.base,
+            &self.actions,
+            &details,
+            &mut self.all_old,
+            Some(&remote_state),
+        );
         match result {
-            Ok(()) => Ok(()),
-            Err(e) => Err(rpc_error(
-                "error applying detailed changes on the server",
-                e,
-            )),
+            Ok(()) => {
+                sync::mark_apply_attempt_state_save(
+                    "remote",
+                    &remote_state,
+                    &self.base,
+                    &self.actions,
+                    self.apply_attempt_id(),
+                )
+                .map_err(|e| {
+                    rpc_report_error("mark apply recovery state-save", Some(&remote_state), e)
+                })?;
+                Ok(())
+            }
+            Err(e) => Err(rpc_report_error("apply details", Some(&self.base), e)),
         }
     }
 
@@ -239,10 +292,8 @@ impl DuetServer for DuetServerImpl {
         log::debug!("Saving state");
         std::fs::create_dir_all(&self.remote_state_dir).map_err(|e| {
             rpc_error(
-                &format!(
-                    "error creating remote state directory {}",
-                    self.remote_state_dir.display()
-                ),
+                "create remote state directory",
+                Some(&self.remote_state_dir),
                 e,
             )
         })?;
@@ -259,11 +310,13 @@ impl DuetServer for DuetServerImpl {
             serialize_into(&self.all_old, &mut f, bincode::config::legacy())
         });
         match result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(rpc_error(
-                &format!("error saving remote state {}", remote_state.display()),
-                e,
-            )),
+            Ok(_) => {
+                sync::finish_apply_attempt(&remote_state).map_err(|e| {
+                    rpc_report_error("finish apply recovery", Some(&remote_state), e)
+                })?;
+                Ok(())
+            }
+            Err(e) => Err(rpc_error("save remote state", Some(&remote_state), e)),
         }
     }
 
@@ -315,11 +368,7 @@ impl DuetServer for DuetServerImpl {
                 }
                 Ok(frame)
             }
-            Err(e) => Err(RPCError::with_cause(
-                RPCErrorKind::Other,
-                "error reading detail stream",
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-            )),
+            Err(e) => Err(rpc_report_error("read detail stream", Some(&self.base), e)),
         }
     }
 
@@ -330,12 +379,22 @@ impl DuetServer for DuetServerImpl {
 
     fn begin_apply_stream(&mut self) -> Result<ApplyStreamId, RPCError> {
         sync::preflight_apply(&self.base, &self.actions)
-            .map_err(|e| rpc_error("error preflighting apply stream on the server", e))?;
+            .map_err(|e| rpc_report_error("preflight apply stream", Some(&self.base), e))?;
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::start_apply_attempt(
+            "remote",
+            &remote_state,
+            &self.base,
+            &self.actions,
+            self.apply_attempt_id(),
+        )
+        .map_err(|e| rpc_report_error("start apply recovery", Some(&remote_state), e))?;
         let id = self.next_apply_stream_id();
-        let applier = sync::DetailApplier::new(
+        let applier = sync::DetailApplier::new_with_attempt(
             self.base.clone(),
             self.actions.clone(),
             self.all_old.clone(),
+            Some(remote_state.clone()),
         );
         self.apply_streams.insert(id, applier);
         Ok(id)
@@ -346,16 +405,14 @@ impl DuetServer for DuetServerImpl {
         stream_id: ApplyStreamId,
         frame: DetailFrame,
     ) -> Result<(), RPCError> {
+        let base = self.base.clone();
         let applier = self
             .apply_streams
             .get_mut(&stream_id)
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
-        applier.apply_frame(frame).map_err(|e| {
-            RPCError::new(
-                RPCErrorKind::Other,
-                format!("error applying detail stream: {}", e),
-            )
-        })
+        applier
+            .apply_frame(frame)
+            .map_err(|e| rpc_report_error("apply detail stream", Some(&base), e))
     }
 
     fn finish_apply_stream(&mut self, stream_id: ApplyStreamId) -> Result<(), RPCError> {
@@ -363,12 +420,18 @@ impl DuetServer for DuetServerImpl {
             .apply_streams
             .remove(&stream_id)
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
-        self.all_old = applier.finish().map_err(|e| {
-            RPCError::new(
-                RPCErrorKind::Other,
-                format!("error finishing apply stream: {}", e),
-            )
-        })?;
+        self.all_old = applier
+            .finish()
+            .map_err(|e| rpc_report_error("finish apply stream", Some(&self.base), e))?;
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::mark_apply_attempt_state_save(
+            "remote",
+            &remote_state,
+            &self.base,
+            &self.actions,
+            self.apply_attempt_id(),
+        )
+        .map_err(|e| rpc_report_error("mark apply recovery state-save", Some(&remote_state), e))?;
         Ok(())
     }
 
@@ -389,11 +452,7 @@ impl DuetServer for DuetServerImpl {
                 }
                 Ok(frames)
             }
-            Err(e) => Err(RPCError::with_cause(
-                RPCErrorKind::Other,
-                "error reading detail stream",
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-            )),
+            Err(e) => Err(rpc_report_error("read detail stream", Some(&self.base), e)),
         }
     }
 
@@ -402,19 +461,44 @@ impl DuetServer for DuetServerImpl {
         stream_id: ApplyStreamId,
         frames: Vec<DetailFrame>,
     ) -> Result<(), RPCError> {
+        let base = self.base.clone();
         let applier = self
             .apply_streams
             .get_mut(&stream_id)
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
         for frame in frames {
-            applier.apply_frame(frame).map_err(|e| {
-                RPCError::new(
-                    RPCErrorKind::Other,
-                    format!("error applying detail stream: {}", e),
-                )
-            })?;
+            applier
+                .apply_frame(frame)
+                .map_err(|e| rpc_report_error("apply detail stream", Some(&base), e))?;
         }
         Ok(())
+    }
+
+    fn prepare_apply_attempt(&mut self) -> Result<(), RPCError> {
+        self.apply_attempt_id = None;
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions, None)
+            .map_err(|e| rpc_report_error("prepare apply recovery", Some(&remote_state), e))
+    }
+
+    fn prepare_apply_attempt_with_id(&mut self, attempt_id: String) -> Result<(), RPCError> {
+        if attempt_id.is_empty() {
+            return Err(rpc_error(
+                "prepare apply recovery",
+                None,
+                "apply attempt id is empty",
+            ));
+        }
+        self.apply_attempt_id = Some(attempt_id);
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::start_apply_attempt(
+            "remote",
+            &remote_state,
+            &self.base,
+            &self.actions,
+            self.apply_attempt_id(),
+        )
+        .map_err(|e| rpc_report_error("prepare apply recovery", Some(&remote_state), e))
     }
 }
 
@@ -422,19 +506,39 @@ pub async fn server() -> Result<()> {
     let log_path = if let Some(path) = std::env::var_os(SERVER_LOG_ENV) {
         PathBuf::from(path)
     } else {
-        crate::full(&"~/.config/duet/remote.log".to_string())?
+        let default_log = "~/.config/duet/remote.log".to_string();
+        crate::full(&default_log).map_err(|e| {
+            eyre!(
+                "{}",
+                sync_error::render_report(
+                    "setup",
+                    "resolve remote server log",
+                    Some(PathBuf::from(default_log)),
+                    e,
+                )
+            )
+        })?
     };
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).wrap_err_with(|| {
-            format!(
-                "unable to create remote server log directory {}",
-                parent.display()
+        std::fs::create_dir_all(parent).map_err(|e| {
+            eyre!(
+                "{}",
+                sync_error::render_error(
+                    "setup",
+                    "create remote server log directory",
+                    Some(parent.to_path_buf()),
+                    e,
+                )
             )
         })?;
     }
     use log::LevelFilter;
-    simple_logging::log_to_file(&log_path, LevelFilter::Debug)
-        .wrap_err_with(|| format!("unable to open remote server log {}", log_path.display()))?;
+    simple_logging::log_to_file(&log_path, LevelFilter::Debug).map_err(|e| {
+        eyre!(
+            "{}",
+            sync_error::render_error("setup", "open remote server log", Some(log_path.clone()), e,)
+        )
+    })?;
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -443,16 +547,28 @@ pub async fn server() -> Result<()> {
 
     log::debug!("in server()");
 
-    tokio::task::spawn_blocking(|| {
-        let mut serve =
-            DuetServerRPCServer::new(DuetServerImpl::new(), BincodeTransport::new(stdio));
+    let server_impl = DuetServerImpl::new().map_err(|e| {
+        eyre!(
+            "{}",
+            sync_error::render_report("setup", "initialize remote server", None, e)
+        )
+    })?;
+
+    tokio::task::spawn_blocking(move || {
+        let mut serve = DuetServerRPCServer::new(server_impl, BincodeTransport::new(stdio));
         if let Err(e) = serve.serve() {
             if e.kind != RPCErrorKind::TransportEOF {
                 log::error!("RPC server stopped with error: {:?}", e);
             }
         }
     })
-    .await?;
+    .await
+    .map_err(|e| {
+        eyre!(
+            "{}",
+            sync_error::render_error("setup", "run remote server task", None, e)
+        )
+    })?;
 
     Ok(())
 }
@@ -460,10 +576,11 @@ pub async fn server() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::Action;
 
     #[test]
     fn server_info_advertises_protocol_and_capabilities() {
-        let info = DuetServerImpl::new().server_info().unwrap();
+        let info = DuetServerImpl::new().unwrap().server_info().unwrap();
 
         assert_eq!(info.protocol_version, PROTOCOL_VERSION);
         assert_eq!(info.duet_version, built_info::PKG_VERSION);
@@ -472,8 +589,36 @@ mod tests {
             vec![
                 CAPABILITY_PROFILE_FILE_STATE_DIR.to_string(),
                 CAPABILITY_STREAMED_DETAILS.to_string(),
-                CAPABILITY_STREAMED_DETAIL_BATCHES.to_string()
+                CAPABILITY_STREAMED_DETAIL_BATCHES.to_string(),
+                CAPABILITY_APPLY_ATTEMPT_PREPARE.to_string(),
+                CAPABILITY_APPLY_ATTEMPT_ID.to_string()
             ]
         );
+    }
+
+    #[test]
+    fn prepare_apply_attempt_with_id_writes_marker_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+
+        let mut server = DuetServerImpl::new().unwrap();
+        server.base = base;
+        server.remote_id = "remote-peer".to_string();
+        server.remote_state_dir = dir.path().join("state");
+        server.actions = Vec::<Action>::new();
+
+        server
+            .prepare_apply_attempt_with_id("attempt-1".to_string())
+            .unwrap();
+        let remote_state = profile::remote_state_in(&server.remote_state_dir, &server.remote_id);
+        let marker = remote_state.with_file_name(format!(
+            ".{}.duet-apply",
+            remote_state.file_name().unwrap().to_string_lossy()
+        ));
+        let marker_contents = std::fs::read_to_string(&marker).unwrap();
+        assert!(marker_contents.contains("attempt-id: attempt-1"));
+
+        server.begin_apply_stream().unwrap();
     }
 }

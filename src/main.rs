@@ -13,6 +13,7 @@ mod rustsync;
 mod scan;
 mod state;
 mod sync;
+mod sync_error;
 mod utils;
 #[macro_use]
 extern crate serde_derive;
@@ -23,7 +24,7 @@ use std::path::PathBuf;
 #[tokio::main]
 #[quit::main]
 pub async fn main() -> Result<()> {
-    color_eyre::install().unwrap();
+    color_eyre::install()?;
 
     match cli::parse_from_env()? {
         Command::Help => commands::show_help(),
@@ -39,6 +40,7 @@ pub async fn main() -> Result<()> {
         }
         Command::Info { profile } => return commands::info(profile),
         Command::Walk { path } => return commands::walk(path).await,
+        Command::Recover { statefile } => return commands::recover(statefile),
         Command::Sync {
             profile,
             path,

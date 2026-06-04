@@ -55,6 +55,21 @@ ignore.
 
 Subsequently, `duet my_profile` will synchronize the two directories.
 
+## Metadata And Permissions
+
+Duet synchronizes regular file contents, directory structure, symlink targets,
+Unix mode bits, and modification times.
+
+Duet does not synchronize file ownership, groups, ACLs, extended attributes, or
+platform-specific permission models. Symlink permissions are ignored; the symlink
+target is synchronized instead. When applying mode metadata, Duet applies only
+Unix permission and special bits, not file-type bits.
+
+Permission failures are treated as sync errors. Duet fails fast rather than
+silently skipping unreadable or unwritable paths, because skipping a path can be
+mistaken for a deletion or a legitimate update. Fix the reported permission
+problem and rerun the sync.
+
 ## Caveat
 
 Duet uses [openssh](https://docs.rs/openssh/) crate, which only supports

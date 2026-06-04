@@ -4,7 +4,9 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -52,6 +54,19 @@ impl SyncCase {
             .arg("-b")
             .env("NO_COLOR", "1")
             .output()
+            .unwrap()
+    }
+
+    fn sync_child(&self) -> Child {
+        Command::new(duet_bin())
+            .arg("--profile-file")
+            .arg(&self.profile)
+            .arg("-b")
+            .env("NO_COLOR", "1")
+            .env("DUET_TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS", "500")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap()
     }
 
@@ -103,6 +118,38 @@ fn chmod(path: &Path, mode: u32) {
 
 fn mode(path: &Path) -> u32 {
     fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn apply_marker_for(state_path: &Path) -> PathBuf {
+    let file_name = state_path.file_name().unwrap().to_string_lossy();
+    state_path.with_file_name(format!(".{}.duet-apply", file_name))
+}
+
+fn remote_state_file(case: &SyncCase) -> PathBuf {
+    fs::read_dir(case.remote_state_dir())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+}
+
+fn wait_for_path_while_child_runs(path: &Path, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "child exited with {} before {} appeared",
+                status,
+                path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {}", path.display());
 }
 
 struct PermissionGuard {
@@ -349,18 +396,108 @@ fn unreadable_local_state_file_fails_without_remote_mutation() {
 }
 
 #[test]
+fn unfinished_local_apply_marker_blocks_next_sync() {
+    let case = SyncCase::new(&["+a.txt"]);
+    let local_file = case.local.join("a.txt");
+    let remote_file = case.remote.join("a.txt");
+    write(&local_file, "initial");
+    assert_success(case.sync());
+
+    let marker = apply_marker_for(&case.local_state());
+    write(
+        &marker,
+        "duet-apply-attempt-v1\nside: local\nphase: apply\npath-count: 1\npath: a.txt\n",
+    );
+    write(&local_file, "updated");
+
+    let output = case.sync();
+
+    assert_failure(&output);
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("previous Duet apply attempt did not finish"));
+    assert_eq!(read(&remote_file), "initial");
+}
+
+#[test]
+fn unfinished_remote_apply_marker_blocks_next_sync() {
+    let case = SyncCase::new(&["+a.txt"]);
+    let local_file = case.local.join("a.txt");
+    let remote_file = case.remote.join("a.txt");
+    write(&local_file, "initial");
+    assert_success(case.sync());
+
+    let marker = apply_marker_for(&remote_state_file(&case));
+    write(
+        &marker,
+        "duet-apply-attempt-v1\nside: remote\nphase: state-save\npath-count: 1\npath: a.txt\n",
+    );
+    write(&local_file, "updated");
+
+    let output = case.sync();
+
+    assert_failure(&output);
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("previous Duet apply attempt did not finish"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("state may not have been saved"));
+    assert_eq!(read(&remote_file), "initial");
+}
+
+#[test]
+fn post_preflight_remote_permission_race_leaves_recovery_marker() {
+    let case = SyncCase::new(&["+link"]);
+    let local_link = case.local.join("link");
+    let remote_link = case.remote.join("link");
+    write(&local_link, "initial");
+    assert_success(case.sync());
+
+    fs::remove_file(&local_link).unwrap();
+    std::os::unix::fs::symlink("target.txt", &local_link).unwrap();
+    let remote_state = remote_state_file(&case);
+    let marker = apply_marker_for(&remote_state);
+    let mut child = case.sync_child();
+    wait_for_path_while_child_runs(&marker, &mut child);
+    let guard = PermissionGuard::set(&case.remote, 0o555);
+
+    let output = child.wait_with_output().unwrap();
+    drop(guard);
+
+    assert_failure(&output);
+    assert!(
+        marker.exists(),
+        "expected recovery marker at {}",
+        marker.display()
+    );
+    let marker_contents = read(&marker);
+    assert!(
+        marker_contents.contains("phase: apply"),
+        "{}",
+        marker_contents
+    );
+    assert!(
+        marker_contents.contains("operation: replace link"),
+        "{}",
+        marker_contents
+    );
+    assert_eq!(read(&remote_link), "initial");
+    let recovery_output = case.sync();
+    assert_failure(&recovery_output);
+    let stderr = String::from_utf8_lossy(&recovery_output.stderr);
+    assert!(
+        stderr.contains("previous Duet apply attempt did not finish")
+            && stderr.contains("Recovery:"),
+        "expected recovery context\nstderr:\n{}",
+        stderr
+    );
+}
+
+#[test]
 fn unreadable_remote_state_file_reports_path_aware_error() {
     let case = SyncCase::new(&["+a.txt"]);
     let local_file = case.local.join("a.txt");
     let remote_file = case.remote.join("a.txt");
     write(&local_file, "initial");
     assert_success(case.sync());
-    let remote_state_file = fs::read_dir(case.remote_state_dir())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let remote_state_file = remote_state_file(&case);
 
     let _guard = deny_read_file(&remote_state_file);
     write(&remote_file, "updated remotely");
@@ -378,7 +515,7 @@ fn unreadable_remote_state_file_reports_path_aware_error() {
 }
 
 #[test]
-fn unwritable_profile_directory_save_failure_is_reported_after_mutation() {
+fn unwritable_profile_directory_fails_before_remote_mutation() {
     let case = SyncCase::new(&["+a.txt"]);
     let local_file = case.local.join("a.txt");
     let remote_file = case.remote.join("a.txt");
@@ -391,7 +528,7 @@ fn unwritable_profile_directory_save_failure_is_reported_after_mutation() {
     let output = case.sync();
 
     assert_failure(&output);
-    assert_eq!(read(&remote_file), "updated contents");
+    assert_eq!(read(&remote_file), "initial");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.to_lowercase().contains("state") || stderr.to_lowercase().contains("save"),

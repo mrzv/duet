@@ -1,5 +1,8 @@
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+#[cfg(debug_assertions)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::{eyre, Result, WrapErr};
@@ -16,6 +19,7 @@ use crate::rpc::{self, DuetServerAsync};
 use crate::scan;
 use crate::state;
 use crate::sync as sync_ops;
+use crate::sync_error;
 use crate::utils;
 
 const OK_CODE: u8 = 0;
@@ -27,6 +31,11 @@ const CTRLC_CODE: u8 = 6;
 const DETAIL_CHUNK_BYTES: usize = 1024 * 1024;
 const DETAIL_BATCH_FRAMES: usize = 256;
 const DETAIL_BATCH_PAYLOAD_BYTES: usize = DETAIL_CHUNK_BYTES;
+#[cfg(debug_assertions)]
+const TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS: &str =
+    "DUET_TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS";
+const POST_PREFLIGHT_RECOVERY_ADVICE: &str = "Recovery: filesystem changes may have been partially applied, but Duet state was not saved. Fix the reported problem, inspect both sides if needed, then rerun duet. If conflicts appear, resolve them manually.";
+const STATE_SAVE_RECOVERY_ADVICE: &str = "Recovery: filesystem changes were applied, but Duet state was not saved on both sides. Fix state storage permissions, then rerun duet before making unrelated changes.";
 
 struct SyncContext {
     profile: profile::Profile,
@@ -47,7 +56,7 @@ pub async fn sync(
     options: SyncOptions,
 ) -> Result<()> {
     env_logger::init();
-    install_ctrlc_handler();
+    install_ctrlc_handler()?;
 
     let SyncContext {
         profile: prf,
@@ -62,6 +71,9 @@ pub async fn sync(
         server_log,
     } = prepare_context(source, path)?;
 
+    sync_ops::check_apply_attempt_clear(&local_state)?;
+    let apply_attempt_id = new_apply_attempt_id(&local_id);
+
     let local_fut = state::old_and_changes(
         &local_base,
         &path,
@@ -74,10 +86,12 @@ pub async fn sync(
     let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
         .await
         .unwrap_or_else(|e| {
-            eprintln!("Failed to start server ({})", e.to_string().cyan());
+            let diagnostic =
+                sync_error::render_report("setup", "launch server", Some(server_log.clone()), e);
+            eprintln!("{}", diagnostic.cyan());
             quit::with_code(SERVER_ERROR_CODE);
         });
-    let remote = remote::get_remote(&mut server);
+    let remote = remote::get_remote(&mut server)?;
 
     let remote_path = path.clone();
     let remote_locations = prf.locations.clone();
@@ -86,7 +100,7 @@ pub async fn sync(
         remote
             .set_base(remote_base)
             .await
-            .expect("Couldn't set server base");
+            .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
         let remote_info = remote.server_info().await.map_err(server_info_error)?;
         if let Some(remote_state_dir) = remote_state_dir {
             require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
@@ -98,12 +112,12 @@ pub async fn sync(
         let changes = remote
             .changes(remote_path, remote_locations, remote_ignore, local_id)
             .await
-            .map_err(|e| eyre!("Couldn't get remote changes: {:?}", e))?;
+            .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))?;
         Ok::<_, color_eyre::eyre::Report>((changes, remote_info))
     };
 
     let (local_result, remote_result) = tokio::join!(local_fut, remote_fut);
-    let (mut local_all_old, local_changes) = local_result.expect("Couldn't get local changes");
+    let (mut local_all_old, local_changes) = local_result?;
     let (remote_changes, remote_info) = remote_result?;
 
     let mut actions = build_actions(&local_changes, &remote_changes);
@@ -126,16 +140,21 @@ pub async fn sync(
             .filter(|a| !a.is_unresolved_conflict())
             .collect(),
     );
+    sync_ops::preflight_state_save(&local_state)?;
     sync_ops::preflight_apply(&local_base, actions.as_ref())?;
     let remote_actions: Actions = reverse(&actions);
     let can_stream_details =
         has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAIL_BATCHES)
             && sync_ops::can_stream_details(&actions)
             && sync_ops::can_stream_details(&remote_actions);
+    let can_prepare_remote_apply =
+        has_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_ATTEMPT_PREPARE);
+    let can_prepare_remote_apply_with_id =
+        has_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_ATTEMPT_ID);
     remote
         .set_actions(remote_actions)
         .await
-        .expect("Failed to set remote actions");
+        .map_err(|e| remote_rpc_error("Failed to set remote actions", e))?;
     log::debug!("set remote actions");
 
     let local_signatures_fut = {
@@ -146,8 +165,9 @@ pub async fn sync(
     let remote_signatures_fut = remote.get_signatures();
     let (local_signatures, remote_signatures) =
         tokio::join!(local_signatures_fut, remote_signatures_fut);
-    let local_signatures = local_signatures?.expect("couldn't get local signatures");
-    let remote_signatures = remote_signatures.expect("couldn't get remote signatures");
+    let local_signatures = local_signatures.wrap_err("local signature task failed")??;
+    let remote_signatures =
+        remote_signatures.map_err(|e| remote_rpc_error("couldn't get remote signatures", e))?;
     log::debug!(
         "{} local signatures; {} remote signatures",
         local_signatures.len(),
@@ -156,9 +176,24 @@ pub async fn sync(
 
     let local_all_old = if can_stream_details {
         log::debug!("streaming detailed changes");
+        prepare_remote_apply_attempt(
+            &remote,
+            can_prepare_remote_apply,
+            can_prepare_remote_apply_with_id,
+            &apply_attempt_id,
+        )
+        .await?;
+        sync_ops::start_apply_attempt(
+            "local",
+            &local_state,
+            &local_base,
+            actions.as_ref(),
+            Some(&apply_attempt_id),
+        )?;
         stream_detailed_changes(
             &remote,
             &local_base,
+            &local_state,
             &actions,
             local_all_old,
             local_signatures,
@@ -177,13 +212,28 @@ pub async fn sync(
         let (local_detailed_changes, remote_detailed_changes) =
             tokio::join!(local_detailed_changes_fut, remote_detailed_changes_fut);
         let local_detailed_changes =
-            local_detailed_changes?.expect("couldn't get local detailed changes");
-        let remote_detailed_changes =
-            remote_detailed_changes.expect("couldn't get remote detailed changes");
+            local_detailed_changes.wrap_err("local detailed changes task failed")??;
+        let remote_detailed_changes = remote_detailed_changes
+            .map_err(|e| remote_rpc_error("couldn't get remote detailed changes", e))?;
         log::debug!("got detailed changes");
 
+        prepare_remote_apply_attempt(
+            &remote,
+            can_prepare_remote_apply,
+            can_prepare_remote_apply_with_id,
+            &apply_attempt_id,
+        )
+        .await?;
+        sync_ops::start_apply_attempt(
+            "local",
+            &local_state,
+            &local_base,
+            actions.as_ref(),
+            Some(&apply_attempt_id),
+        )?;
         let local_apply_fut = {
             let local_base = local_base.clone();
+            let local_state = local_state.clone();
             let actions = actions.clone();
             tokio::task::spawn_blocking(move || {
                 sync_ops::apply_detailed_changes(
@@ -191,22 +241,35 @@ pub async fn sync(
                     &actions,
                     &remote_detailed_changes,
                     &mut local_all_old,
+                    Some(&local_state),
                 )?;
                 Ok::<state::Entries, color_eyre::eyre::Report>(local_all_old)
             })
         };
         let remote_apply_fut = remote.apply_detailed_changes(local_detailed_changes);
         let (local_apply, remote_apply) = tokio::join!(local_apply_fut, remote_apply_fut);
-        let _ = remote_apply?;
-        local_apply.wrap_err("local apply task failed")??
+        let _ = remote_apply
+            .map_err(|e| post_preflight_rpc_error("remote apply failed after preflight", e))?;
+        local_apply
+            .wrap_err("local apply task failed")?
+            .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?
     };
 
+    sync_ops::mark_apply_attempt_state_save(
+        "local",
+        &local_state,
+        &local_base,
+        actions.as_ref(),
+        Some(&apply_attempt_id),
+    )?;
+
     let local_state_display = local_state.display().to_string();
+    let local_state_for_save = local_state.clone();
     let (remote_result, local_result) = tokio::join!(
         remote.save_state(),
         tokio::task::spawn_blocking(move || {
             use atomicwrites::{AllowOverwrite, AtomicFile};
-            let af = AtomicFile::new(local_state, AllowOverwrite);
+            let af = AtomicFile::new(local_state_for_save, AllowOverwrite);
             af.write(|f| {
                 let mut f = BufWriter::new(f);
                 serialize_into(&local_all_old, &mut f, bincode::config::legacy())
@@ -215,34 +278,103 @@ pub async fn sync(
     );
     local_result
         .wrap_err("local state save task failed")?
-        .wrap_err_with(|| format!("failed to save local state {}", local_state_display))?;
-    remote_result.map_err(|e| eyre!("failed to save remote state: {:?}", e))?;
+        .wrap_err_with(|| {
+            format!(
+                "failed to save local state {}\n{}",
+                local_state_display, STATE_SAVE_RECOVERY_ADVICE
+            )
+        })?;
+    sync_ops::finish_apply_attempt(&local_state)?;
+    remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
 
     Ok(())
 }
 
-fn install_ctrlc_handler() {
+async fn prepare_remote_apply_attempt<R>(
+    remote: &R,
+    supported: bool,
+    supports_attempt_id: bool,
+    attempt_id: &str,
+) -> Result<()>
+where
+    R: DuetServerAsync,
+{
+    if supported {
+        if supports_attempt_id {
+            remote
+                .prepare_apply_attempt_with_id(attempt_id.to_string())
+                .await
+                .map_err(|e| remote_rpc_error("Couldn't prepare remote apply recovery", e))?;
+        } else {
+            remote
+                .prepare_apply_attempt()
+                .await
+                .map_err(|e| remote_rpc_error("Couldn't prepare remote apply recovery", e))?;
+        }
+        test_pause_after_remote_apply_prepare().await;
+    }
+    Ok(())
+}
+
+fn new_apply_attempt_id(local_id: &str) -> String {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}-{}", local_id, std::process::id(), since_epoch)
+}
+
+#[cfg(debug_assertions)]
+async fn test_pause_after_remote_apply_prepare() {
+    let Ok(raw_ms) = std::env::var(TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS) else {
+        return;
+    };
+    let Ok(ms) = raw_ms.parse::<u64>() else {
+        return;
+    };
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+#[cfg(not(debug_assertions))]
+async fn test_pause_after_remote_apply_prepare() {}
+
+fn install_ctrlc_handler() -> Result<()> {
     ctrlc::set_handler(|| {
         eprintln!("\nQuitting");
         quit::with_code(CTRLC_CODE);
     })
-    .expect("Error setting Ctrl-C handler");
+    .wrap_err("failed to install Ctrl-C handler")?;
+    Ok(())
 }
 
 fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncContext> {
     let config = profile::load(&source).unwrap_or_else(|e| {
-        eprintln!(
-            "Failed to read profile {} ({})",
-            profile_name(&source).yellow(),
-            e.to_string().cyan()
-        );
+        let diagnostic =
+            sync_error::render_error("setup", "load profile", profile_source_path(&source), e);
+        eprintln!("{}", diagnostic.cyan());
         quit::with_code(PROFILE_ERROR_CODE);
     });
 
     let local_id = local_id(&config.identity);
 
-    let local_base = crate::full(&config.profile.local)?;
-    let (remote_base, remote_server, remote_cmd) = remote::parse_remote(&config.profile.remote)?;
+    let local_base = crate::full(&config.profile.local).map_err(|e| {
+        eyre!(
+            "{}",
+            sync_error::render_report(
+                "setup",
+                "resolve local base",
+                Some(PathBuf::from(&config.profile.local)),
+                e
+            )
+        )
+    })?;
+    let (remote_base, remote_server, remote_cmd) = remote::parse_remote(&config.profile.remote)
+        .map_err(|e| {
+            eyre!(
+                "{}",
+                sync_error::render_report("setup", "parse remote", None, e)
+            )
+        })?;
 
     let path = normalize_path(&local_base, &path.unwrap_or(PathBuf::from("")))?;
     println!(
@@ -276,13 +408,36 @@ fn remote_state_dir_error(error: RPCError) -> color_eyre::eyre::Report {
             "remote server does not support --profile-file state isolation; upgrade remote duet ({:?})",
             error
         ),
-        _ => eyre!("Couldn't set remote state dir: {:?}", error),
+        _ => remote_rpc_error("Couldn't set remote state dir", error),
     }
+}
+
+fn remote_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre::Report {
+    eyre!("{}: {}", context, sync_error::render_rpc_error(&error))
+}
+
+fn post_preflight_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre::Report {
+    eyre!(
+        "{}: {}\n{}",
+        context,
+        sync_error::render_rpc_error(&error),
+        POST_PREFLIGHT_RECOVERY_ADVICE
+    )
+}
+
+fn post_state_save_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre::Report {
+    eyre!(
+        "{}: {}\n{}",
+        context,
+        sync_error::render_rpc_error(&error),
+        STATE_SAVE_RECOVERY_ADVICE
+    )
 }
 
 async fn stream_detailed_changes<R>(
     remote: &R,
     local_base: &PathBuf,
+    local_state: &Path,
     actions: &Actions,
     local_all_old: state::Entries,
     local_signatures: Vec<sync_ops::SignatureWithPath>,
@@ -301,17 +456,21 @@ where
         remote_signatures,
         DETAIL_CHUNK_BYTES,
     );
-    let mut local_applier =
-        sync_ops::DetailApplier::new(local_base.clone(), actions.clone(), local_all_old);
+    let mut local_applier = sync_ops::DetailApplier::new_with_attempt(
+        local_base.clone(),
+        actions.clone(),
+        local_all_old,
+        Some(local_state.to_path_buf()),
+    );
 
     let remote_detail_stream = remote
         .begin_detail_stream(local_signatures, DETAIL_CHUNK_BYTES as u32)
         .await
-        .map_err(|e| eyre!("Couldn't begin remote detail stream: {:?}", e))?;
+        .map_err(|e| remote_rpc_error("Couldn't begin remote detail stream", e))?;
     let remote_apply_stream = remote
         .begin_apply_stream()
         .await
-        .map_err(|e| eyre!("Couldn't begin remote apply stream: {:?}", e))?;
+        .map_err(|e| remote_rpc_error("Couldn't begin remote apply stream", e))?;
 
     let mut local_done = false;
     let mut remote_done = false;
@@ -324,13 +483,15 @@ where
                     DETAIL_BATCH_PAYLOAD_BYTES as u32,
                 )
                 .await
-                .map_err(|e| eyre!("Couldn't read remote detail stream: {:?}", e))?;
+                .map_err(|e| post_preflight_rpc_error("Couldn't read remote detail stream", e))?;
             if frames.is_empty() {
                 remote_done = true;
             } else {
                 let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
                 for frame in frames {
-                    local_applier.apply_frame(frame)?;
+                    local_applier
+                        .apply_frame(frame)
+                        .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
                 }
                 advance_stream_progress(
                     &progress,
@@ -342,8 +503,9 @@ where
         }
 
         if !local_done {
-            let frames =
-                local_producer.next_frames(DETAIL_BATCH_FRAMES, DETAIL_BATCH_PAYLOAD_BYTES)?;
+            let frames = local_producer
+                .next_frames(DETAIL_BATCH_FRAMES, DETAIL_BATCH_PAYLOAD_BYTES)
+                .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
             if frames.is_empty() {
                 local_done = true;
             } else {
@@ -351,7 +513,9 @@ where
                 remote
                     .apply_detail_chunks(remote_apply_stream, frames)
                     .await
-                    .map_err(|e| eyre!("Couldn't apply remote detail stream: {:?}", e))?;
+                    .map_err(|e| {
+                        post_preflight_rpc_error("Couldn't apply remote detail stream", e)
+                    })?;
                 advance_stream_progress(
                     &progress,
                     &mut progress_position,
@@ -362,11 +526,13 @@ where
         }
     }
 
-    let local_all_old = local_applier.finish()?;
+    let local_all_old = local_applier
+        .finish()
+        .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
     remote
         .finish_apply_stream(remote_apply_stream)
         .await
-        .map_err(|e| eyre!("Couldn't finish remote apply stream: {:?}", e))?;
+        .map_err(|e| post_preflight_rpc_error("Couldn't finish remote apply stream", e))?;
     progress.finish_and_clear();
     Ok(local_all_old)
 }
@@ -459,7 +625,7 @@ fn server_info_error(error: RPCError) -> color_eyre::eyre::Report {
             "remote server does not support capability negotiation; upgrade remote duet ({:?})",
             error
         ),
-        _ => eyre!("Couldn't get remote server info: {:?}", error),
+        _ => remote_rpc_error("Couldn't get remote server info", error),
     }
 }
 
@@ -476,10 +642,10 @@ fn require_remote_capability(info: &rpc::ServerInfo, capability: &str) -> Result
     ))
 }
 
-fn profile_name(source: &ProfileSource) -> String {
+fn profile_source_path(source: &ProfileSource) -> Option<PathBuf> {
     match source {
-        ProfileSource::Named(name) => name.clone(),
-        ProfileSource::File(path) => path.display().to_string(),
+        ProfileSource::Named(name) => profile::location(name).ok(),
+        ProfileSource::File(path) => Some(path.clone()),
     }
 }
 
@@ -493,7 +659,13 @@ async fn open_remote_session(remote_server: Option<String>) -> Option<Session> {
         match session_result {
             Ok(session) => Some(session),
             Err(e) => {
-                eprintln!("Unable to get SSH session ({})", e.to_string().cyan());
+                let diagnostic = sync_error::render_message(
+                    "setup",
+                    "open SSH session",
+                    None,
+                    ssh_diagnostic(&e),
+                );
+                eprintln!("{}", diagnostic.cyan());
                 log::error!("Unable to get SSH session: {:?}", e);
                 quit::with_code(SSH_ERROR_CODE);
             }
@@ -501,6 +673,36 @@ async fn open_remote_session(remote_server: Option<String>) -> Option<Session> {
     } else {
         None
     }
+}
+
+fn ssh_diagnostic(error: &openssh::Error) -> String {
+    let display = error.to_string();
+    let debug = format!("{:?}", error);
+    ssh_permission_hint(&display, &debug).unwrap_or(display)
+}
+
+fn ssh_permission_hint(display: &str, debug: &str) -> Option<String> {
+    let combined = format!("{}\n{}", display, debug).to_lowercase();
+
+    if combined.contains("bad permissions")
+        || combined.contains("bad owner or permissions")
+        || combined.contains("permissions are too open")
+        || combined.contains("unprotected private key")
+    {
+        return Some(format!(
+            "{}. OpenSSH rejected a key or SSH config because its permissions are too open; try `chmod 700 ~/.ssh` and `chmod 600 ~/.ssh/<private-key>`, then retry.",
+            display
+        ));
+    }
+
+    if combined.contains("permission denied") && combined.contains("publickey") {
+        return Some(format!(
+            "{}. SSH public-key authentication failed; check that the correct key is loaded and that private key permissions are not too open (`chmod 600 ~/.ssh/<private-key>`).",
+            display
+        ));
+    }
+
+    None
 }
 
 fn build_actions(local_changes: &state::Changes, remote_changes: &state::Changes) -> Actions {
@@ -678,5 +880,17 @@ mod tests {
         let capabilities: [&str; 0] = [];
 
         assert_eq!(format_capabilities(&capabilities), "none");
+    }
+
+    #[test]
+    fn ssh_permission_diagnostic_mentions_chmod_hint() {
+        let diagnostic = ssh_permission_hint(
+            "Bad owner or permissions on /home/user/.ssh/config",
+            "ignored",
+        )
+        .unwrap();
+
+        assert!(diagnostic.contains("chmod 700 ~/.ssh"));
+        assert!(diagnostic.contains("chmod 600 ~/.ssh/<private-key>"));
     }
 }

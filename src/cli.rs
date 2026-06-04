@@ -38,6 +38,9 @@ pub enum Command {
     Walk {
         path: PathBuf,
     },
+    Recover {
+        statefile: PathBuf,
+    },
     Sync {
         profile: ProfileSource,
         path: Option<PathBuf>,
@@ -108,6 +111,9 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         }),
         "_walk" => Ok(Command::Walk {
             path: pargs.free_from_os_str(parse_path)?,
+        }),
+        "_recover" => Ok(Command::Recover {
+            statefile: pargs.free_from_os_str(parse_path)?,
         }),
         _ => Ok(Command::Sync {
             profile: ProfileSource::Named(profile),
@@ -242,6 +248,12 @@ mod tests {
             parse_args(&["_walk", "docs"]),
             Command::Walk {
                 path: PathBuf::from("docs"),
+            }
+        );
+        assert_eq!(
+            parse_args(&["_recover", "state.bin"]),
+            Command::Recover {
+                statefile: PathBuf::from("state.bin"),
             }
         );
     }
