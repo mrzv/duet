@@ -323,11 +323,17 @@ pub fn mark_apply_attempt_state_save(
         )
     })?;
     let committed_operations = committed_operations_from_marker(&existing);
+    let committed_steps = committed_steps_from_marker(&existing);
     let mut contents =
         apply_attempt_contents(side, state_path, base, "state-save", actions, attempt_id);
     for operation in committed_operations {
         contents.push_str("committed-operation: ");
         contents.push_str(&operation);
+        contents.push('\n');
+    }
+    for step in committed_steps {
+        contents.push_str("committed-step: ");
+        contents.push_str(&step);
         contents.push('\n');
     }
     fs::OpenOptions::new()
@@ -383,6 +389,29 @@ fn record_staged_file(attempt_state: Option<&Path>, path: &Path) -> Result<()> {
         .wrap_err_with(|| {
             format!(
                 "unable to record staged file in apply recovery marker {}",
+                marker_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn record_committed_step(
+    attempt_state: Option<&Path>,
+    operation: &str,
+    path: &Path,
+) -> Result<()> {
+    let Some(state_path) = attempt_state else {
+        return Ok(());
+    };
+    let marker_path = apply_attempt_path(state_path)?;
+    let line = format!("committed-step: {} {}\n", operation, path.display());
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&marker_path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .wrap_err_with(|| {
+            format!(
+                "unable to record committed step in apply recovery marker {}",
                 marker_path.display()
             )
         })?;
@@ -581,6 +610,7 @@ struct ApplyAttemptMarker {
     unstaged_operations: Vec<String>,
     staged_files: Vec<String>,
     committed_operations: Vec<String>,
+    committed_steps: Vec<String>,
 }
 
 fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
@@ -596,6 +626,8 @@ fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
             parsed.staged_files.push(path.to_string());
         } else if let Some(operation) = line.strip_prefix("committed-operation: ") {
             parsed.committed_operations.push(operation.to_string());
+        } else if let Some(step) = line.strip_prefix("committed-step: ") {
+            parsed.committed_steps.push(step.to_string());
         }
     }
     parsed
@@ -605,6 +637,14 @@ fn committed_operations_from_marker(marker: &str) -> Vec<String> {
     marker
         .lines()
         .filter_map(|line| line.strip_prefix("committed-operation: "))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn committed_steps_from_marker(marker: &str) -> Vec<String> {
+    marker
+        .lines()
+        .filter_map(|line| line.strip_prefix("committed-step: "))
         .map(ToString::to_string)
         .collect()
 }
@@ -645,6 +685,11 @@ fn apply_attempt_recovery_advice(marker: &str) -> String {
     if !marker.committed_operations.is_empty() {
         advice.push_str(
             " The marker records committed operations; inspect those paths first before removing the marker.",
+        );
+    }
+    if !marker.committed_steps.is_empty() {
+        advice.push_str(
+            " The marker records committed apply steps; inspect those step paths before removing the marker.",
         );
     }
     if !marker.staged_files.is_empty() {
@@ -1559,8 +1604,6 @@ impl DetailApplier {
                 ..
             } => (action_index, output),
         };
-        output.finish()?;
-
         let entry = match &self.actions[action_index] {
             Action::Local(Change::Added(e))
             | Action::ResolvedLocal((_, _), Change::Added(e))
@@ -1569,7 +1612,10 @@ impl DetailApplier {
             _ => return Err(eyre!("file detail finished for non-file action")),
         };
         let filename = self.base.join(entry.path());
+        output.finish()?;
+        record_committed_step(self.attempt_state.as_deref(), "rename-file", entry.path())?;
         self.new_entries.push(update_meta(&filename, entry)?);
+        record_committed_step(self.attempt_state.as_deref(), "update-metadata", entry.path())?;
         record_committed_action(self.attempt_state.as_deref(), &self.actions[action_index])?;
         self.action_index = action_index + 1;
         Ok(())
@@ -1953,7 +1999,8 @@ fn create_file_with_contents(
         .ok_or_else(|| eyre!("temporary output is closed"))?
         .write_all(data)
         .wrap_err_with(|| format!("failed to write temporary file for {}", filename.display()))?;
-    output.finish()
+    output.finish()?;
+    record_committed_step(attempt_state, "rename-file", filename)
 }
 
 fn update_file_with_diff(
@@ -1971,7 +2018,8 @@ fn update_file_with_diff(
         .ok_or_else(|| eyre!("temporary output is closed"))?;
     restore_seek(output_file, source, [0; WINDOW], delta)
         .wrap_err_with(|| format!("failed to restore diff for {}", filename.display()))?;
-    output.finish()
+    output.finish()?;
+    record_committed_step(attempt_state, "rename-file", filename)
 }
 
 fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
@@ -2094,6 +2142,7 @@ mod tests {
 
         start_apply_attempt("local", &state, &base, &actions, Some("attempt-1")).unwrap();
         record_staged_file(Some(&state), &base.join(".duet-part-test")).unwrap();
+        record_committed_step(Some(&state), "rename-file", &PathBuf::from("a.txt")).unwrap();
         record_committed_action(Some(&state), &actions[0]).unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("attempt-id: attempt-1"), "{}", marker);
@@ -2104,6 +2153,11 @@ mod tests {
             marker
         );
         assert!(marker.contains("staged-file: "), "{}", marker);
+        assert!(
+            marker.contains("committed-step: rename-file a.txt"),
+            "{}",
+            marker
+        );
         assert!(
             marker.contains("committed-operation: add-file a.txt"),
             "{}",
@@ -2130,10 +2184,16 @@ mod tests {
             "{}",
             marker
         );
+        assert!(
+            marker.contains("committed-step: rename-file a.txt"),
+            "{}",
+            marker
+        );
         let error = check_apply_attempt_clear(&state).unwrap_err().to_string();
         assert!(error.contains("phase: state-save"));
         assert!(error.contains("state may not have been saved"));
         assert!(error.contains("committed operations"));
+        assert!(error.contains("committed apply steps"));
 
         finish_apply_attempt(&state).unwrap();
         check_apply_attempt_clear(&state).unwrap();
@@ -2141,7 +2201,7 @@ mod tests {
 
     #[test]
     fn apply_attempt_recovery_advice_uses_operation_summaries() {
-        let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\nunstaged-operation: remove-file old.txt\nstaged-file: /tmp/.duet-part-test\ncommitted-operation: modify-file contents.txt\n";
+        let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\nunstaged-operation: remove-file old.txt\nstaged-file: /tmp/.duet-part-test\ncommitted-step: rename-file contents.txt\ncommitted-operation: modify-file contents.txt\n";
 
         let advice = apply_attempt_recovery_advice(marker);
 
@@ -2153,6 +2213,7 @@ mod tests {
             advice
         );
         assert!(advice.contains("committed operations"), "{}", advice);
+        assert!(advice.contains("committed apply steps"), "{}", advice);
         assert!(advice.contains("staged temporary files"), "{}", advice);
         assert!(advice.contains("unstaged operations"), "{}", advice);
     }
