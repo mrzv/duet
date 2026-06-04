@@ -13,6 +13,7 @@ mod rustsync;
 mod scan;
 mod state;
 mod sync;
+mod sync_error;
 mod utils;
 #[macro_use]
 extern crate serde_derive;

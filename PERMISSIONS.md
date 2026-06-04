@@ -36,7 +36,7 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   remote state-save paths before filesystem mutation starts.
 - Already-synced read-only destination directories can be temporarily made
   writable for child file updates and then restored.
-- Remote RPC handlers wrap sync failures in a structured `RemoteSyncError`
+- Remote RPC handlers wrap sync failures in a shared `StructuredSyncError`
   envelope with side, operation, optional path, classified error kind, and source
   message.
 - Streamed apply temp files use bounded-length names, so long destination file
@@ -120,11 +120,12 @@ Remaining work:
 - Replace phase/path marker guidance with operation-specific recovery advice once
   apply attempts record staged paths and committed operations.
 
-### 3. Remote Errors Are Only Partly Structured
+### 3. Sync Errors Are Only Partly Structured
 
-Remote sync errors now use a structured `RemoteSyncError` envelope inside
-`RPCErrorKind::Other`. This is a practical improvement over generic strings, but
-it is not a complete end-to-end error model yet.
+Remote sync errors now use the shared `StructuredSyncError` envelope inside
+`RPCErrorKind::Other`. This is a practical improvement over generic strings and
+removes the earlier RPC-only error type boundary, but it is not a complete
+end-to-end error model yet.
 
 The client parses this envelope for concise remote error rendering. The original
 RPC payload remains line-oriented and machine-readable, but source chains are
@@ -132,8 +133,6 @@ still carried as formatted debug text.
 
 Remaining work:
 
-- Promote the envelope into a shared sync error type instead of an RPC-only
-  wrapper.
 - Preserve structured source chains without relying on formatted debug strings.
 - Extend client-side parsing/rendering to all sync/setup errors, not only remote
   RPC errors.
@@ -205,5 +204,5 @@ Remaining work:
 1. Complete the transactional or resumable apply protocol described above.
 2. Add tests and phase/path-specific recovery advice for races and
    post-preflight failures.
-3. Promote `RemoteSyncError` into an end-to-end structured error model with
-   client-side rendering.
+3. Extend `StructuredSyncError` into a full end-to-end error model with
+   structured source chains and setup-error rendering.

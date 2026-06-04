@@ -16,6 +16,7 @@ use crate::rpc::{self, DuetServerAsync};
 use crate::scan;
 use crate::state;
 use crate::sync as sync_ops;
+use crate::sync_error;
 use crate::utils;
 
 const OK_CODE: u8 = 0;
@@ -306,14 +307,14 @@ fn remote_state_dir_error(error: RPCError) -> color_eyre::eyre::Report {
 }
 
 fn remote_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre::Report {
-    eyre!("{}: {}", context, rpc::render_rpc_error(&error))
+    eyre!("{}: {}", context, sync_error::render_rpc_error(&error))
 }
 
 fn post_preflight_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre::Report {
     eyre!(
         "{}: {}\n{}",
         context,
-        rpc::render_rpc_error(&error),
+        sync_error::render_rpc_error(&error),
         POST_PREFLIGHT_RECOVERY_ADVICE
     )
 }
@@ -322,7 +323,7 @@ fn post_state_save_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre
     eyre!(
         "{}: {}\n{}",
         context,
-        rpc::render_rpc_error(&error),
+        sync_error::render_rpc_error(&error),
         STATE_SAVE_RECOVERY_ADVICE
     )
 }
