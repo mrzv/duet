@@ -231,8 +231,13 @@ impl DuetServer for DuetServerImpl {
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions)
             .map_err(|e| rpc_error("start apply recovery", Some(&remote_state), e))?;
-        let result =
-            sync::apply_detailed_changes(&self.base, &self.actions, &details, &mut self.all_old);
+        let result = sync::apply_detailed_changes(
+            &self.base,
+            &self.actions,
+            &details,
+            &mut self.all_old,
+            Some(&remote_state),
+        );
         match result {
             Ok(()) => {
                 sync::mark_apply_attempt_state_save(
@@ -343,10 +348,11 @@ impl DuetServer for DuetServerImpl {
         sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions)
             .map_err(|e| rpc_error("start apply recovery", Some(&remote_state), e))?;
         let id = self.next_apply_stream_id();
-        let applier = sync::DetailApplier::new(
+        let applier = sync::DetailApplier::new_with_attempt(
             self.base.clone(),
             self.actions.clone(),
             self.all_old.clone(),
+            Some(remote_state.clone()),
         );
         self.apply_streams.insert(id, applier);
         Ok(id)

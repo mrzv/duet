@@ -314,7 +314,19 @@ pub fn mark_apply_attempt_state_save(
     actions: &[Action],
 ) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
-    let contents = apply_attempt_contents(side, state_path, base, "state-save", actions);
+    let existing = fs::read_to_string(&marker_path).wrap_err_with(|| {
+        format!(
+            "unable to read apply recovery marker {}",
+            marker_path.display()
+        )
+    })?;
+    let committed_operations = committed_operations_from_marker(&existing);
+    let mut contents = apply_attempt_contents(side, state_path, base, "state-save", actions);
+    for operation in committed_operations {
+        contents.push_str("committed-operation: ");
+        contents.push_str(&operation);
+        contents.push('\n');
+    }
     fs::OpenOptions::new()
         .write(true)
         .truncate(true)
@@ -327,6 +339,39 @@ pub fn mark_apply_attempt_state_save(
             )
         })?;
     Ok(())
+}
+
+fn record_committed_action(attempt_state: Option<&Path>, action: &Action) -> Result<()> {
+    let Some(state_path) = attempt_state else {
+        return Ok(());
+    };
+    let Some(change) = applied_change(action) else {
+        return Ok(());
+    };
+    let marker_path = apply_attempt_path(state_path)?;
+    let line = format!(
+        "committed-operation: {} {}\n",
+        change_operation(change),
+        action.path().display()
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&marker_path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .wrap_err_with(|| {
+            format!(
+                "unable to record committed operation in apply recovery marker {}",
+                marker_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn applied_change(action: &Action) -> Option<&Change> {
+    match action {
+        Action::Local(change) | Action::ResolvedLocal((_, _), change) => Some(change),
+        _ => None,
+    }
 }
 
 pub fn finish_apply_attempt(state_path: &Path) -> Result<()> {
@@ -452,6 +497,7 @@ fn entry_operation(prefix: &'static str, entry: &Entry) -> &'static str {
 struct ApplyAttemptMarker {
     phase: Option<String>,
     operations: Vec<String>,
+    committed_operations: Vec<String>,
 }
 
 fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
@@ -461,9 +507,19 @@ fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
             parsed.phase = Some(phase.to_string());
         } else if let Some(operation) = line.strip_prefix("operation: ") {
             parsed.operations.push(operation.to_string());
+        } else if let Some(operation) = line.strip_prefix("committed-operation: ") {
+            parsed.committed_operations.push(operation.to_string());
         }
     }
     parsed
+}
+
+fn committed_operations_from_marker(marker: &str) -> Vec<String> {
+    marker
+        .lines()
+        .filter_map(|line| line.strip_prefix("committed-operation: "))
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn apply_attempt_recovery_advice(marker: &str) -> String {
@@ -497,6 +553,11 @@ fn apply_attempt_recovery_advice(marker: &str) -> String {
     {
         advice.push_str(
             " File contents may have changed even if the matching state save did not finish.",
+        );
+    }
+    if !marker.committed_operations.is_empty() {
+        advice.push_str(
+            " The marker records committed operations; inspect those paths first before removing the marker.",
         );
     }
 
@@ -1110,6 +1171,7 @@ pub struct DetailApplier {
     base: PathBuf,
     actions: Vec<Action>,
     all_old: Vec<Entry>,
+    attempt_state: Option<PathBuf>,
     old_index: usize,
     action_index: usize,
     new_entries: Vec<Entry>,
@@ -1117,11 +1179,17 @@ pub struct DetailApplier {
 }
 
 impl DetailApplier {
-    pub fn new(base: PathBuf, actions: Vec<Action>, all_old: Vec<Entry>) -> Self {
+    pub fn new_with_attempt(
+        base: PathBuf,
+        actions: Vec<Action>,
+        all_old: Vec<Entry>,
+        attempt_state: Option<PathBuf>,
+    ) -> Self {
         DetailApplier {
             base,
             actions,
             all_old,
+            attempt_state,
             old_index: 0,
             action_index: 0,
             new_entries: Vec::new(),
@@ -1337,6 +1405,14 @@ impl DetailApplier {
             },
             Action::Conflict(_, _) => {}
         }
+        if let Some(change) = applied_change(&self.actions[action_index]) {
+            if !change.is_dir() {
+                record_committed_action(
+                    self.attempt_state.as_deref(),
+                    &self.actions[action_index],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1391,6 +1467,7 @@ impl DetailApplier {
         };
         let filename = self.base.join(entry.path());
         self.new_entries.push(update_meta(&filename, entry)?);
+        record_committed_action(self.attempt_state.as_deref(), &self.actions[action_index])?;
         self.action_index = action_index + 1;
         Ok(())
     }
@@ -1421,6 +1498,7 @@ impl DetailApplier {
                             self.new_entries.push(update_meta(&dirname, e2)?);
                         }
                     }
+                    record_committed_action(self.attempt_state.as_deref(), action)?;
                 }
                 _ => {}
             }
@@ -1500,6 +1578,7 @@ pub fn apply_detailed_changes(
     actions: &Vec<Action>,
     details: &Vec<ChangeDetails>,
     all_old: &mut Vec<Entry>,
+    attempt_state: Option<&Path>,
 ) -> Result<()> {
     log::debug!("details.len() = {}", details.len());
     let mut details_iter = details.iter();
@@ -1656,6 +1735,9 @@ pub fn apply_detailed_changes(
                         }
                     }
                 }
+                if !change.is_dir() {
+                    record_committed_action(attempt_state, action)?;
+                }
             }
             Action::Remote(change) | Action::ResolvedRemote((_, _), change) => match change {
                 Change::Removed(_) => {}
@@ -1724,6 +1806,7 @@ pub fn apply_detailed_changes(
                         new_entries.push(update_meta(&dirname, e2)?);
                     }
                 }
+                record_committed_action(attempt_state, action)?;
             }
             _ => {}
         }
@@ -1893,8 +1976,14 @@ mod tests {
         fs::create_dir(&base).unwrap();
 
         start_apply_attempt("local", &state, &base, &actions).unwrap();
+        record_committed_action(Some(&state), &actions[0]).unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("operation: add-file a.txt"), "{}", marker);
+        assert!(
+            marker.contains("committed-operation: add-file a.txt"),
+            "{}",
+            marker
+        );
         let error = check_apply_attempt_clear(&state).unwrap_err().to_string();
 
         assert!(error.contains("previous Duet apply attempt did not finish"));
@@ -1903,9 +1992,16 @@ mod tests {
         assert!(error.contains("path: a.txt"));
 
         mark_apply_attempt_state_save("local", &state, &base, &actions).unwrap();
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert!(
+            marker.contains("committed-operation: add-file a.txt"),
+            "{}",
+            marker
+        );
         let error = check_apply_attempt_clear(&state).unwrap_err().to_string();
         assert!(error.contains("phase: state-save"));
         assert!(error.contains("state may not have been saved"));
+        assert!(error.contains("committed operations"));
 
         finish_apply_attempt(&state).unwrap();
         check_apply_attempt_clear(&state).unwrap();
@@ -1913,7 +2009,7 @@ mod tests {
 
     #[test]
     fn apply_attempt_recovery_advice_uses_operation_summaries() {
-        let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\n";
+        let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\ncommitted-operation: modify-file contents.txt\n";
 
         let advice = apply_attempt_recovery_advice(marker);
 
@@ -1924,5 +2020,6 @@ mod tests {
             "{}",
             advice
         );
+        assert!(advice.contains("committed operations"), "{}", advice);
     }
 }

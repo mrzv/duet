@@ -177,6 +177,7 @@ pub async fn sync(
         stream_detailed_changes(
             &remote,
             &local_base,
+            &local_state,
             &actions,
             local_all_old,
             local_signatures,
@@ -204,6 +205,7 @@ pub async fn sync(
         sync_ops::start_apply_attempt("local", &local_state, &local_base, actions.as_ref())?;
         let local_apply_fut = {
             let local_base = local_base.clone();
+            let local_state = local_state.clone();
             let actions = actions.clone();
             tokio::task::spawn_blocking(move || {
                 sync_ops::apply_detailed_changes(
@@ -211,6 +213,7 @@ pub async fn sync(
                     &actions,
                     &remote_detailed_changes,
                     &mut local_all_old,
+                    Some(&local_state),
                 )?;
                 Ok::<state::Entries, color_eyre::eyre::Report>(local_all_old)
             })
@@ -380,6 +383,7 @@ fn post_state_save_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre
 async fn stream_detailed_changes<R>(
     remote: &R,
     local_base: &PathBuf,
+    local_state: &Path,
     actions: &Actions,
     local_all_old: state::Entries,
     local_signatures: Vec<sync_ops::SignatureWithPath>,
@@ -398,8 +402,12 @@ where
         remote_signatures,
         DETAIL_CHUNK_BYTES,
     );
-    let mut local_applier =
-        sync_ops::DetailApplier::new(local_base.clone(), actions.clone(), local_all_old);
+    let mut local_applier = sync_ops::DetailApplier::new_with_attempt(
+        local_base.clone(),
+        actions.clone(),
+        local_all_old,
+        Some(local_state.to_path_buf()),
+    );
 
     let remote_detail_stream = remote
         .begin_detail_stream(local_signatures, DETAIL_CHUNK_BYTES as u32)
