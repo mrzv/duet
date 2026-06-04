@@ -262,6 +262,7 @@ pub fn start_apply_attempt(
     state_path: &Path,
     base: &Path,
     actions: &[Action],
+    attempt_id: Option<&str>,
 ) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
     if let Some(parent) = marker_path.parent() {
@@ -272,7 +273,7 @@ pub fn start_apply_attempt(
             )
         })?;
     }
-    let contents = apply_attempt_contents(side, state_path, base, "apply", actions);
+    let contents = apply_attempt_contents(side, state_path, base, "apply", actions, attempt_id);
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -312,6 +313,7 @@ pub fn mark_apply_attempt_state_save(
     state_path: &Path,
     base: &Path,
     actions: &[Action],
+    attempt_id: Option<&str>,
 ) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
     let existing = fs::read_to_string(&marker_path).wrap_err_with(|| {
@@ -321,7 +323,8 @@ pub fn mark_apply_attempt_state_save(
         )
     })?;
     let committed_operations = committed_operations_from_marker(&existing);
-    let mut contents = apply_attempt_contents(side, state_path, base, "state-save", actions);
+    let mut contents =
+        apply_attempt_contents(side, state_path, base, "state-save", actions, attempt_id);
     for operation in committed_operations {
         contents.push_str("committed-operation: ");
         contents.push_str(&operation);
@@ -404,6 +407,7 @@ fn apply_attempt_contents(
     base: &Path,
     phase: &str,
     actions: &[Action],
+    attempt_id: Option<&str>,
 ) -> String {
     let mut paths: Vec<_> = actions.iter().map(|action| action.path().clone()).collect();
     paths.sort();
@@ -419,6 +423,12 @@ fn apply_attempt_contents(
         paths.len(),
         operations.len()
     );
+
+    if let Some(attempt_id) = attempt_id {
+        contents.push_str("attempt-id: ");
+        contents.push_str(attempt_id);
+        contents.push('\n');
+    }
 
     for path in paths.iter().take(50) {
         contents.push_str("path: ");
@@ -1975,9 +1985,10 @@ mod tests {
         )))];
         fs::create_dir(&base).unwrap();
 
-        start_apply_attempt("local", &state, &base, &actions).unwrap();
+        start_apply_attempt("local", &state, &base, &actions, Some("attempt-1")).unwrap();
         record_committed_action(Some(&state), &actions[0]).unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert!(marker.contains("attempt-id: attempt-1"), "{}", marker);
         assert!(marker.contains("operation: add-file a.txt"), "{}", marker);
         assert!(
             marker.contains("committed-operation: add-file a.txt"),
@@ -1991,8 +2002,9 @@ mod tests {
         assert!(error.contains("phase: apply"));
         assert!(error.contains("path: a.txt"));
 
-        mark_apply_attempt_state_save("local", &state, &base, &actions).unwrap();
+        mark_apply_attempt_state_save("local", &state, &base, &actions, Some("attempt-1")).unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert!(marker.contains("attempt-id: attempt-1"), "{}", marker);
         assert!(
             marker.contains("committed-operation: add-file a.txt"),
             "{}",

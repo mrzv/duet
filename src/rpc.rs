@@ -25,11 +25,13 @@ pub(crate) const CAPABILITY_PROFILE_FILE_STATE_DIR: &str = "profile-file-state-d
 pub(crate) const CAPABILITY_STREAMED_DETAILS: &str = "streamed-details-v1";
 pub(crate) const CAPABILITY_STREAMED_DETAIL_BATCHES: &str = "streamed-detail-batches-v1";
 pub(crate) const CAPABILITY_APPLY_ATTEMPT_PREPARE: &str = "apply-attempt-prepare-v1";
+pub(crate) const CAPABILITY_APPLY_ATTEMPT_ID: &str = "apply-attempt-id-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
     CAPABILITY_STREAMED_DETAIL_BATCHES,
     CAPABILITY_APPLY_ATTEMPT_PREPARE,
+    CAPABILITY_APPLY_ATTEMPT_ID,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -98,6 +100,7 @@ pub trait DuetServer {
         frames: Vec<DetailFrame>,
     ) -> Result<(), RPCError>;
     fn prepare_apply_attempt(&mut self) -> Result<(), RPCError>;
+    fn prepare_apply_attempt_with_id(&mut self, attempt_id: String) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -106,6 +109,7 @@ struct DuetServerImpl {
     remote_state_dir: PathBuf,
     all_old: Entries,
     actions: Actions,
+    apply_attempt_id: Option<String>,
     detail_streams: HashMap<DetailStreamId, DetailProducer>,
     apply_streams: HashMap<ApplyStreamId, sync::DetailApplier>,
     next_stream_id: u64,
@@ -119,6 +123,7 @@ impl DuetServerImpl {
             remote_state_dir: profile::remote_state_dir()?,
             all_old: Vec::new(),
             actions: Vec::new(),
+            apply_attempt_id: None,
             detail_streams: HashMap::new(),
             apply_streams: HashMap::new(),
             next_stream_id: 1,
@@ -135,6 +140,10 @@ impl DuetServerImpl {
         let id = ApplyStreamId(self.next_stream_id);
         self.next_stream_id += 1;
         id
+    }
+
+    fn apply_attempt_id(&self) -> Option<&str> {
+        self.apply_attempt_id.as_deref()
     }
 }
 
@@ -175,6 +184,7 @@ impl DuetServer for DuetServerImpl {
     ) -> Result<Changes, RPCError> {
         log::debug!("remote id = {}", remote_id);
         self.remote_id = remote_id;
+        self.apply_attempt_id = None;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         sync::check_apply_attempt_clear(&remote_state)
             .map_err(|e| rpc_error("check apply recovery", Some(&remote_state), e))?;
@@ -229,8 +239,14 @@ impl DuetServer for DuetServerImpl {
         sync::preflight_apply(&self.base, &self.actions)
             .map_err(|e| rpc_error("preflight apply details", Some(&self.base), e))?;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
-        sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions)
-            .map_err(|e| rpc_error("start apply recovery", Some(&remote_state), e))?;
+        sync::start_apply_attempt(
+            "remote",
+            &remote_state,
+            &self.base,
+            &self.actions,
+            self.apply_attempt_id(),
+        )
+        .map_err(|e| rpc_error("start apply recovery", Some(&remote_state), e))?;
         let result = sync::apply_detailed_changes(
             &self.base,
             &self.actions,
@@ -245,6 +261,7 @@ impl DuetServer for DuetServerImpl {
                     &remote_state,
                     &self.base,
                     &self.actions,
+                    self.apply_attempt_id(),
                 )
                 .map_err(|e| rpc_error("mark apply recovery state-save", Some(&remote_state), e))?;
                 Ok(())
@@ -345,8 +362,14 @@ impl DuetServer for DuetServerImpl {
         sync::preflight_apply(&self.base, &self.actions)
             .map_err(|e| rpc_error("preflight apply stream", Some(&self.base), e))?;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
-        sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions)
-            .map_err(|e| rpc_error("start apply recovery", Some(&remote_state), e))?;
+        sync::start_apply_attempt(
+            "remote",
+            &remote_state,
+            &self.base,
+            &self.actions,
+            self.apply_attempt_id(),
+        )
+        .map_err(|e| rpc_error("start apply recovery", Some(&remote_state), e))?;
         let id = self.next_apply_stream_id();
         let applier = sync::DetailApplier::new_with_attempt(
             self.base.clone(),
@@ -382,8 +405,14 @@ impl DuetServer for DuetServerImpl {
             .finish()
             .map_err(|e| rpc_error("finish apply stream", Some(&self.base), e))?;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
-        sync::mark_apply_attempt_state_save("remote", &remote_state, &self.base, &self.actions)
-            .map_err(|e| rpc_error("mark apply recovery state-save", Some(&remote_state), e))?;
+        sync::mark_apply_attempt_state_save(
+            "remote",
+            &remote_state,
+            &self.base,
+            &self.actions,
+            self.apply_attempt_id(),
+        )
+        .map_err(|e| rpc_error("mark apply recovery state-save", Some(&remote_state), e))?;
         Ok(())
     }
 
@@ -427,9 +456,30 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn prepare_apply_attempt(&mut self) -> Result<(), RPCError> {
+        self.apply_attempt_id = None;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
-        sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions)
+        sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions, None)
             .map_err(|e| rpc_error("prepare apply recovery", Some(&remote_state), e))
+    }
+
+    fn prepare_apply_attempt_with_id(&mut self, attempt_id: String) -> Result<(), RPCError> {
+        if attempt_id.is_empty() {
+            return Err(rpc_error(
+                "prepare apply recovery",
+                None,
+                "apply attempt id is empty",
+            ));
+        }
+        self.apply_attempt_id = Some(attempt_id);
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::start_apply_attempt(
+            "remote",
+            &remote_state,
+            &self.base,
+            &self.actions,
+            self.apply_attempt_id(),
+        )
+        .map_err(|e| rpc_error("prepare apply recovery", Some(&remote_state), e))
     }
 }
 
@@ -507,6 +557,7 @@ pub async fn server() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::Action;
 
     #[test]
     fn server_info_advertises_protocol_and_capabilities() {
@@ -520,8 +571,35 @@ mod tests {
                 CAPABILITY_PROFILE_FILE_STATE_DIR.to_string(),
                 CAPABILITY_STREAMED_DETAILS.to_string(),
                 CAPABILITY_STREAMED_DETAIL_BATCHES.to_string(),
-                CAPABILITY_APPLY_ATTEMPT_PREPARE.to_string()
+                CAPABILITY_APPLY_ATTEMPT_PREPARE.to_string(),
+                CAPABILITY_APPLY_ATTEMPT_ID.to_string()
             ]
         );
+    }
+
+    #[test]
+    fn prepare_apply_attempt_with_id_writes_marker_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+
+        let mut server = DuetServerImpl::new().unwrap();
+        server.base = base;
+        server.remote_id = "remote-peer".to_string();
+        server.remote_state_dir = dir.path().join("state");
+        server.actions = Vec::<Action>::new();
+
+        server
+            .prepare_apply_attempt_with_id("attempt-1".to_string())
+            .unwrap();
+        let remote_state = profile::remote_state_in(&server.remote_state_dir, &server.remote_id);
+        let marker = remote_state.with_file_name(format!(
+            ".{}.duet-apply",
+            remote_state.file_name().unwrap().to_string_lossy()
+        ));
+        let marker_contents = std::fs::read_to_string(&marker).unwrap();
+        assert!(marker_contents.contains("attempt-id: attempt-1"));
+
+        server.begin_apply_stream().unwrap();
     }
 }

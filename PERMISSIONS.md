@@ -62,11 +62,12 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   ownership, ACLs, xattrs, platform-specific permission models, and symlink
   permissions are not.
 - Local and remote apply now create a side-local recovery marker before applying
-  changes, record the apply/state-save phase, affected paths, and operation
-  summaries, append committed-operation records as side-local actions complete,
-  and remove the marker after state save succeeds. A later sync refuses to run if
-  the marker remains, with phase- and operation-aware recovery instructions
-  instead of silently continuing from an unknown partial-apply state.
+  changes, record a shared attempt id, the apply/state-save phase, affected
+  paths, and operation summaries, append committed-operation records as
+  side-local actions complete, and remove the marker after state save succeeds. A
+  later sync refuses to run if the marker remains, with phase- and
+  operation-aware recovery instructions instead of silently continuing from an
+  unknown partial-apply state.
 - New peers prepare the remote apply marker before local mutation starts, so both
   sides have recovery markers before the concurrent apply phase begins.
 - Permission tests now cover a representative race where the remote destination
@@ -79,11 +80,12 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
 
 Current preflight catches common permission failures before mutation, and apply
 now records recovery markers while filesystem changes and state saves are in
-progress. The markers include the side, base, state file, current phase,
-affected paths, compact operation summaries, and committed-operation records for
-side-local actions that completed before interruption. New peers prepare both
-local and remote markers before concurrent apply begins. This prevents a later
-run from silently continuing after an interrupted apply. Sync is still not a true
+progress. The markers include the side, base, state file, shared apply attempt
+id, current phase, affected paths, compact operation summaries, and
+committed-operation records for side-local actions that completed before
+interruption. New peers prepare both local and remote markers before concurrent
+apply begins. This prevents a later run from silently continuing after an
+interrupted apply. Sync is still not a true
 transaction: local and remote apply can still mutate files before a later
 non-preflighted error, crash, or race is detected.
 
@@ -105,7 +107,8 @@ Target design:
 Remaining work:
 
 - Add RPC methods for `prepare`, `commit`, `finish`, and `recover`, advertised by
-  a protocol capability.
+  a protocol capability. The current protocol has a prepare marker RPC with a
+  shared attempt id, but not a full staged prepare/commit/recover sequence.
 - Move streamed and non-streamed apply through the same staged apply engine.
   File-content writes now share the same temporary-output primitive, but the full
   staged engine still needs to cover directory, symlink, metadata, and removal

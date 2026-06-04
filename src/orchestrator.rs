@@ -2,6 +2,7 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 #[cfg(debug_assertions)]
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::{eyre, Result, WrapErr};
@@ -71,6 +72,7 @@ pub async fn sync(
     } = prepare_context(source, path)?;
 
     sync_ops::check_apply_attempt_clear(&local_state)?;
+    let apply_attempt_id = new_apply_attempt_id(&local_id);
 
     let local_fut = state::old_and_changes(
         &local_base,
@@ -147,6 +149,8 @@ pub async fn sync(
             && sync_ops::can_stream_details(&remote_actions);
     let can_prepare_remote_apply =
         has_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_ATTEMPT_PREPARE);
+    let can_prepare_remote_apply_with_id =
+        has_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_ATTEMPT_ID);
     remote
         .set_actions(remote_actions)
         .await
@@ -172,8 +176,20 @@ pub async fn sync(
 
     let local_all_old = if can_stream_details {
         log::debug!("streaming detailed changes");
-        prepare_remote_apply_attempt(&remote, can_prepare_remote_apply).await?;
-        sync_ops::start_apply_attempt("local", &local_state, &local_base, actions.as_ref())?;
+        prepare_remote_apply_attempt(
+            &remote,
+            can_prepare_remote_apply,
+            can_prepare_remote_apply_with_id,
+            &apply_attempt_id,
+        )
+        .await?;
+        sync_ops::start_apply_attempt(
+            "local",
+            &local_state,
+            &local_base,
+            actions.as_ref(),
+            Some(&apply_attempt_id),
+        )?;
         stream_detailed_changes(
             &remote,
             &local_base,
@@ -201,8 +217,20 @@ pub async fn sync(
             .map_err(|e| remote_rpc_error("couldn't get remote detailed changes", e))?;
         log::debug!("got detailed changes");
 
-        prepare_remote_apply_attempt(&remote, can_prepare_remote_apply).await?;
-        sync_ops::start_apply_attempt("local", &local_state, &local_base, actions.as_ref())?;
+        prepare_remote_apply_attempt(
+            &remote,
+            can_prepare_remote_apply,
+            can_prepare_remote_apply_with_id,
+            &apply_attempt_id,
+        )
+        .await?;
+        sync_ops::start_apply_attempt(
+            "local",
+            &local_state,
+            &local_base,
+            actions.as_ref(),
+            Some(&apply_attempt_id),
+        )?;
         let local_apply_fut = {
             let local_base = local_base.clone();
             let local_state = local_state.clone();
@@ -227,7 +255,13 @@ pub async fn sync(
             .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?
     };
 
-    sync_ops::mark_apply_attempt_state_save("local", &local_state, &local_base, actions.as_ref())?;
+    sync_ops::mark_apply_attempt_state_save(
+        "local",
+        &local_state,
+        &local_base,
+        actions.as_ref(),
+        Some(&apply_attempt_id),
+    )?;
 
     let local_state_display = local_state.display().to_string();
     let local_state_for_save = local_state.clone();
@@ -256,18 +290,38 @@ pub async fn sync(
     Ok(())
 }
 
-async fn prepare_remote_apply_attempt<R>(remote: &R, supported: bool) -> Result<()>
+async fn prepare_remote_apply_attempt<R>(
+    remote: &R,
+    supported: bool,
+    supports_attempt_id: bool,
+    attempt_id: &str,
+) -> Result<()>
 where
     R: DuetServerAsync,
 {
     if supported {
-        remote
-            .prepare_apply_attempt()
-            .await
-            .map_err(|e| remote_rpc_error("Couldn't prepare remote apply recovery", e))?;
+        if supports_attempt_id {
+            remote
+                .prepare_apply_attempt_with_id(attempt_id.to_string())
+                .await
+                .map_err(|e| remote_rpc_error("Couldn't prepare remote apply recovery", e))?;
+        } else {
+            remote
+                .prepare_apply_attempt()
+                .await
+                .map_err(|e| remote_rpc_error("Couldn't prepare remote apply recovery", e))?;
+        }
         test_pause_after_remote_apply_prepare().await;
     }
     Ok(())
+}
+
+fn new_apply_attempt_id(local_id: &str) -> String {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}-{}", local_id, std::process::id(), since_epoch)
 }
 
 #[cfg(debug_assertions)]
