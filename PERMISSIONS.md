@@ -47,6 +47,10 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   permission failures, and server launch errors include command/log context.
 - Applied Unix modes are masked to permission/special bits before `chmod`, so
   file-type bits from `symlink_metadata` are not passed back to the OS.
+- `README.md` documents the user-facing metadata model: file contents,
+  directories, symlink targets, Unix mode bits, and mtimes are synchronized;
+  ownership, ACLs, xattrs, platform-specific permission models, and symlink
+  permissions are not.
 
 ## Remaining Work
 
@@ -133,8 +137,6 @@ permission/special bits (`0o7777`) before calling `chmod`.
 
 Remaining work:
 
-- Document the supported metadata model in user-facing docs: Unix mode bits and
-  mtimes, not ownership/ACLs/xattrs.
 - Decide whether uid/gid support is in scope. If it is, gate it behind explicit
   capability checks and clear behavior for non-root users.
 
@@ -188,5 +190,4 @@ Remaining work:
    post-preflight failures.
 3. Promote `RemoteSyncError` into an end-to-end structured error model with
    client-side rendering.
-4. Document the user-facing metadata model outside this internal status file.
-5. Decide whether permission-denied skip/per-file recovery is in scope.
+4. Decide whether permission-denied skip/per-file recovery is in scope.
