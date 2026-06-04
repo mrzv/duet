@@ -432,15 +432,17 @@ fn apply_attempt_contents(
     paths.sort();
     paths.dedup();
     let operations = apply_attempt_operations(actions);
+    let unstaged_operations = apply_attempt_unstaged_operations(actions);
 
     let mut contents = format!(
-        "duet-apply-attempt-v1\nside: {}\nbase: {}\nstate: {}\nphase: {}\npath-count: {}\noperation-count: {}\n",
+        "duet-apply-attempt-v1\nside: {}\nbase: {}\nstate: {}\nphase: {}\npath-count: {}\noperation-count: {}\nunstaged-operation-count: {}\n",
         side,
         base.display(),
         state_path.display(),
         phase,
         paths.len(),
-        operations.len()
+        operations.len(),
+        unstaged_operations.len()
     );
 
     if let Some(attempt_id) = attempt_id {
@@ -465,6 +467,14 @@ fn apply_attempt_contents(
     if operations.len() > 50 {
         contents.push_str("operations-truncated: true\n");
     }
+    for operation in unstaged_operations.iter().take(50) {
+        contents.push_str("unstaged-operation: ");
+        contents.push_str(operation);
+        contents.push('\n');
+    }
+    if unstaged_operations.len() > 50 {
+        contents.push_str("unstaged-operations-truncated: true\n");
+    }
     contents
 }
 
@@ -472,19 +482,61 @@ fn apply_attempt_operations(actions: &[Action]) -> Vec<String> {
     let mut operations: Vec<_> = actions
         .iter()
         .map(|action| {
-            let change = match action {
-                Action::Local(change)
-                | Action::Remote(change)
-                | Action::ResolvedLocal((_, _), change)
-                | Action::ResolvedRemote((_, _), change) => change,
-                Action::Conflict(left, _) | Action::Identical(left, _) => left,
-            };
+            let change = action_change(action);
             format!("{} {}", change_operation(change), change.path().display())
         })
         .collect();
     operations.sort();
     operations.dedup();
     operations
+}
+
+fn apply_attempt_unstaged_operations(actions: &[Action]) -> Vec<String> {
+    let mut operations: Vec<_> = actions
+        .iter()
+        .filter_map(|action| {
+            unstaged_change_operation(action_change(action))
+                .map(|op| format!("{} {}", op, action.path().display()))
+        })
+        .collect();
+    operations.sort();
+    operations.dedup();
+    operations
+}
+
+fn action_change(action: &Action) -> &Change {
+    match action {
+        Action::Local(change)
+        | Action::Remote(change)
+        | Action::ResolvedLocal((_, _), change)
+        | Action::ResolvedRemote((_, _), change) => change,
+        Action::Conflict(left, _) | Action::Identical(left, _) => left,
+    }
+}
+
+fn unstaged_change_operation(change: &Change) -> Option<&'static str> {
+    match change {
+        Change::Added(entry) => {
+            if entry.is_file() {
+                Some("metadata")
+            } else {
+                Some(entry_operation("add", entry))
+            }
+        }
+        Change::Removed(entry) => Some(entry_operation("remove", entry)),
+        Change::Modified(old, new) => {
+            if old.is_file() && new.is_file() && !old.same_contents(new) {
+                Some("metadata")
+            } else if old.is_file() == new.is_file()
+                && old.is_dir() == new.is_dir()
+                && old.is_symlink() == new.is_symlink()
+            {
+                Some(change_operation(change))
+            } else {
+                Some("replace")
+            }
+        }
+    }
 }
 
 fn change_operation(change: &Change) -> &'static str {
@@ -526,6 +578,7 @@ fn entry_operation(prefix: &'static str, entry: &Entry) -> &'static str {
 struct ApplyAttemptMarker {
     phase: Option<String>,
     operations: Vec<String>,
+    unstaged_operations: Vec<String>,
     staged_files: Vec<String>,
     committed_operations: Vec<String>,
 }
@@ -537,6 +590,8 @@ fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
             parsed.phase = Some(phase.to_string());
         } else if let Some(operation) = line.strip_prefix("operation: ") {
             parsed.operations.push(operation.to_string());
+        } else if let Some(operation) = line.strip_prefix("unstaged-operation: ") {
+            parsed.unstaged_operations.push(operation.to_string());
         } else if let Some(path) = line.strip_prefix("staged-file: ") {
             parsed.staged_files.push(path.to_string());
         } else if let Some(operation) = line.strip_prefix("committed-operation: ") {
@@ -595,6 +650,11 @@ fn apply_attempt_recovery_advice(marker: &str) -> String {
     if !marker.staged_files.is_empty() {
         advice.push_str(
             " The marker lists staged temporary files that may be safe to remove after inspection if they were not renamed into place.",
+        );
+    }
+    if !marker.unstaged_operations.is_empty() {
+        advice.push_str(
+            " The marker lists unstaged operations that commit directly; inspect those paths for partial changes.",
         );
     }
 
@@ -2038,6 +2098,11 @@ mod tests {
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("attempt-id: attempt-1"), "{}", marker);
         assert!(marker.contains("operation: add-file a.txt"), "{}", marker);
+        assert!(
+            marker.contains("unstaged-operation: metadata a.txt"),
+            "{}",
+            marker
+        );
         assert!(marker.contains("staged-file: "), "{}", marker);
         assert!(
             marker.contains("committed-operation: add-file a.txt"),
@@ -2054,6 +2119,11 @@ mod tests {
         mark_apply_attempt_state_save("local", &state, &base, &actions, Some("attempt-1")).unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("attempt-id: attempt-1"), "{}", marker);
+        assert!(
+            marker.contains("unstaged-operation: metadata a.txt"),
+            "{}",
+            marker
+        );
         assert!(!marker.contains("staged-file: "), "{}", marker);
         assert!(
             marker.contains("committed-operation: add-file a.txt"),
@@ -2071,7 +2141,7 @@ mod tests {
 
     #[test]
     fn apply_attempt_recovery_advice_uses_operation_summaries() {
-        let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\nstaged-file: /tmp/.duet-part-test\ncommitted-operation: modify-file contents.txt\n";
+        let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\nunstaged-operation: remove-file old.txt\nstaged-file: /tmp/.duet-part-test\ncommitted-operation: modify-file contents.txt\n";
 
         let advice = apply_attempt_recovery_advice(marker);
 
@@ -2084,5 +2154,6 @@ mod tests {
         );
         assert!(advice.contains("committed operations"), "{}", advice);
         assert!(advice.contains("staged temporary files"), "{}", advice);
+        assert!(advice.contains("unstaged operations"), "{}", advice);
     }
 }

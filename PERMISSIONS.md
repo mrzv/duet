@@ -64,11 +64,12 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   permissions are not.
 - Local and remote apply now create a side-local recovery marker before applying
   changes, record a shared attempt id, the apply/state-save phase, affected
-  paths, operation summaries, and staged temporary file paths, append
-  committed-operation records as side-local actions complete, and remove the
-  marker after state save succeeds. A later sync refuses to run if the marker
-  remains, with phase- and operation-aware recovery instructions instead of
-  silently continuing from an unknown partial-apply state.
+  paths, operation summaries, unstaged-operation classifications, and staged
+  temporary file paths, append committed-operation records as side-local actions
+  complete, and remove the marker after state save succeeds. A later sync
+  refuses to run if the marker remains, with phase- and operation-aware recovery
+  instructions instead of silently continuing from an unknown partial-apply
+  state.
 - New peers prepare the remote apply marker before local mutation starts, so both
   sides have recovery markers before the concurrent apply phase begins.
 - Permission tests now cover a representative race where the remote destination
@@ -82,7 +83,8 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
 Current preflight catches common permission failures before mutation, and apply
 now records recovery markers while filesystem changes and state saves are in
 progress. The markers include the side, base, state file, shared apply attempt
-id, current phase, affected paths, compact operation summaries, and
+id, current phase, affected paths, compact operation summaries,
+unstaged-operation classifications for direct commit operations, plus
 committed-operation records for side-local actions that completed before
 interruption. While apply is in progress, file content writes also record staged
 temporary file paths that may need cleanup after a crash. New peers prepare both
@@ -115,8 +117,8 @@ Remaining work:
   File-content writes now share the same temporary-output primitive, but the full
   staged engine still needs to cover directory, symlink, metadata, and removal
   operations.
-- Stage or explicitly classify every operation that cannot be staged, especially
-  directory removals, type replacements, chmod, and utime.
+- Convert the broad unstaged-operation classifications into step-level commit
+  records for directory removals, type replacements, chmod, and utime.
 - Persist enough committed-operation metadata to resume automatically after a
   crash. The current marker records completed side-local action summaries, but it
   does not yet record per-step commit points inside multi-step replacements or
@@ -138,8 +140,8 @@ state may not have been saved. If a process exits before cleanup, the recovery
 marker blocks the next sync until the user inspects the listed paths and removes
 the marker. Marker recovery advice is tailored to the recorded phase and to
 planned destructive, metadata, or file-content operations, and it calls out when
-staged-file or committed-operation records are present. This is still not a
-resumable apply protocol.
+staged-file, unstaged-operation, or committed-operation records are present.
+This is still not a resumable apply protocol.
 
 Remaining work:
 
@@ -148,9 +150,9 @@ Remaining work:
 - Expand preflight coverage for less common replacement/remove combinations as
   they are found.
 - Add more race tests as new post-preflight failure modes are found.
-- Replace action-level committed-operation guidance with step-level recovery
-  advice once apply attempts record staged paths and individual commit points
-  inside multi-step replacements.
+- Replace action-level committed-operation and broad unstaged-operation guidance
+  with step-level recovery advice once apply attempts record individual commit
+  points inside multi-step replacements.
 
 ### 3. Sync Errors Are Only Partly Structured
 
