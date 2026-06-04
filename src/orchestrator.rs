@@ -166,7 +166,7 @@ pub async fn sync(
 
     let local_all_old = if can_stream_details {
         log::debug!("streaming detailed changes");
-        sync_ops::start_apply_attempt("local", &local_state, &local_base)?;
+        sync_ops::start_apply_attempt("local", &local_state, &local_base, actions.as_ref())?;
         stream_detailed_changes(
             &remote,
             &local_base,
@@ -193,7 +193,7 @@ pub async fn sync(
             .map_err(|e| remote_rpc_error("couldn't get remote detailed changes", e))?;
         log::debug!("got detailed changes");
 
-        sync_ops::start_apply_attempt("local", &local_state, &local_base)?;
+        sync_ops::start_apply_attempt("local", &local_state, &local_base, actions.as_ref())?;
         let local_apply_fut = {
             let local_base = local_base.clone();
             let actions = actions.clone();
@@ -215,6 +215,8 @@ pub async fn sync(
             .wrap_err("local apply task failed")?
             .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?
     };
+
+    sync_ops::mark_apply_attempt_state_save("local", &local_state, &local_base, actions.as_ref())?;
 
     let local_state_display = local_state.display().to_string();
     let local_state_for_save = local_state.clone();

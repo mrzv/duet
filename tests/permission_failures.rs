@@ -373,7 +373,7 @@ fn unfinished_local_apply_marker_blocks_next_sync() {
     let marker = apply_marker_for(&case.local_state());
     write(
         &marker,
-        "duet-apply-attempt-v1\nside: local\nphase: apply-or-state-save\n",
+        "duet-apply-attempt-v1\nside: local\nphase: apply\npath-count: 1\npath: a.txt\n",
     );
     write(&local_file, "updated");
 
@@ -396,7 +396,7 @@ fn unfinished_remote_apply_marker_blocks_next_sync() {
     let marker = apply_marker_for(&remote_state_file(&case));
     write(
         &marker,
-        "duet-apply-attempt-v1\nside: remote\nphase: apply-or-state-save\n",
+        "duet-apply-attempt-v1\nside: remote\nphase: state-save\npath-count: 1\npath: a.txt\n",
     );
     write(&local_file, "updated");
 
@@ -405,6 +405,7 @@ fn unfinished_remote_apply_marker_blocks_next_sync() {
     assert_failure(&output);
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("previous Duet apply attempt did not finish"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("state may not have been saved"));
     assert_eq!(read(&remote_file), "initial");
 }
 

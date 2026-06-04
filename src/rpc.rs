@@ -185,6 +185,10 @@ impl RemoteSyncError {
         if let Some(summary) = first_error_line(&self.message) {
             rendered.push_str(&format!(": {}", summary));
         }
+        if let Some(recovery) = recovery_line(&self.message) {
+            rendered.push('\n');
+            rendered.push_str(recovery);
+        }
         rendered
     }
 }
@@ -220,6 +224,13 @@ fn classify_error_message(message: &str) -> &'static str {
 
 fn first_error_line(message: &str) -> Option<&str> {
     message.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn recovery_line(message: &str) -> Option<&str> {
+    message.lines().find_map(|line| {
+        let line = line.trim();
+        line.find("Recovery:").map(|index| &line[index..])
+    })
 }
 
 pub(crate) fn render_rpc_error(error: &RPCError) -> String {
@@ -349,12 +360,21 @@ impl DuetServer for DuetServerImpl {
         sync::preflight_apply(&self.base, &self.actions)
             .map_err(|e| rpc_error("preflight apply details", Some(&self.base), e))?;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
-        sync::start_apply_attempt("remote", &remote_state, &self.base)
+        sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions)
             .map_err(|e| rpc_error("start apply recovery", Some(&remote_state), e))?;
         let result =
             sync::apply_detailed_changes(&self.base, &self.actions, &details, &mut self.all_old);
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                sync::mark_apply_attempt_state_save(
+                    "remote",
+                    &remote_state,
+                    &self.base,
+                    &self.actions,
+                )
+                .map_err(|e| rpc_error("mark apply recovery state-save", Some(&remote_state), e))?;
+                Ok(())
+            }
             Err(e) => Err(rpc_error("apply details", Some(&self.base), e)),
         }
     }
@@ -451,7 +471,7 @@ impl DuetServer for DuetServerImpl {
         sync::preflight_apply(&self.base, &self.actions)
             .map_err(|e| rpc_error("preflight apply stream", Some(&self.base), e))?;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
-        sync::start_apply_attempt("remote", &remote_state, &self.base)
+        sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions)
             .map_err(|e| rpc_error("start apply recovery", Some(&remote_state), e))?;
         let id = self.next_apply_stream_id();
         let applier = sync::DetailApplier::new(
@@ -486,6 +506,9 @@ impl DuetServer for DuetServerImpl {
         self.all_old = applier
             .finish()
             .map_err(|e| rpc_error("finish apply stream", Some(&self.base), e))?;
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::mark_apply_attempt_state_save("remote", &remote_state, &self.base, &self.actions)
+            .map_err(|e| rpc_error("mark apply recovery state-save", Some(&remote_state), e))?;
         Ok(())
     }
 
@@ -626,5 +649,25 @@ mod tests {
         assert!(rendered.contains("remote apply details failed"));
         assert!(rendered.contains("blocked/file.txt"));
         assert!(rendered.contains("permission_denied"));
+    }
+
+    #[test]
+    fn remote_sync_error_rendering_preserves_recovery_advice() {
+        let error = RemoteSyncError {
+            version: 1,
+            side: "remote".to_string(),
+            operation: "check apply recovery".to_string(),
+            path: Some(PathBuf::from("profile.remotes/state")),
+            kind: "other".to_string(),
+            message: "previous Duet apply attempt did not finish\nRecovery: filesystem changes were applied, but Duet state may not have been saved on this side."
+                .to_string(),
+        };
+        let rpc_error = RPCError::new(RPCErrorKind::Other, error.to_string());
+
+        let rendered = render_rpc_error(&rpc_error);
+
+        assert!(rendered.contains("remote check apply recovery failed"));
+        assert!(rendered.contains("Recovery: filesystem changes were applied"));
+        assert!(rendered.contains("state may not have been saved"));
     }
 }
