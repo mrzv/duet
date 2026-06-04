@@ -1,5 +1,7 @@
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+#[cfg(debug_assertions)]
+use std::time::Duration;
 
 use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::{eyre, Result, WrapErr};
@@ -28,6 +30,9 @@ const CTRLC_CODE: u8 = 6;
 const DETAIL_CHUNK_BYTES: usize = 1024 * 1024;
 const DETAIL_BATCH_FRAMES: usize = 256;
 const DETAIL_BATCH_PAYLOAD_BYTES: usize = DETAIL_CHUNK_BYTES;
+#[cfg(debug_assertions)]
+const TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS: &str =
+    "DUET_TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS";
 const POST_PREFLIGHT_RECOVERY_ADVICE: &str = "Recovery: filesystem changes may have been partially applied, but Duet state was not saved. Fix the reported problem, inspect both sides if needed, then rerun duet. If conflicts appear, resolve them manually.";
 const STATE_SAVE_RECOVERY_ADVICE: &str = "Recovery: filesystem changes were applied, but Duet state was not saved on both sides. Fix state storage permissions, then rerun duet before making unrelated changes.";
 
@@ -259,9 +264,24 @@ where
             .prepare_apply_attempt()
             .await
             .map_err(|e| remote_rpc_error("Couldn't prepare remote apply recovery", e))?;
+        test_pause_after_remote_apply_prepare().await;
     }
     Ok(())
 }
+
+#[cfg(debug_assertions)]
+async fn test_pause_after_remote_apply_prepare() {
+    let Ok(raw_ms) = std::env::var(TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS) else {
+        return;
+    };
+    let Ok(ms) = raw_ms.parse::<u64>() else {
+        return;
+    };
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+#[cfg(not(debug_assertions))]
+async fn test_pause_after_remote_apply_prepare() {}
 
 fn install_ctrlc_handler() -> Result<()> {
     ctrlc::set_handler(|| {

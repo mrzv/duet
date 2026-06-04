@@ -4,7 +4,9 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -52,6 +54,19 @@ impl SyncCase {
             .arg("-b")
             .env("NO_COLOR", "1")
             .output()
+            .unwrap()
+    }
+
+    fn sync_child(&self) -> Child {
+        Command::new(duet_bin())
+            .arg("--profile-file")
+            .arg(&self.profile)
+            .arg("-b")
+            .env("NO_COLOR", "1")
+            .env("DUET_TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS", "500")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap()
     }
 
@@ -117,6 +132,24 @@ fn remote_state_file(case: &SyncCase) -> PathBuf {
         .unwrap()
         .unwrap()
         .path()
+}
+
+fn wait_for_path_while_child_runs(path: &Path, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "child exited with {} before {} appeared",
+                status,
+                path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {}", path.display());
 }
 
 struct PermissionGuard {
@@ -407,6 +440,54 @@ fn unfinished_remote_apply_marker_blocks_next_sync() {
         .contains("previous Duet apply attempt did not finish"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("state may not have been saved"));
     assert_eq!(read(&remote_file), "initial");
+}
+
+#[test]
+fn post_preflight_remote_permission_race_leaves_recovery_marker() {
+    let case = SyncCase::new(&["+link"]);
+    let local_link = case.local.join("link");
+    let remote_link = case.remote.join("link");
+    write(&local_link, "initial");
+    assert_success(case.sync());
+
+    fs::remove_file(&local_link).unwrap();
+    std::os::unix::fs::symlink("target.txt", &local_link).unwrap();
+    let remote_state = remote_state_file(&case);
+    let marker = apply_marker_for(&remote_state);
+    let mut child = case.sync_child();
+    wait_for_path_while_child_runs(&marker, &mut child);
+    let guard = PermissionGuard::set(&case.remote, 0o555);
+
+    let output = child.wait_with_output().unwrap();
+    drop(guard);
+
+    assert_failure(&output);
+    assert!(
+        marker.exists(),
+        "expected recovery marker at {}",
+        marker.display()
+    );
+    let marker_contents = read(&marker);
+    assert!(
+        marker_contents.contains("phase: apply"),
+        "{}",
+        marker_contents
+    );
+    assert!(
+        marker_contents.contains("operation: replace link"),
+        "{}",
+        marker_contents
+    );
+    assert_eq!(read(&remote_link), "initial");
+    let recovery_output = case.sync();
+    assert_failure(&recovery_output);
+    let stderr = String::from_utf8_lossy(&recovery_output.stderr);
+    assert!(
+        stderr.contains("previous Duet apply attempt did not finish")
+            && stderr.contains("Recovery:"),
+        "expected recovery context\nstderr:\n{}",
+        stderr
+    );
 }
 
 #[test]

@@ -58,6 +58,9 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   instructions instead of silently continuing from an unknown partial-apply state.
 - New peers prepare the remote apply marker before local mutation starts, so both
   sides have recovery markers before the concurrent apply phase begins.
+- Permission tests now cover a representative race where the remote destination
+  becomes unwritable after remote apply recovery is prepared; the next sync is
+  blocked by the recovery marker instead of proceeding from unknown state.
 
 ## Remaining Work
 
@@ -121,7 +124,7 @@ Remaining work:
   possible.
 - Expand preflight coverage for less common replacement/remove combinations as
   they are found.
-- Add tests for representative races between preflight and apply.
+- Add more race tests as new post-preflight failure modes are found.
 - Replace planned-operation marker guidance with committed-operation recovery
   advice once apply attempts record staged paths and committed operations.
 
