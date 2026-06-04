@@ -54,8 +54,8 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
 - Local and remote apply now create a side-local recovery marker before applying
   changes, record the apply/state-save phase, affected paths, and operation
   summaries, and remove the marker after state save succeeds. A later sync
-  refuses to run if the marker remains, with recovery instructions instead of
-  silently continuing from an unknown partial-apply state.
+  refuses to run if the marker remains, with phase- and operation-aware recovery
+  instructions instead of silently continuing from an unknown partial-apply state.
 - New peers prepare the remote apply marker before local mutation starts, so both
   sides have recovery markers before the concurrent apply phase begins.
 
@@ -111,7 +111,9 @@ When a post-preflight apply or state-save error occurs, Duet now reports recover
 advice explaining that filesystem changes may have been partially applied and
 state may not have been saved. If a process exits before cleanup, the recovery
 marker blocks the next sync until the user inspects the listed paths and removes
-the marker. This is still not a resumable apply protocol.
+the marker. Marker recovery advice is tailored to the recorded phase and to
+planned destructive, metadata, or file-content operations. This is still not a
+resumable apply protocol.
 
 Remaining work:
 
@@ -120,8 +122,8 @@ Remaining work:
 - Expand preflight coverage for less common replacement/remove combinations as
   they are found.
 - Add tests for representative races between preflight and apply.
-- Replace phase/path marker guidance with operation-specific recovery advice once
-  apply attempts record staged paths and committed operations.
+- Replace planned-operation marker guidance with committed-operation recovery
+  advice once apply attempts record staged paths and committed operations.
 
 ### 3. Sync Errors Are Only Partly Structured
 

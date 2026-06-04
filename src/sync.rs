@@ -448,12 +448,59 @@ fn entry_operation(prefix: &'static str, entry: &Entry) -> &'static str {
     }
 }
 
-fn apply_attempt_recovery_advice(marker: &str) -> &'static str {
-    if marker.lines().any(|line| line == "phase: state-save") {
+#[derive(Debug, Default)]
+struct ApplyAttemptMarker {
+    phase: Option<String>,
+    operations: Vec<String>,
+}
+
+fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
+    let mut parsed = ApplyAttemptMarker::default();
+    for line in marker.lines() {
+        if let Some(phase) = line.strip_prefix("phase: ") {
+            parsed.phase = Some(phase.to_string());
+        } else if let Some(operation) = line.strip_prefix("operation: ") {
+            parsed.operations.push(operation.to_string());
+        }
+    }
+    parsed
+}
+
+fn apply_attempt_recovery_advice(marker: &str) -> String {
+    let marker = parse_apply_attempt_marker(marker);
+    let mut advice = if marker.phase.as_deref() == Some("state-save") {
         "Recovery: filesystem changes were applied, but Duet state may not have been saved on this side. Fix state-storage permissions if needed, inspect the listed paths if needed, then remove this marker and rerun Duet before making unrelated changes."
+            .to_string()
     } else {
         "Recovery: filesystem changes may have been partially applied on this side. Inspect the listed paths on both sides, fix any permission or filesystem problem, then remove this marker and rerun Duet."
+            .to_string()
+    };
+
+    if marker
+        .operations
+        .iter()
+        .any(|operation| operation.starts_with("remove-") || operation.starts_with("replace "))
+    {
+        advice.push_str(" Removed or replaced paths may need to be restored or reconciled before removing the marker.");
     }
+    if marker.operations.iter().any(|operation| {
+        operation.starts_with("modify-metadata")
+            || operation.starts_with("modify-dir-metadata")
+            || operation.starts_with("modify-symlink")
+    }) {
+        advice.push_str(" Metadata operations may have changed modes, mtimes, or symlink targets without matching state.");
+    }
+    if marker
+        .operations
+        .iter()
+        .any(|operation| operation.starts_with("add-file") || operation.starts_with("modify-file"))
+    {
+        advice.push_str(
+            " File contents may have changed even if the matching state save did not finish.",
+        );
+    }
+
+    advice
 }
 
 fn preflight_directory_writable_or_creatable(path: &Path, description: &str) -> Result<()> {
@@ -1866,5 +1913,20 @@ mod tests {
 
         finish_apply_attempt(&state).unwrap();
         check_apply_attempt_clear(&state).unwrap();
+    }
+
+    #[test]
+    fn apply_attempt_recovery_advice_uses_operation_summaries() {
+        let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\n";
+
+        let advice = apply_attempt_recovery_advice(marker);
+
+        assert!(advice.contains("Removed or replaced paths"), "{}", advice);
+        assert!(advice.contains("Metadata operations"), "{}", advice);
+        assert!(
+            advice.contains("File contents may have changed"),
+            "{}",
+            advice
+        );
     }
 }
