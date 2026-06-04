@@ -1481,15 +1481,35 @@ impl DetailApplier {
                     let filename = self.base.join(e.path());
                     if !e.is_dir() {
                         fs::remove_file(&filename)?;
+                        record_committed_step(
+                            self.attempt_state.as_deref(),
+                            "remove-file",
+                            e.path(),
+                        )?;
                     }
                 }
                 Change::Added(e) => {
                     let filename = self.base.join(e.path());
                     if let Some(p) = e.target() {
                         std::os::unix::fs::symlink(p, &filename)?;
+                        record_committed_step(
+                            self.attempt_state.as_deref(),
+                            "create-symlink",
+                            e.path(),
+                        )?;
                         self.new_entries.push(update_meta(&filename, e)?);
+                        record_committed_step(
+                            self.attempt_state.as_deref(),
+                            "update-metadata",
+                            e.path(),
+                        )?;
                     } else if e.is_dir() {
                         fs::create_dir(&filename)?;
+                        record_committed_step(
+                            self.attempt_state.as_deref(),
+                            "create-dir",
+                            e.path(),
+                        )?;
                     } else {
                         return Err(eyre!("missing file detail for {}", e.path().display()));
                     }
@@ -1505,13 +1525,38 @@ impl DetailApplier {
                                 ));
                             }
                             self.new_entries.push(update_meta(&filename, e2)?);
+                            record_committed_step(
+                                self.attempt_state.as_deref(),
+                                "update-metadata",
+                                e2.path(),
+                            )?;
                         } else {
                             fs::remove_file(&filename)?;
+                            record_committed_step(
+                                self.attempt_state.as_deref(),
+                                "remove-file",
+                                e1.path(),
+                            )?;
                             if let Some(p) = e2.target() {
                                 std::os::unix::fs::symlink(p, &filename)?;
+                                record_committed_step(
+                                    self.attempt_state.as_deref(),
+                                    "create-symlink",
+                                    e2.path(),
+                                )?;
                                 self.new_entries.push(update_meta(&filename, e2)?);
+                                record_committed_step(
+                                    self.attempt_state.as_deref(),
+                                    "update-metadata",
+                                    e2.path(),
+                                )?;
                             } else if e2.is_dir() {
                                 fs::create_dir(&filename)?;
+                                record_committed_step(
+                                    self.attempt_state.as_deref(),
+                                    "create-dir",
+                                    e2.path(),
+                                )?;
                             } else {
                                 return Err(eyre!(
                                     "unsupported new entry for {}",
@@ -1524,11 +1569,31 @@ impl DetailApplier {
                             return Err(eyre!("missing file detail for {}", e2.path().display()));
                         }
                         fs::remove_file(&filename)?;
+                        record_committed_step(
+                            self.attempt_state.as_deref(),
+                            "remove-symlink",
+                            e1.path(),
+                        )?;
                         if let Some(p) = e2.target() {
                             std::os::unix::fs::symlink(p, &filename)?;
+                            record_committed_step(
+                                self.attempt_state.as_deref(),
+                                "create-symlink",
+                                e2.path(),
+                            )?;
                             self.new_entries.push(update_meta(&filename, e2)?);
+                            record_committed_step(
+                                self.attempt_state.as_deref(),
+                                "update-metadata",
+                                e2.path(),
+                            )?;
                         } else if e2.is_dir() {
                             fs::create_dir(&filename)?;
+                            record_committed_step(
+                                self.attempt_state.as_deref(),
+                                "create-dir",
+                                e2.path(),
+                            )?;
                         }
                     } else if e1.is_dir() {
                         if e2.is_file() {
@@ -1632,10 +1697,20 @@ impl DetailApplier {
                         Change::Removed(e) => {
                             let dirname = self.base.join(e.path());
                             fs::remove_dir(&dirname)?;
+                            record_committed_step(
+                                self.attempt_state.as_deref(),
+                                "remove-dir",
+                                e.path(),
+                            )?;
                         }
                         Change::Added(e) => {
                             let dirname = self.base.join(e.path());
                             self.new_entries.push(update_meta(&dirname, e)?);
+                            record_committed_step(
+                                self.attempt_state.as_deref(),
+                                "update-metadata",
+                                e.path(),
+                            )?;
                         }
                         Change::Modified(e1, e2) => {
                             let dirname = self.base.join(e2.path());
@@ -1645,6 +1720,11 @@ impl DetailApplier {
                                 ));
                             }
                             self.new_entries.push(update_meta(&dirname, e2)?);
+                            record_committed_step(
+                                self.attempt_state.as_deref(),
+                                "update-metadata",
+                                e2.path(),
+                            )?;
                         }
                     }
                     record_committed_action(self.attempt_state.as_deref(), action)?;
@@ -1771,6 +1851,7 @@ pub fn apply_detailed_changes(
                             fs::remove_file(&filename).wrap_err_with(|| {
                                 format!("failed to remove file {}", filename.display())
                             })?;
+                            record_committed_step(attempt_state, "remove-file", e.path())?;
                         } // else: removing directory;
                           //   must happen after all the files have been removed, which will happen
                           //   in the second pass
@@ -1786,11 +1867,14 @@ pub fn apply_detailed_changes(
                                     p.display()
                                 )
                             })?;
+                            record_committed_step(attempt_state, "create-symlink", e.path())?;
                             new_entries.push(update_meta(&filename, e)?);
+                            record_committed_step(attempt_state, "update-metadata", e.path())?;
                         } else if e.is_dir() {
                             fs::create_dir(&filename).wrap_err_with(|| {
                                 format!("failed to create directory {}", filename.display())
                             })?;
+                            record_committed_step(attempt_state, "create-dir", e.path())?;
                             // new entry gets updated in the second pass, after all the updates in
                             // the directory are finished
                         } else {
@@ -1798,6 +1882,7 @@ pub fn apply_detailed_changes(
                             let detail = next_detail(&mut details_iter, e.path())?;
                             create_file(&filename, detail, attempt_state)?;
                             new_entries.push(update_meta(&filename, e)?);
+                            record_committed_step(attempt_state, "update-metadata", e.path())?;
                         }
                     }
                     Change::Modified(e1, e2) => {
@@ -1819,12 +1904,18 @@ pub fn apply_detailed_changes(
                                     }
                                 }
                                 new_entries.push(update_meta(&filename, e2)?);
+                                record_committed_step(
+                                    attempt_state,
+                                    "update-metadata",
+                                    e2.path(),
+                                )?;
                             } else {
                                 // e2 not a file
                                 // remove the file
                                 fs::remove_file(&filename).wrap_err_with(|| {
                                     format!("failed to remove file {}", filename.display())
                                 })?;
+                                record_committed_step(attempt_state, "remove-file", e1.path())?;
                                 if let Some(p) = e2.target() {
                                     std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
                                         format!(
@@ -1833,11 +1924,22 @@ pub fn apply_detailed_changes(
                                             p.display()
                                         )
                                     })?;
+                                    record_committed_step(
+                                        attempt_state,
+                                        "create-symlink",
+                                        e2.path(),
+                                    )?;
                                     new_entries.push(update_meta(&filename, e2)?);
+                                    record_committed_step(
+                                        attempt_state,
+                                        "update-metadata",
+                                        e2.path(),
+                                    )?;
                                 } else if e2.is_dir() {
                                     fs::create_dir(&filename).wrap_err_with(|| {
                                         format!("failed to create directory {}", filename.display())
                                     })?;
+                                    record_committed_step(attempt_state, "create-dir", e2.path())?;
                                 } else {
                                     return Err(eyre!(
                                         "unsupported new entry for {}",
@@ -1850,10 +1952,16 @@ pub fn apply_detailed_changes(
                             fs::remove_file(&filename).wrap_err_with(|| {
                                 format!("failed to remove file {}", filename.display())
                             })?;
+                            record_committed_step(attempt_state, "remove-symlink", e1.path())?;
                             if e2.is_file() {
                                 let detail = next_detail(&mut details_iter, e2.path())?;
                                 create_file(&filename, detail, attempt_state)?;
                                 new_entries.push(update_meta(&filename, e2)?);
+                                record_committed_step(
+                                    attempt_state,
+                                    "update-metadata",
+                                    e2.path(),
+                                )?;
                             } else if let Some(p) = e2.target() {
                                 std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
                                     format!(
@@ -1862,11 +1970,22 @@ pub fn apply_detailed_changes(
                                         p.display()
                                     )
                                 })?;
+                                record_committed_step(
+                                    attempt_state,
+                                    "create-symlink",
+                                    e2.path(),
+                                )?;
                                 new_entries.push(update_meta(&filename, e2)?);
+                                record_committed_step(
+                                    attempt_state,
+                                    "update-metadata",
+                                    e2.path(),
+                                )?;
                             } else if e2.is_dir() {
                                 fs::create_dir(&filename).wrap_err_with(|| {
                                     format!("failed to create directory {}", filename.display())
                                 })?;
+                                record_committed_step(attempt_state, "create-dir", e2.path())?;
                                 // new entry gets updated in the second pass, after all the updates in
                                 // the directory are finished
                             }
@@ -1926,10 +2045,12 @@ pub fn apply_detailed_changes(
                         fs::remove_dir(&dirname).wrap_err_with(|| {
                             format!("failed to remove directory {}", dirname.display())
                         })?;
+                        record_committed_step(attempt_state, "remove-dir", e.path())?;
                     }
                     Change::Added(e) => {
                         let dirname = base.join(e.path());
                         new_entries.push(update_meta(&dirname, e)?);
+                        record_committed_step(attempt_state, "update-metadata", e.path())?;
                     }
                     Change::Modified(e1, e2) => {
                         let dirname = base.join(e2.path());
@@ -1937,6 +2058,7 @@ pub fn apply_detailed_changes(
                             fs::remove_dir(&dirname).wrap_err_with(|| {
                                 format!("failed to remove directory {}", dirname.display())
                             })?;
+                            record_committed_step(attempt_state, "remove-dir", e1.path())?;
                             if let Some(p) = e2.target() {
                                 std::os::unix::fs::symlink(p, &dirname).wrap_err_with(|| {
                                     format!(
@@ -1945,6 +2067,11 @@ pub fn apply_detailed_changes(
                                         p.display()
                                     )
                                 })?;
+                                record_committed_step(
+                                    attempt_state,
+                                    "create-symlink",
+                                    e2.path(),
+                                )?;
                             } else if e2.is_file() {
                                 let detail = details_iter.next().ok_or_else(|| {
                                     eyre!("missing detail for {}", e2.path().display())
@@ -1953,6 +2080,7 @@ pub fn apply_detailed_changes(
                             }
                         }
                         new_entries.push(update_meta(&dirname, e2)?);
+                        record_committed_step(attempt_state, "update-metadata", e2.path())?;
                     }
                 }
                 record_committed_action(attempt_state, action)?;
