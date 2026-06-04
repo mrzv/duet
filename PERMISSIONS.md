@@ -171,17 +171,22 @@ Remaining work:
 - Keep path-aware failure messages for any ancestor that must still be read or
   statted.
 
-### 7. There Is No Permission-Denied Skip Or Per-File Recovery Policy
+### 7. Permission-Denied Skip Is Out Of Scope For Default Sync
 
 The current policy is fail-fast. That is safer than silently skipping unreadable
 paths, but it means one inaccessible path aborts the sync.
 
+Decision: keep fail-fast as the default and do not add implicit skip behavior.
+Skipping permission-denied paths is only acceptable as a future explicit opt-in
+mode, because both sides must know exactly which paths were skipped so they are
+not interpreted as deletions or legitimate updates.
+
 Remaining work:
 
-- Decide whether an explicit skip policy is desirable.
-- If implemented, communicate skipped permission-denied paths to both sides so
-  they are not interpreted as removals or legitimate updates.
-- Make skipped-path behavior opt-in and visible in the action plan.
+- If an opt-in skip mode is implemented, communicate skipped permission-denied
+  paths to both sides so they are not interpreted as removals or legitimate
+  updates.
+- Make any skipped-path behavior visible in the action plan and final summary.
 
 ## Current Priority Order
 
@@ -190,4 +195,3 @@ Remaining work:
    post-preflight failures.
 3. Promote `RemoteSyncError` into an end-to-end structured error model with
    client-side rendering.
-4. Decide whether permission-denied skip/per-file recovery is in scope.
