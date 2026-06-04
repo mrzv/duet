@@ -363,14 +363,16 @@ fn apply_attempt_contents(
     let mut paths: Vec<_> = actions.iter().map(|action| action.path().clone()).collect();
     paths.sort();
     paths.dedup();
+    let operations = apply_attempt_operations(actions);
 
     let mut contents = format!(
-        "duet-apply-attempt-v1\nside: {}\nbase: {}\nstate: {}\nphase: {}\npath-count: {}\n",
+        "duet-apply-attempt-v1\nside: {}\nbase: {}\nstate: {}\nphase: {}\npath-count: {}\noperation-count: {}\n",
         side,
         base.display(),
         state_path.display(),
         phase,
-        paths.len()
+        paths.len(),
+        operations.len()
     );
 
     for path in paths.iter().take(50) {
@@ -381,7 +383,69 @@ fn apply_attempt_contents(
     if paths.len() > 50 {
         contents.push_str("paths-truncated: true\n");
     }
+    for operation in operations.iter().take(50) {
+        contents.push_str("operation: ");
+        contents.push_str(operation);
+        contents.push('\n');
+    }
+    if operations.len() > 50 {
+        contents.push_str("operations-truncated: true\n");
+    }
     contents
+}
+
+fn apply_attempt_operations(actions: &[Action]) -> Vec<String> {
+    let mut operations: Vec<_> = actions
+        .iter()
+        .map(|action| {
+            let change = match action {
+                Action::Local(change)
+                | Action::Remote(change)
+                | Action::ResolvedLocal((_, _), change)
+                | Action::ResolvedRemote((_, _), change) => change,
+                Action::Conflict(left, _) | Action::Identical(left, _) => left,
+            };
+            format!("{} {}", change_operation(change), change.path().display())
+        })
+        .collect();
+    operations.sort();
+    operations.dedup();
+    operations
+}
+
+fn change_operation(change: &Change) -> &'static str {
+    match change {
+        Change::Added(entry) => entry_operation("add", entry),
+        Change::Removed(entry) => entry_operation("remove", entry),
+        Change::Modified(old, new) => {
+            if old.is_file() && new.is_file() && !old.same_contents(new) {
+                "modify-file"
+            } else if old.is_dir() && new.is_dir() {
+                "modify-dir-metadata"
+            } else if old.is_symlink() && new.is_symlink() {
+                "modify-symlink"
+            } else if old.is_file() == new.is_file()
+                && old.is_dir() == new.is_dir()
+                && old.is_symlink() == new.is_symlink()
+            {
+                "modify-metadata"
+            } else {
+                "replace"
+            }
+        }
+    }
+}
+
+fn entry_operation(prefix: &'static str, entry: &Entry) -> &'static str {
+    match (prefix, entry.is_dir(), entry.is_symlink()) {
+        ("add", true, _) => "add-dir",
+        ("add", _, true) => "add-symlink",
+        ("add", _, _) => "add-file",
+        ("remove", true, _) => "remove-dir",
+        ("remove", _, true) => "remove-symlink",
+        ("remove", _, _) => "remove-file",
+        _ => prefix,
+    }
 }
 
 fn apply_attempt_recovery_advice(marker: &str) -> &'static str {
@@ -1786,6 +1850,8 @@ mod tests {
         fs::create_dir(&base).unwrap();
 
         start_apply_attempt("local", &state, &base, &actions).unwrap();
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert!(marker.contains("operation: add-file a.txt"), "{}", marker);
         let error = check_apply_attempt_clear(&state).unwrap_err().to_string();
 
         assert!(error.contains("previous Duet apply attempt did not finish"));

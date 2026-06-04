@@ -52,10 +52,10 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   ownership, ACLs, xattrs, platform-specific permission models, and symlink
   permissions are not.
 - Local and remote apply now create a side-local recovery marker before applying
-  changes, record the apply/state-save phase and affected paths, and remove the
-  marker after state save succeeds. A later sync refuses to run if the marker
-  remains, with recovery instructions instead of silently continuing from an
-  unknown partial-apply state.
+  changes, record the apply/state-save phase, affected paths, and operation
+  summaries, and remove the marker after state save succeeds. A later sync
+  refuses to run if the marker remains, with recovery instructions instead of
+  silently continuing from an unknown partial-apply state.
 - New peers prepare the remote apply marker before local mutation starts, so both
   sides have recovery markers before the concurrent apply phase begins.
 
@@ -66,11 +66,11 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
 Current preflight catches common permission failures before mutation, and apply
 now records recovery markers while filesystem changes and state saves are in
 progress. The markers include the side, base, state file, current phase, and
-affected paths. New peers prepare both local and remote markers before concurrent
-apply begins. This prevents a later run from silently continuing after an
-interrupted apply. Sync is still not a true transaction: local and remote apply
-can still mutate files before a later non-preflighted error, crash, or race is
-detected.
+affected paths plus compact operation summaries. New peers prepare both local and
+remote markers before concurrent apply begins. This prevents a later run from
+silently continuing after an interrupted apply. Sync is still not a true
+transaction: local and remote apply can still mutate files before a later
+non-preflighted error, crash, or race is detected.
 
 Target design:
 
@@ -94,10 +94,10 @@ Remaining work:
 - Move streamed and non-streamed apply through the same staged apply engine.
 - Stage or explicitly classify every operation that cannot be staged, especially
   directory removals, type replacements, chmod, and utime.
-- Persist richer operation-level attempt metadata to resume or provide
-  deterministic recovery instructions after a crash. The current marker identifies
-  the broad phase and affected paths, but not which individual operations
-  committed.
+- Persist enough committed-operation metadata to resume or provide deterministic
+  recovery instructions after a crash. The current marker identifies the broad
+  phase, affected paths, and planned operation summaries, but not which
+  individual operations committed.
 - Keep state saving after both sides have committed successfully.
 
 ### 2. Preflight And Apply Recovery Are Still Best-Effort
