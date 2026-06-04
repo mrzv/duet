@@ -43,6 +43,8 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   names no longer create overlong temporary path components.
 - Setup/orchestration paths that previously used permission-triggerable
   `expect`/`unwrap` calls now return contextual errors.
+- SSH/session setup now adds targeted hints for common private-key and SSH config
+  permission failures, and server launch errors include command/log context.
 - Applied Unix modes are masked to permission/special bits before `chmod`, so
   file-type bits from `symlink_metadata` are not passed back to the OS.
 
@@ -136,25 +138,24 @@ Remaining work:
 - Decide whether uid/gid support is in scope. If it is, gate it behind explicit
   capability checks and clear behavior for non-root users.
 
-### 5. Server, Profile, And SSH Setup Still Need Better Diagnostics
+### 5. Server, Profile, And SSH Setup Diagnostics Are Still Evolving
 
 Most permission-triggerable setup `expect`/`unwrap` paths in profile loading,
 remote command expansion, RPC setup, and orchestration have been converted to
-contextual errors. Some setup failures still happen before normal sync error
-handling is established and can produce weak diagnostics.
+contextual errors. SSH setup adds hints for common key/config permission
+failures, and server launch errors include the command and server log path where
+available. Some setup failures still happen before normal sync error handling is
+established and can produce weak diagnostics.
 
 Known examples:
 
-- SSH key permission failures rely on OpenSSH output and do not provide a
-  targeted `chmod 600` hint.
 - Server startup failures before RPC initialization still depend on child
   process stderr/log context.
 
 Remaining work:
 
-- Add targeted SSH diagnostics for common key-permission failures.
-- Preserve remote server startup failures with enough context to identify log,
-  config, state, temp, and base-path permission problems.
+- Preserve remote server startup failures with enough context to identify remote
+  log, config, state, temp, and base-path permission problems before RPC starts.
 
 ### 6. Restricted Sync Can Still Enumerate Readable Ancestors Broadly
 
@@ -187,6 +188,5 @@ Remaining work:
    post-preflight failures.
 3. Promote `RemoteSyncError` into an end-to-end structured error model with
    client-side rendering.
-4. Add targeted SSH/server-startup diagnostics.
-5. Document the user-facing metadata model outside this internal status file.
-6. Decide whether permission-denied skip/per-file recovery is in scope.
+4. Document the user-facing metadata model outside this internal status file.
+5. Decide whether permission-denied skip/per-file recovery is in scope.

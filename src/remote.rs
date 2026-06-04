@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use essrpc::transports::BincodeAsyncClientTransport;
 use essrpc::AsyncRPCClient;
 use openssh::{RemoteChild, Session};
@@ -13,7 +13,15 @@ use crate::io_wrappers::{StdinWrapper, StdoutWrapper};
 
 pub(crate) fn parse_remote(remote: &String) -> Result<(String, Option<String>, String)> {
     let elements: Vec<&str> = remote.split_whitespace().collect();
+    if elements.is_empty() {
+        return Err(eyre!("remote profile entry is empty"));
+    }
     let (remote_server, i) = if elements[0] == "ssh" {
+        if elements.len() < 3 {
+            return Err(eyre!(
+                "ssh remote must have the form `ssh <server> [duet-command] <base-path>`"
+            ));
+        }
         (Some(elements[1].to_string()), 2)
     } else {
         (None, 0)
@@ -42,13 +50,14 @@ pub(crate) async fn launch_server<'a>(
 ) -> Result<Server<'a>> {
     if let Some(session) = session {
         let server = session
-            .command(cmd)
+            .command(&cmd)
             .arg("--server")
             .stdin(openssh::process::Stdio::piped())
             .stdout(openssh::process::Stdio::piped())
             .stderr(openssh::process::Stdio::inherit())
             .spawn()
-            .await?;
+            .await
+            .wrap_err_with(|| format!("failed to launch remote duet server `{}` over SSH", cmd))?;
 
         log::trace!("launched remote server");
 
@@ -58,13 +67,20 @@ pub(crate) async fn launch_server<'a>(
             .map_err(|e| eyre!("failed to expand local server command {}: {}", cmd, e))?
             .to_string_lossy()
             .to_string();
-        let server = TokioCommand::new(cmd)
+        let server = TokioCommand::new(&cmd)
             .arg("--server")
             .env(crate::rpc::SERVER_LOG_ENV, server_log)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()?;
+            .spawn()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to launch local duet server `{}`; server log: {}",
+                    cmd,
+                    server_log.display()
+                )
+            })?;
 
         log::trace!("launched local server");
 
@@ -154,5 +170,14 @@ mod tests {
         assert_eq!(base, "/remote/base");
         assert_eq!(server, Some("example.com".to_string()));
         assert_eq!(cmd, "/bin/duet");
+    }
+
+    #[test]
+    fn rejects_incomplete_ssh_remote() {
+        let error = parse_remote(&"ssh example.com".to_string())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ssh <server>"));
     }
 }

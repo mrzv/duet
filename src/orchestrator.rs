@@ -76,7 +76,11 @@ pub async fn sync(
     let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
         .await
         .unwrap_or_else(|e| {
-            eprintln!("Failed to start server ({})", e.to_string().cyan());
+            eprintln!(
+                "Failed to start server ({}). Server log: {}",
+                e.to_string().cyan(),
+                server_log.display().to_string().yellow()
+            );
             quit::with_code(SERVER_ERROR_CODE);
         });
     let remote = remote::get_remote(&mut server)?;
@@ -535,7 +539,7 @@ async fn open_remote_session(remote_server: Option<String>) -> Option<Session> {
         match session_result {
             Ok(session) => Some(session),
             Err(e) => {
-                eprintln!("Unable to get SSH session ({})", e.to_string().cyan());
+                eprintln!("Unable to get SSH session ({})", ssh_diagnostic(&e).cyan());
                 log::error!("Unable to get SSH session: {:?}", e);
                 quit::with_code(SSH_ERROR_CODE);
             }
@@ -543,6 +547,36 @@ async fn open_remote_session(remote_server: Option<String>) -> Option<Session> {
     } else {
         None
     }
+}
+
+fn ssh_diagnostic(error: &openssh::Error) -> String {
+    let display = error.to_string();
+    let debug = format!("{:?}", error);
+    ssh_permission_hint(&display, &debug).unwrap_or(display)
+}
+
+fn ssh_permission_hint(display: &str, debug: &str) -> Option<String> {
+    let combined = format!("{}\n{}", display, debug).to_lowercase();
+
+    if combined.contains("bad permissions")
+        || combined.contains("bad owner or permissions")
+        || combined.contains("permissions are too open")
+        || combined.contains("unprotected private key")
+    {
+        return Some(format!(
+            "{}. OpenSSH rejected a key or SSH config because its permissions are too open; try `chmod 700 ~/.ssh` and `chmod 600 ~/.ssh/<private-key>`, then retry.",
+            display
+        ));
+    }
+
+    if combined.contains("permission denied") && combined.contains("publickey") {
+        return Some(format!(
+            "{}. SSH public-key authentication failed; check that the correct key is loaded and that private key permissions are not too open (`chmod 600 ~/.ssh/<private-key>`).",
+            display
+        ));
+    }
+
+    None
 }
 
 fn build_actions(local_changes: &state::Changes, remote_changes: &state::Changes) -> Actions {
@@ -720,5 +754,17 @@ mod tests {
         let capabilities: [&str; 0] = [];
 
         assert_eq!(format_capabilities(&capabilities), "none");
+    }
+
+    #[test]
+    fn ssh_permission_diagnostic_mentions_chmod_hint() {
+        let diagnostic = ssh_permission_hint(
+            "Bad owner or permissions on /home/user/.ssh/config",
+            "ignored",
+        )
+        .unwrap();
+
+        assert!(diagnostic.contains("chmod 700 ~/.ssh"));
+        assert!(diagnostic.contains("chmod 600 ~/.ssh/<private-key>"));
     }
 }
