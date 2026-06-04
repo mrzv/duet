@@ -52,7 +52,9 @@ These issues are covered by active tests in `tests/permission_failures.rs`.
   permission failures, and server launch errors include command/log context. SSH
   session, profile-loading, local-base expansion, remote-profile parsing, and
   server-launch failures now use the shared structured error renderer even when
-  they occur before the RPC server is available.
+  they occur before the RPC server is available. Remote server setup also uses
+  the shared renderer for log path, log directory, log file, default state-dir,
+  and server task startup failures.
 - Applied Unix modes are masked to permission/special bits before `chmod`, so
   file-type bits from `symlink_metadata` are not passed back to the OS.
 - `README.md` documents the user-facing metadata model: file contents,
@@ -178,20 +180,22 @@ remote command expansion, RPC setup, and orchestration have been converted to
 contextual errors. SSH setup adds hints for common key/config permission
 failures, and server launch errors include the command and server log path where
 available. SSH session, profile-loading, local-base expansion,
-remote-profile parsing, and server-launch diagnostics now use the shared
-structured renderer. Some setup failures still happen before normal sync error
-handling is established and can produce weak diagnostics.
+remote-profile parsing, server-launch, and remote server log/state setup
+diagnostics now use the shared structured renderer. Some setup failures still
+happen before normal sync error handling is established and can produce weak
+diagnostics.
 
 Known examples:
 
 - Server startup failures before RPC initialization still depend on child
   process stderr/log context, though their final setup error is now classified
-  and rendered consistently.
+  and rendered consistently when the child reaches Duet setup code.
 
 Remaining work:
 
-- Preserve remote server startup failures with enough context to identify remote
-  log, config, state, temp, and base-path permission problems before RPC starts.
+- Preserve non-Duet remote process failures, shell failures, and SSH transport
+  failures with enough stderr/log context to distinguish remote config, temp, and
+  base-path permission problems before RPC starts.
 
 ### 6. Restricted Sync Can Still Enumerate Readable Ancestors Broadly
 

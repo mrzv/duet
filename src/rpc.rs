@@ -3,7 +3,7 @@ use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 
 use bincode::serde::encode_into_std_write as serialize_into;
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{eyre, Result};
 use essrpc::essrpc;
 use essrpc::transports::{BincodeTransport, ReadWrite};
 use essrpc::{RPCError, RPCErrorKind, RPCServer};
@@ -17,7 +17,7 @@ use crate::sync::{
     self, ApplyStreamId, ChangeDetails, DetailFrame, DetailProducer, DetailStreamId,
     SignatureWithPath,
 };
-use crate::sync_error::StructuredSyncError;
+use crate::sync_error::{self, StructuredSyncError};
 
 pub(crate) const SERVER_LOG_ENV: &str = "DUET_SERVER_LOG";
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
@@ -431,19 +431,39 @@ pub async fn server() -> Result<()> {
     let log_path = if let Some(path) = std::env::var_os(SERVER_LOG_ENV) {
         PathBuf::from(path)
     } else {
-        crate::full(&"~/.config/duet/remote.log".to_string())?
+        let default_log = "~/.config/duet/remote.log".to_string();
+        crate::full(&default_log).map_err(|e| {
+            eyre!(
+                "{}",
+                sync_error::render_report(
+                    "setup",
+                    "resolve remote server log",
+                    Some(PathBuf::from(default_log)),
+                    e,
+                )
+            )
+        })?
     };
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).wrap_err_with(|| {
-            format!(
-                "unable to create remote server log directory {}",
-                parent.display()
+        std::fs::create_dir_all(parent).map_err(|e| {
+            eyre!(
+                "{}",
+                sync_error::render_error(
+                    "setup",
+                    "create remote server log directory",
+                    Some(parent.to_path_buf()),
+                    e,
+                )
             )
         })?;
     }
     use log::LevelFilter;
-    simple_logging::log_to_file(&log_path, LevelFilter::Debug)
-        .wrap_err_with(|| format!("unable to open remote server log {}", log_path.display()))?;
+    simple_logging::log_to_file(&log_path, LevelFilter::Debug).map_err(|e| {
+        eyre!(
+            "{}",
+            sync_error::render_error("setup", "open remote server log", Some(log_path.clone()), e,)
+        )
+    })?;
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -452,7 +472,12 @@ pub async fn server() -> Result<()> {
 
     log::debug!("in server()");
 
-    let server_impl = DuetServerImpl::new()?;
+    let server_impl = DuetServerImpl::new().map_err(|e| {
+        eyre!(
+            "{}",
+            sync_error::render_report("setup", "initialize remote server", None, e)
+        )
+    })?;
 
     tokio::task::spawn_blocking(move || {
         let mut serve = DuetServerRPCServer::new(server_impl, BincodeTransport::new(stdio));
@@ -462,7 +487,13 @@ pub async fn server() -> Result<()> {
             }
         }
     })
-    .await?;
+    .await
+    .map_err(|e| {
+        eyre!(
+            "{}",
+            sync_error::render_error("setup", "run remote server task", None, e)
+        )
+    })?;
 
     Ok(())
 }
