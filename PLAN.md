@@ -1,22 +1,25 @@
-# Permission Handling Status
+# Duet Hardening Plan
 
-This document tracks the remaining permission-handling work in Duet. Older
-audit documents have been consolidated here so there is a single source of
-truth.
+This document tracks the remaining hardening work in Duet. It started as a
+permission-failure audit, but the remaining work is now mostly about apply
+transactionality, recovery, diagnostics, and platform metadata scope.
 
-Duet has two separate permission concerns:
+Duet has two permission-related responsibilities:
 
 - It synchronizes Unix mode bits for files and directories as metadata.
 - It depends on OS permissions to scan, read, write, remove, chmod, set mtimes,
   launch the server, and save state.
 
 The highest-risk bugs around permission failures being mistaken for deletions
-have been fixed. The remaining work is mostly transactionality, recovery policy,
-and fuller diagnostics for setup and platform-specific permission models.
+have been fixed. The remaining work is broader: make apply failures recoverable,
+make diagnostics consistently structured, and document or explicitly scope
+platform-specific metadata behavior.
 
 ## Fixed And Tested
 
-These issues are covered by active tests in `tests/permission_failures.rs`.
+Most of these issues are covered by active tests in
+`tests/permission_failures.rs`; additional unit tests cover protocol and marker
+helpers.
 
 - Scanner failures now propagate instead of being accepted as partial scans.
   Unreadable local or remote subdirectories no longer look like deletions.
@@ -123,11 +126,11 @@ Remaining work:
   File-content writes now share the same temporary-output primitive, but the full
   staged engine still needs to cover directory, symlink, metadata, and removal
   operations.
-- Convert the broad unstaged-operation classifications into step-level commit
-  records for directory removals, type replacements, chmod, and utime.
 - Persist enough committed-operation metadata to resume automatically after a
   crash. The current marker records completed side-local action summaries, but it
   does not yet support automatic replay/rollback.
+- Close any remaining gaps in step-level commit records for multi-step
+  replacements, chmod, and utime as the staged apply engine is built out.
 - Use staged-file records to offer safe automatic cleanup for abandoned temp
   files that were never renamed into place.
 - Keep state saving after both sides have committed successfully.
@@ -181,7 +184,7 @@ Remaining work:
 - Extend structured setup errors to remaining log/state setup paths that fail
   before the normal RPC server is running.
 
-### 4. Permission Model Is Still Unix Mode Bits Only
+### 4. Metadata Model Is Still Unix Mode Bits Only
 
 Duet records and syncs mode bits, but it does not sync ownership, ACLs, xattrs,
 or platform-specific permission models. Symlink permissions are intentionally
