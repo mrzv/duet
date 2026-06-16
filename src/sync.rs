@@ -157,6 +157,10 @@ pub fn preflight_apply(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
             if planned_directories.contains(parent) {
                 continue;
             }
+            if mutation.allow_missing_parent {
+                preflight_directory_writable_or_creatable(&parent_path, "destination parent")?;
+                continue;
+            }
             return Err(eyre!(
                 "destination parent {} does not exist",
                 parent_path.display()
@@ -814,6 +818,7 @@ fn planned_destination_directories(actions: &Vec<Action>) -> HashSet<PathBuf> {
 struct ParentMutation {
     path: PathBuf,
     allow_writable_guard: bool,
+    allow_missing_parent: bool,
 }
 
 fn apply_parent_mutations(actions: &Vec<Action>) -> Vec<ParentMutation> {
@@ -824,16 +829,19 @@ fn apply_parent_mutations(actions: &Vec<Action>) -> Vec<ParentMutation> {
                 Change::Removed(e) => mutations.push(ParentMutation {
                     path: e.path().clone(),
                     allow_writable_guard: false,
+                    allow_missing_parent: false,
                 }),
                 Change::Added(e) => mutations.push(ParentMutation {
                     path: e.path().clone(),
                     allow_writable_guard: e.is_file(),
+                    allow_missing_parent: true,
                 }),
                 Change::Modified(old, new) if old.is_file() && new.is_file() => {
                     if !old.same_contents(new) {
                         mutations.push(ParentMutation {
                             path: new.path().clone(),
                             allow_writable_guard: true,
+                            allow_missing_parent: false,
                         });
                     }
                 }
@@ -843,12 +851,14 @@ fn apply_parent_mutations(actions: &Vec<Action>) -> Vec<ParentMutation> {
                         mutations.push(ParentMutation {
                             path: new.path().clone(),
                             allow_writable_guard: false,
+                            allow_missing_parent: false,
                         });
                     }
                 }
                 Change::Modified(_, new) => mutations.push(ParentMutation {
                     path: new.path().clone(),
                     allow_writable_guard: new.is_file(),
+                    allow_missing_parent: false,
                 }),
             },
             _ => {}
@@ -1308,6 +1318,18 @@ impl Drop for TempOutput {
     }
 }
 
+fn ensure_parent_directory(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).wrap_err_with(|| {
+            format!(
+                "failed to create destination parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 enum ApplyState {
     File {
         action_index: usize,
@@ -1497,6 +1519,7 @@ impl DetailApplier {
                 }
                 Change::Added(e) => {
                     let filename = self.base.join(e.path());
+                    ensure_parent_directory(&filename)?;
                     if let Some(p) = e.target() {
                         std::os::unix::fs::symlink(p, &filename)?;
                         record_committed_step(
@@ -1637,6 +1660,7 @@ impl DetailApplier {
     fn begin_file_detail(&mut self, action_index: usize) -> Result<()> {
         self.prepare_action(action_index);
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
+        ensure_parent_directory(&filename)?;
         let output = TempOutput::new(filename)?;
         record_staged_file(self.attempt_state.as_deref(), output.temp_path())?;
         self.state = Some(ApplyState::File {
@@ -1866,6 +1890,7 @@ pub fn apply_detailed_changes(
                     }
                     Change::Added(e) => {
                         let filename = base.join(e.path());
+                        ensure_parent_directory(&filename)?;
                         if let Some(p) = e.target() {
                             std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
                                 format!(
@@ -2126,6 +2151,7 @@ fn create_file_with_contents(
     data: &[u8],
     attempt_state: Option<&Path>,
 ) -> Result<()> {
+    ensure_parent_directory(filename)?;
     let mut output = TempOutput::new(filename.to_path_buf())?;
     record_staged_file(attempt_state, output.temp_path())?;
     output
@@ -2262,6 +2288,36 @@ mod tests {
         assert_eq!(synced_mode(0o100644), 0o644);
         assert_eq!(synced_mode(0o40755), 0o755);
         assert_eq!(synced_mode(0o104755), 0o4755);
+    }
+
+    #[test]
+    fn preflight_allows_creatable_parent_for_added_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let actions = vec![Action::Local(Change::Added(Entry::test_file(
+            PathBuf::from(".git/refs/remotes/origin/main"),
+            0,
+        )))];
+
+        preflight_apply(&base, &actions).unwrap();
+    }
+
+    #[test]
+    fn apply_added_file_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let path = PathBuf::from(".git/refs/remotes/origin/main");
+        let actions = vec![Action::Local(Change::Added(Entry::test_file(
+            path.clone(),
+            0,
+        )))];
+        let details = vec![ChangeDetails::Contents(b"commit-id\n".to_vec())];
+        let mut all_old = Vec::new();
+
+        preflight_apply(&base, &actions).unwrap();
+        apply_detailed_changes(&base, &actions, &details, &mut all_old, None).unwrap();
+
+        assert_eq!(fs::read(base.join(path)).unwrap(), b"commit-id\n");
     }
 
     #[test]
