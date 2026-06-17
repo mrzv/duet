@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.0 - 2026-06-17
+
 ### Added
 - Added `sync-tuning-v1` capability negotiation so newer clients and servers can agree on signature-window and detail-stream batching settings without requiring lockstep upgrades.
 - Added adaptive per-file signature windows for modified files, using the square root of the file size clamped by negotiated limits.
