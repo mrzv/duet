@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.5 - 2026-06-17
+
 ### Added
 - Added developer-facing sync performance profiling flags for phase timings, transfer counters, and optional JSON output.
 - Added hidden `DUET_SYNC_*` environment overrides for experimenting with sync tuning values during profiling.
