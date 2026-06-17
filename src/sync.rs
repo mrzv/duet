@@ -129,6 +129,7 @@ pub fn can_stream_details(actions: &[Action]) -> bool {
 
 pub fn preflight_apply(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
     preflight_source_reads(base, actions)?;
+    preflight_removed_directories(base, actions)?;
 
     let readonly_metadata_changes = readonly_directory_metadata_changes(actions);
     let planned_directories = planned_destination_directories(actions);
@@ -865,6 +866,73 @@ fn apply_parent_mutations(actions: &Vec<Action>) -> Vec<ParentMutation> {
         }
     }
     mutations
+}
+
+fn preflight_removed_directories(base: &Path, actions: &Vec<Action>) -> Result<()> {
+    let removed_paths = removed_destination_paths(actions);
+    for path in removed_paths.iter() {
+        let dirname = base.join(path);
+        if dirname.is_dir() {
+            preflight_removed_directory_contents(base, &dirname, &removed_paths)?;
+        }
+    }
+    Ok(())
+}
+
+fn removed_destination_paths(actions: &Vec<Action>) -> HashSet<PathBuf> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Local(Change::Removed(entry))
+            | Action::ResolvedLocal((_, _), Change::Removed(entry)) => Some(entry.path().clone()),
+            Action::Local(Change::Modified(old, new))
+            | Action::ResolvedLocal((_, _), Change::Modified(old, new))
+                if old.is_dir() && !new.is_dir() =>
+            {
+                Some(old.path().clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn preflight_removed_directory_contents(
+    base: &Path,
+    dirname: &Path,
+    removed_paths: &HashSet<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(dirname)
+        .wrap_err_with(|| format!("unable to preflight directory removal {}", dirname.display()))?
+    {
+        let entry = entry.wrap_err_with(|| {
+            format!(
+                "unable to preflight directory removal entry in {}",
+                dirname.display()
+            )
+        })?;
+        let path = entry.path();
+        let relative_path = path.strip_prefix(base).wrap_err_with(|| {
+            format!(
+                "unable to preflight directory removal path {}",
+                path.display()
+            )
+        })?;
+        if !removed_paths.contains(relative_path) {
+            return Err(eyre!(
+                "destination directory {} is not empty; unexpected child {} would prevent removal",
+                dirname.display(),
+                path.display()
+            ));
+        }
+        if entry
+            .file_type()
+            .wrap_err_with(|| format!("unable to preflight directory entry {}", path.display()))?
+            .is_dir()
+        {
+            preflight_removed_directory_contents(base, &path, removed_paths)?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_metadata_targets(actions: &Vec<Action>) -> Vec<PathBuf> {
@@ -2318,6 +2386,23 @@ mod tests {
         apply_detailed_changes(&base, &actions, &details, &mut all_old, None).unwrap();
 
         assert_eq!(fs::read(base.join(path)).unwrap(), b"commit-id\n");
+    }
+
+    #[test]
+    fn preflight_rejects_removed_directory_with_untracked_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir(base.join("removed")).unwrap();
+        fs::write(base.join("removed/untracked.txt"), b"still here").unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+
+        let error = preflight_apply(&base, &actions).unwrap_err().to_string();
+
+        assert!(error.contains("destination directory"), "{}", error);
+        assert!(error.contains("unexpected child"), "{}", error);
+        assert!(error.contains("untracked.txt"), "{}", error);
     }
 
     #[test]
