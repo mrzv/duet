@@ -19,7 +19,7 @@ pub use crate::rustsync::{Delta, Signature};
 
 pub const LEGACY_SIGNATURE_WINDOW: usize = 1024;
 pub const DEFAULT_SIGNATURE_WINDOW_MIN: usize = LEGACY_SIGNATURE_WINDOW;
-pub const DEFAULT_SIGNATURE_WINDOW_MAX: usize = 1024 * 1024;
+pub const DEFAULT_SIGNATURE_WINDOW_MAX: usize = 64 * 1024;
 pub const LEGACY_DETAIL_CHUNK_BYTES: usize = 1024 * 1024;
 pub const LEGACY_DETAIL_BATCH_FRAMES: usize = 256;
 pub const LEGACY_DETAIL_BATCH_PAYLOAD_BYTES: usize = LEGACY_DETAIL_CHUNK_BYTES;
