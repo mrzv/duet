@@ -17,14 +17,73 @@ use crate::actions::Action;
 use crate::rustsync::{compare, compare_stream, restore_seek, signature, DeltaOp};
 pub use crate::rustsync::{Delta, Signature};
 
-const WINDOW: usize = 1024; // TODO: figure out appropriate window size
+pub const LEGACY_SIGNATURE_WINDOW: usize = 1024;
+pub const DEFAULT_SIGNATURE_WINDOW_MIN: usize = LEGACY_SIGNATURE_WINDOW;
+pub const DEFAULT_SIGNATURE_WINDOW_MAX: usize = 1024 * 1024;
+const COPY_BUFFER_BYTES: usize = 128 * 1024;
 const SYNCED_MODE_MASK: u32 = 0o7777;
 static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignatureWindowConfig {
+    pub min: usize,
+    pub max: usize,
+}
+
+impl SignatureWindowConfig {
+    pub fn legacy() -> Self {
+        Self {
+            min: LEGACY_SIGNATURE_WINDOW,
+            max: LEGACY_SIGNATURE_WINDOW,
+        }
+    }
+
+    pub fn adaptive() -> Self {
+        Self {
+            min: DEFAULT_SIGNATURE_WINDOW_MIN,
+            max: DEFAULT_SIGNATURE_WINDOW_MAX,
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        let min = self.min.max(1);
+        let max = self.max.max(min);
+        Self { min, max }
+    }
+
+    pub fn window_for_size(self, size: u64) -> usize {
+        let config = self.normalized();
+        let window = integer_sqrt(size).max(config.min as u64);
+        window.min(config.max as u64) as usize
+    }
+}
+
+fn integer_sqrt(n: u64) -> u64 {
+    if n <= 1 {
+        return n;
+    }
+
+    let mut x = n;
+    let mut y = (x + n / x) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureWithPath(PathBuf, Signature);
 
 pub fn get_signatures(base: &PathBuf, actions: &Vec<Action>) -> Result<Vec<SignatureWithPath>> {
+    get_signatures_with_config(base, actions, SignatureWindowConfig::legacy())
+}
+
+pub fn get_signatures_with_config(
+    base: &PathBuf,
+    actions: &Vec<Action>,
+    window_config: SignatureWindowConfig,
+) -> Result<Vec<SignatureWithPath>> {
     let mut signatures: Vec<SignatureWithPath> = Vec::new();
     for action in actions {
         match action {
@@ -32,7 +91,7 @@ pub fn get_signatures(base: &PathBuf, actions: &Vec<Action>) -> Result<Vec<Signa
             | Action::ResolvedLocal((_, _), Change::Modified(e1, e2)) => {
                 if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
                     let f = fs::File::open(base.join(e1.path()))?;
-                    let block = [0; WINDOW];
+                    let block = vec![0; window_config.window_for_size(e1.size())];
                     let sig = signature(f, block)?;
                     signatures.push(SignatureWithPath(e1.path().clone(), sig));
                 }
@@ -1028,7 +1087,6 @@ pub fn get_detailed_changes(
                     }
                     Change::Modified(e1, e2) => {
                         if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
-                            let block = [0; WINDOW];
                             let f = fs::File::open(base.join(e1.path()))?;
                             let sig = &sig_iter
                                 .next()
@@ -1036,6 +1094,7 @@ pub fn get_detailed_changes(
                                     eyre!("missing signature for {}", e1.path().display())
                                 })?
                                 .1;
+                            let block = vec![0; sig.window];
                             let delta = compare(sig, f, block)?;
                             details.push(ChangeDetails::Diff(delta))
                         } else if !e1.is_file() && e2.is_file() {
@@ -1908,7 +1967,7 @@ fn copy_from_source(
 ) -> Result<()> {
     source.seek(SeekFrom::Start(offset))?;
     let mut remaining = len;
-    let mut buf = [0; WINDOW];
+    let mut buf = vec![0; COPY_BUFFER_BYTES];
     while remaining > 0 {
         let want = std::cmp::min(remaining as usize, buf.len());
         let n = source.read(&mut buf[..want])?;
@@ -2265,7 +2324,7 @@ fn update_file_with_diff(
         .file
         .as_mut()
         .ok_or_else(|| eyre!("temporary output is closed"))?;
-    restore_seek(output_file, source, [0; WINDOW], delta)
+    restore_seek(output_file, source, vec![0; delta.window], delta)
         .wrap_err_with(|| format!("failed to restore diff for {}", filename.display()))?;
     output.finish()?;
     record_committed_step(attempt_state, "rename-file", filename)
@@ -2302,6 +2361,7 @@ mod tests {
 
     #[test]
     fn stream_diff_frames_coalesces_adjacent_copy_ops() {
+        const WINDOW: usize = LEGACY_SIGNATURE_WINDOW;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         let mut contents = vec![0; WINDOW * 8];
@@ -2326,6 +2386,23 @@ mod tests {
                 if len >= contents.len() as u64 && len <= (contents.len() + WINDOW) as u64
         ));
         assert!(matches!(frames[1].payload, DetailPayload::DiffEnd));
+    }
+
+    #[test]
+    fn signature_window_config_uses_sqrt_clamped_to_limits() {
+        let config = SignatureWindowConfig { min: 8, max: 64 };
+
+        assert_eq!(config.window_for_size(0), 8);
+        assert_eq!(config.window_for_size(1), 8);
+        assert_eq!(config.window_for_size(256), 16);
+        assert_eq!(config.window_for_size(10_000), 64);
+    }
+
+    #[test]
+    fn signature_window_config_normalizes_invalid_limits() {
+        let config = SignatureWindowConfig { min: 0, max: 0 };
+
+        assert_eq!(config.window_for_size(1), 1);
     }
 
     #[test]
