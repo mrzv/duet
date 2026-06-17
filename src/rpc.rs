@@ -109,11 +109,6 @@ pub trait DuetServer {
         stream_id: ApplyStreamId,
         frames: Vec<DetailFrame>,
     ) -> Result<(), RPCError>;
-    fn apply_file_byte_chunk(
-        &mut self,
-        stream_id: ApplyStreamId,
-        chunk: sync::FileByteChunk,
-    ) -> Result<(), RPCError>;
     fn prepare_apply_attempt(&mut self) -> Result<(), RPCError>;
     fn prepare_apply_attempt_with_id(&mut self, attempt_id: String) -> Result<(), RPCError>;
     fn negotiate_sync_tuning(
@@ -121,6 +116,11 @@ pub trait DuetServer {
         request: sync::SyncTuningRequest,
     ) -> Result<sync::SyncTuning, RPCError>;
     fn stream_performance(&self) -> Result<RemoteStreamProfile, RPCError>;
+    fn apply_file_byte_chunk(
+        &mut self,
+        stream_id: ApplyStreamId,
+        chunk: sync::FileByteChunk,
+    ) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -184,6 +184,10 @@ fn rpc_report_error(operation: &str, path: Option<&Path>, error: Report) -> RPCE
         StructuredSyncError::from_report("remote", operation, path.map(Path::to_path_buf), error)
             .to_string(),
     )
+}
+
+fn clamp_rpc_limit(requested: u32, max: usize) -> usize {
+    requested.clamp(1, max.min(u32::MAX as usize) as u32) as usize
 }
 
 impl DuetServer for DuetServerImpl {
@@ -372,11 +376,12 @@ impl DuetServer for DuetServerImpl {
         max_chunk_bytes: u32,
     ) -> Result<DetailStreamId, RPCError> {
         let id = self.next_detail_stream_id();
+        let max_chunk_bytes = clamp_rpc_limit(max_chunk_bytes, self.tuning.detail_chunk_bytes());
         let producer = sync::DetailProducer::new(
             self.base.clone(),
             self.actions.clone(),
             signatures,
-            max_chunk_bytes as usize,
+            max_chunk_bytes,
         );
         self.detail_streams.insert(id, producer);
         Ok(id)
@@ -473,18 +478,22 @@ impl DuetServer for DuetServerImpl {
         max_payload_bytes: u32,
     ) -> Result<Vec<DetailFrame>, RPCError> {
         let start = Instant::now();
+        let max_frames = clamp_rpc_limit(max_frames, self.tuning.detail_batch_frames());
+        let max_payload_bytes =
+            clamp_rpc_limit(max_payload_bytes, self.tuning.detail_batch_payload_bytes());
         let result = {
-            let producer = self
-                .detail_streams
-                .get_mut(&stream_id)
-                .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "detail stream does not exist"))?;
-            producer.next_frames(max_frames as usize, max_payload_bytes as usize)
+            let producer = self.detail_streams.get_mut(&stream_id).ok_or_else(|| {
+                RPCError::new(RPCErrorKind::Other, "detail stream does not exist")
+            })?;
+            producer.next_frames(max_frames, max_payload_bytes)
         };
         match result {
             Ok(frames) => {
                 self.stream_performance.detail_generate_ms += duration_ms(start.elapsed());
                 self.stream_performance.detail_batches += 1;
-                self.stream_performance.detail_transfer.record_batch(&frames);
+                self.stream_performance
+                    .detail_transfer
+                    .record_batch(&frames);
                 if frames.is_empty() {
                     self.detail_streams.remove(&stream_id);
                 }
@@ -512,28 +521,6 @@ impl DuetServer for DuetServerImpl {
                 .apply_frame(frame)
                 .map_err(|e| rpc_report_error("apply detail stream", Some(&base), e))?;
         }
-        self.stream_performance.apply_frames_ms += duration_ms(start.elapsed());
-        Ok(())
-    }
-
-    fn apply_file_byte_chunk(
-        &mut self,
-        stream_id: ApplyStreamId,
-        chunk: sync::FileByteChunk,
-    ) -> Result<(), RPCError> {
-        let base = self.base.clone();
-        self.stream_performance.apply_batches += 1;
-        self.stream_performance
-            .apply_transfer
-            .record_file_byte_chunk(chunk.len() as u64);
-        let start = Instant::now();
-        let applier = self
-            .apply_streams
-            .get_mut(&stream_id)
-            .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
-        applier
-            .apply_file_byte_chunk(chunk)
-            .map_err(|e| rpc_report_error("apply file byte stream", Some(&base), e))?;
         self.stream_performance.apply_frames_ms += duration_ms(start.elapsed());
         Ok(())
     }
@@ -576,6 +563,28 @@ impl DuetServer for DuetServerImpl {
 
     fn stream_performance(&self) -> Result<RemoteStreamProfile, RPCError> {
         Ok(self.stream_performance.clone())
+    }
+
+    fn apply_file_byte_chunk(
+        &mut self,
+        stream_id: ApplyStreamId,
+        chunk: sync::FileByteChunk,
+    ) -> Result<(), RPCError> {
+        let base = self.base.clone();
+        self.stream_performance.apply_batches += 1;
+        self.stream_performance
+            .apply_transfer
+            .record_file_byte_chunk(chunk.len() as u64);
+        let start = Instant::now();
+        let applier = self
+            .apply_streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
+        applier
+            .apply_file_byte_chunk(chunk)
+            .map_err(|e| rpc_report_error("apply file byte stream", Some(&base), e))?;
+        self.stream_performance.apply_frames_ms += duration_ms(start.elapsed());
+        Ok(())
     }
 }
 
@@ -654,6 +663,90 @@ pub async fn server() -> Result<()> {
 mod tests {
     use super::*;
     use crate::actions::Action;
+    use essrpc::RPCClient;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingTransport {
+        calls: Arc<Mutex<Vec<(&'static str, u32)>>>,
+    }
+
+    impl RecordingTransport {
+        fn new(calls: Arc<Mutex<Vec<(&'static str, u32)>>>) -> Self {
+            Self { calls }
+        }
+    }
+
+    impl essrpc::ClientTransport for RecordingTransport {
+        type TXState = ();
+        type FinalState = ();
+
+        fn tx_begin_call(
+            &mut self,
+            method: essrpc::MethodId,
+        ) -> std::result::Result<Self::TXState, RPCError> {
+            self.calls.lock().unwrap().push((method.name, method.num));
+            Ok(())
+        }
+
+        fn tx_add_param(
+            &mut self,
+            _name: &'static str,
+            _value: impl serde::Serialize,
+            _state: &mut Self::TXState,
+        ) -> std::result::Result<(), RPCError> {
+            Ok(())
+        }
+
+        fn tx_finalize(
+            &mut self,
+            _state: Self::TXState,
+        ) -> std::result::Result<Self::FinalState, RPCError> {
+            Ok(())
+        }
+
+        fn rx_response<T>(&mut self, _state: Self::FinalState) -> std::result::Result<T, RPCError>
+        where
+            for<'de> T: serde::Deserialize<'de>,
+        {
+            Err(RPCError::new(RPCErrorKind::Other, "recorded call"))
+        }
+    }
+
+    #[test]
+    fn generated_rpc_method_ids_append_new_methods() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut client = DuetServerRPCClient::new(RecordingTransport::new(calls.clone()));
+
+        assert!(client.prepare_apply_attempt().is_err());
+        assert!(client
+            .prepare_apply_attempt_with_id("attempt".to_string())
+            .is_err());
+        assert!(client
+            .negotiate_sync_tuning(sync::SyncTuningRequest::preferred())
+            .is_err());
+        assert!(client.stream_performance().is_err());
+        assert!(client
+            .apply_file_byte_chunk(ApplyStreamId(1), sync::FileByteChunk::new(0, Vec::new()))
+            .is_err());
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                ("prepare_apply_attempt", 17),
+                ("prepare_apply_attempt_with_id", 18),
+                ("negotiate_sync_tuning", 19),
+                ("stream_performance", 20),
+                ("apply_file_byte_chunk", 21),
+            ]
+        );
+    }
+
+    #[test]
+    fn rpc_size_limits_are_clamped() {
+        assert_eq!(clamp_rpc_limit(0, 1024), 1);
+        assert_eq!(clamp_rpc_limit(512, 1024), 512);
+        assert_eq!(clamp_rpc_limit(u32::MAX, 1024), 1024);
+    }
 
     #[test]
     fn server_info_advertises_protocol_and_capabilities() {
