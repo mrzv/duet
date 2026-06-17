@@ -7,6 +7,7 @@
 - Added hidden `DUET_SYNC_*` environment overrides for experimenting with sync tuning values during profiling.
 
 ### Changed
+- Split streamed sync performance profile output into detail-generation and apply sub-phases for both directions.
 - Lowered the preferred adaptive signature-window ceiling to 64 KiB to avoid large-window diff performance cliffs observed during profiling.
 
 ## 0.8.0 - 2026-06-17

@@ -265,10 +265,14 @@ pub async fn sync(
             "stream_remote_detail_and_local_apply",
             stream_result.remote_detail_and_local_apply_duration,
         );
+        performance.record_phase("stream_remote_detail_rpc", stream_result.remote_detail_duration);
+        performance.record_phase("stream_local_apply", stream_result.local_apply_duration);
         performance.record_phase(
             "stream_local_detail_and_remote_apply",
             stream_result.local_detail_and_remote_apply_duration,
         );
+        performance.record_phase("stream_local_detail", stream_result.local_detail_duration);
+        performance.record_phase("stream_remote_apply_rpc", stream_result.remote_apply_duration);
         performance.counters.streamed_details = true;
         performance.counters.streaming = stream_result.profile;
         stream_result.local_all_old
@@ -569,6 +573,10 @@ struct StreamDetailedChangesResult {
     profile: StreamingProfile,
     remote_detail_and_local_apply_duration: Duration,
     local_detail_and_remote_apply_duration: Duration,
+    remote_detail_duration: Duration,
+    local_apply_duration: Duration,
+    local_detail_duration: Duration,
+    remote_apply_duration: Duration,
 }
 
 async fn stream_detailed_changes<R>(
@@ -613,8 +621,10 @@ where
     let mut local_done = false;
     let mut remote_done = false;
     let mut profile = StreamingProfile::default();
-    let mut remote_detail_and_local_apply_duration = Duration::default();
-    let mut local_detail_and_remote_apply_duration = Duration::default();
+    let mut remote_detail_duration = Duration::default();
+    let mut local_apply_duration = Duration::default();
+    let mut local_detail_duration = Duration::default();
+    let mut remote_apply_duration = Duration::default();
     while !local_done || !remote_done {
         if !remote_done {
             let start = Instant::now();
@@ -626,11 +636,13 @@ where
                 )
                 .await
                 .map_err(|e| post_preflight_rpc_error("Couldn't read remote detail stream", e))?;
+            remote_detail_duration += start.elapsed();
             profile.remote_to_local.record_batch(&frames);
             if frames.is_empty() {
                 remote_done = true;
             } else {
                 let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
+                let start = Instant::now();
                 for frame in frames {
                     local_applier
                         .apply_frame(frame)
@@ -642,8 +654,8 @@ where
                     total_transfer_bytes,
                     transfer_bytes,
                 );
+                local_apply_duration += start.elapsed();
             }
-            remote_detail_and_local_apply_duration += start.elapsed();
         }
 
         if !local_done {
@@ -654,11 +666,13 @@ where
                     tuning.detail_batch_payload_bytes(),
                 )
                 .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
+            local_detail_duration += start.elapsed();
             profile.local_to_remote.record_batch(&frames);
             if frames.is_empty() {
                 local_done = true;
             } else {
                 let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
+                let start = Instant::now();
                 remote
                     .apply_detail_chunks(remote_apply_stream, frames)
                     .await
@@ -671,8 +685,8 @@ where
                     total_transfer_bytes,
                     transfer_bytes,
                 );
+                remote_apply_duration += start.elapsed();
             }
-            local_detail_and_remote_apply_duration += start.elapsed();
         }
     }
 
@@ -680,19 +694,23 @@ where
     let local_all_old = local_applier
         .finish()
         .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
-    remote_detail_and_local_apply_duration += start.elapsed();
+    local_apply_duration += start.elapsed();
     let start = Instant::now();
     remote
         .finish_apply_stream(remote_apply_stream)
         .await
         .map_err(|e| post_preflight_rpc_error("Couldn't finish remote apply stream", e))?;
-    local_detail_and_remote_apply_duration += start.elapsed();
+    remote_apply_duration += start.elapsed();
     progress.finish_and_clear();
     Ok(StreamDetailedChangesResult {
         local_all_old,
         profile,
-        remote_detail_and_local_apply_duration,
-        local_detail_and_remote_apply_duration,
+        remote_detail_and_local_apply_duration: remote_detail_duration + local_apply_duration,
+        local_detail_and_remote_apply_duration: local_detail_duration + remote_apply_duration,
+        remote_detail_duration,
+        local_apply_duration,
+        local_detail_duration,
+        remote_apply_duration,
     })
 }
 
