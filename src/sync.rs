@@ -1237,6 +1237,7 @@ enum ProducerState {
     File {
         action_index: u32,
         file: fs::File,
+        remaining: u64,
     },
     Diff {
         receiver: mpsc::Receiver<Result<DetailFrame>>,
@@ -1284,8 +1285,17 @@ impl DetailProducer {
                 ProducerState::File {
                     action_index,
                     mut file,
+                    mut remaining,
                 } => {
-                    let mut buf = vec![0; self.max_chunk_bytes];
+                    if remaining == 0 {
+                        return Ok(Some(DetailFrame {
+                            action_index,
+                            payload: DetailPayload::FileEnd,
+                        }));
+                    }
+
+                    let chunk_bytes = remaining.min(self.max_chunk_bytes as u64) as usize;
+                    let mut buf = vec![0; chunk_bytes];
                     let n = file.read(&mut buf)?;
                     if n == 0 {
                         return Ok(Some(DetailFrame {
@@ -1295,7 +1305,12 @@ impl DetailProducer {
                     }
 
                     buf.truncate(n);
-                    self.state = Some(ProducerState::File { action_index, file });
+                    remaining = remaining.saturating_sub(n as u64);
+                    self.state = Some(ProducerState::File {
+                        action_index,
+                        file,
+                        remaining,
+                    });
                     return Ok(Some(DetailFrame {
                         action_index,
                         payload: DetailPayload::FileBytes(buf),
@@ -1331,7 +1346,12 @@ impl DetailProducer {
             match kind {
                 SourceDetailKind::File(path) => {
                     let file = fs::File::open(self.base.join(path))?;
-                    self.state = Some(ProducerState::File { action_index, file });
+                    let remaining = file.metadata()?.len();
+                    self.state = Some(ProducerState::File {
+                        action_index,
+                        file,
+                        remaining,
+                    });
                     return Ok(Some(DetailFrame {
                         action_index,
                         payload: DetailPayload::FileBegin,
