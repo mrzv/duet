@@ -259,6 +259,7 @@ pub async fn sync(
             local_signatures,
             remote_signatures,
             tuning,
+            has_remote_capability(&remote_info, rpc::CAPABILITY_STREAM_PERFORMANCE),
         )
         .await?;
         performance.record_phase(
@@ -588,6 +589,7 @@ async fn stream_detailed_changes<R>(
     local_signatures: Vec<sync_ops::SignatureWithPath>,
     remote_signatures: Vec<sync_ops::SignatureWithPath>,
     tuning: sync_ops::SyncTuning,
+    remote_stream_performance: bool,
 ) -> Result<StreamDetailedChangesResult>
 where
     R: DuetServerAsync,
@@ -701,6 +703,15 @@ where
         .await
         .map_err(|e| post_preflight_rpc_error("Couldn't finish remote apply stream", e))?;
     remote_apply_duration += start.elapsed();
+    if remote_stream_performance {
+        let remote_server_profile = remote
+            .stream_performance()
+            .await
+            .map_err(|e| remote_rpc_error("Couldn't read remote stream performance", e))?;
+        if !remote_server_profile.is_empty() {
+            profile.remote_server = Some(remote_server_profile);
+        }
+    }
     progress.finish_and_clear();
     Ok(StreamDetailedChangesResult {
         local_all_old,

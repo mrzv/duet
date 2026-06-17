@@ -5,10 +5,12 @@
 ### Added
 - Added developer-facing sync performance profiling flags for phase timings, transfer counters, and optional JSON output.
 - Added hidden `DUET_SYNC_*` environment overrides for experimenting with sync tuning values during profiling.
+- Added streamed sync server-side performance telemetry to separate transport time from remote detail/apply work.
 
 ### Changed
 - Split streamed sync performance profile output into detail-generation and apply sub-phases for both directions.
 - Lowered the preferred adaptive signature-window ceiling to 64 KiB to avoid large-window diff performance cliffs observed during profiling.
+- Increased preferred detail chunk and payload sizes to 64 MiB to reduce SSH round trips for large file transfers.
 - Reduced allocation overhead when streaming many small whole-file changes.
 - Reused the streamed apply recovery-marker append handle to reduce per-file apply overhead.
 

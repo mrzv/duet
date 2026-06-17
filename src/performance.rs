@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use color_eyre::eyre::{Result, WrapErr};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::sync::{DetailFrame, DetailPayload, SyncTuning};
 
@@ -71,6 +71,18 @@ impl PerformanceProfile {
         if self.counters.streamed_details {
             print_transfer("remote->local", &self.counters.streaming.remote_to_local);
             print_transfer("local->remote", &self.counters.streaming.local_to_remote);
+            if let Some(remote_server) = &self.counters.streaming.remote_server {
+                println!(
+                    "  remote server stream: detail-generate={} ms apply-frames={} ms apply-finish={} ms detail-batches={} apply-batches={}",
+                    remote_server.detail_generate_ms,
+                    remote_server.apply_frames_ms,
+                    remote_server.apply_finish_ms,
+                    remote_server.detail_batches,
+                    remote_server.apply_batches
+                );
+                print_transfer("remote-server detail", &remote_server.detail_transfer);
+                print_transfer("remote-server apply", &remote_server.apply_transfer);
+            }
         }
     }
 }
@@ -102,9 +114,27 @@ pub struct ProfileCounters {
 pub struct StreamingProfile {
     pub remote_to_local: DetailTransferStats,
     pub local_to_remote: DetailTransferStats,
+    pub remote_server: Option<RemoteStreamProfile>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RemoteStreamProfile {
+    pub detail_generate_ms: u64,
+    pub detail_batches: u64,
+    pub apply_frames_ms: u64,
+    pub apply_finish_ms: u64,
+    pub apply_batches: u64,
+    pub detail_transfer: DetailTransferStats,
+    pub apply_transfer: DetailTransferStats,
+}
+
+impl RemoteStreamProfile {
+    pub fn is_empty(&self) -> bool {
+        self.detail_batches == 0 && self.apply_batches == 0 && self.apply_finish_ms == 0
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DetailTransferStats {
     pub batches: u64,
     pub empty_batches: u64,

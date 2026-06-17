@@ -197,6 +197,7 @@ fn debug_info_reports_negotiated_capabilities() {
         stdout
     );
     assert!(stdout.contains("sync-tuning-v1"), "{}", stdout);
+    assert!(stdout.contains("stream-performance-v1"), "{}", stdout);
     assert!(stdout.contains("sync tuning:"), "{}", stdout);
     assert!(stdout.contains("detail-batch-frames=256"), "{}", stdout);
 }
@@ -272,6 +273,7 @@ fn performance_profile_reports_human_and_json_output() {
     assert!(stdout.contains("signatures:"), "{}", stdout);
     assert!(stdout.contains("stream remote->local"), "{}", stdout);
     assert!(stdout.contains("stream local->remote"), "{}", stdout);
+    assert!(stdout.contains("remote server stream:"), "{}", stdout);
 
     let json = fs::read_to_string(profile_json).unwrap();
     assert!(json.contains("\"total_ms\""), "{}", json);
@@ -279,6 +281,8 @@ fn performance_profile_reports_human_and_json_output() {
     assert!(json.contains("\"sync_tuning\""), "{}", json);
     assert!(json.contains("\"streamed_details\": true"), "{}", json);
     assert!(json.contains("\"local_to_remote\""), "{}", json);
+    assert!(json.contains("\"remote_server\""), "{}", json);
+    assert!(json.contains("\"apply_frames_ms\""), "{}", json);
     assert_eq!(read(&case.remote.join("a.txt")), "from local");
 }
 

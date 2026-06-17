@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::{eyre, Report, Result};
@@ -10,6 +11,7 @@ use essrpc::{RPCError, RPCErrorKind, RPCServer};
 use serde::{Deserialize, Serialize};
 
 use crate::actions::Actions;
+use crate::performance::{duration_ms, RemoteStreamProfile};
 use crate::profile;
 use crate::scan::location::Locations;
 use crate::state::{Changes, Entries};
@@ -28,6 +30,7 @@ pub(crate) const CAPABILITY_APPLY_ATTEMPT_PREPARE: &str = "apply-attempt-prepare
 pub(crate) const CAPABILITY_APPLY_ATTEMPT_ID: &str = "apply-attempt-id-v1";
 pub(crate) const CAPABILITY_CREATABLE_ADDED_PARENTS: &str = "creatable-added-parents-v1";
 pub(crate) const CAPABILITY_SYNC_TUNING: &str = "sync-tuning-v1";
+pub(crate) const CAPABILITY_STREAM_PERFORMANCE: &str = "stream-performance-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -36,6 +39,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_APPLY_ATTEMPT_ID,
     CAPABILITY_CREATABLE_ADDED_PARENTS,
     CAPABILITY_SYNC_TUNING,
+    CAPABILITY_STREAM_PERFORMANCE,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -109,6 +113,7 @@ pub trait DuetServer {
         &mut self,
         request: sync::SyncTuningRequest,
     ) -> Result<sync::SyncTuning, RPCError>;
+    fn stream_performance(&self) -> Result<RemoteStreamProfile, RPCError>;
 }
 
 struct DuetServerImpl {
@@ -122,6 +127,7 @@ struct DuetServerImpl {
     apply_streams: HashMap<ApplyStreamId, sync::DetailApplier>,
     next_stream_id: u64,
     tuning: sync::SyncTuning,
+    stream_performance: RemoteStreamProfile,
 }
 
 impl DuetServerImpl {
@@ -137,6 +143,7 @@ impl DuetServerImpl {
             apply_streams: HashMap::new(),
             next_stream_id: 1,
             tuning: sync::SyncTuning::legacy(),
+            stream_performance: RemoteStreamProfile::default(),
         })
     }
 
@@ -185,6 +192,7 @@ impl DuetServer for DuetServerImpl {
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError> {
         log::debug!("Setting {} actions", actions.len());
         self.actions = actions;
+        self.stream_performance = RemoteStreamProfile::default();
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         sync::preflight_state_save(&remote_state)
             .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
@@ -430,6 +438,7 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn finish_apply_stream(&mut self, stream_id: ApplyStreamId) -> Result<(), RPCError> {
+        let start = Instant::now();
         let applier = self
             .apply_streams
             .remove(&stream_id)
@@ -446,6 +455,7 @@ impl DuetServer for DuetServerImpl {
             self.apply_attempt_id(),
         )
         .map_err(|e| rpc_report_error("mark apply recovery state-save", Some(&remote_state), e))?;
+        self.stream_performance.apply_finish_ms += duration_ms(start.elapsed());
         Ok(())
     }
 
@@ -455,12 +465,19 @@ impl DuetServer for DuetServerImpl {
         max_frames: u32,
         max_payload_bytes: u32,
     ) -> Result<Vec<DetailFrame>, RPCError> {
-        let producer = self
-            .detail_streams
-            .get_mut(&stream_id)
-            .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "detail stream does not exist"))?;
-        match producer.next_frames(max_frames as usize, max_payload_bytes as usize) {
+        let start = Instant::now();
+        let result = {
+            let producer = self
+                .detail_streams
+                .get_mut(&stream_id)
+                .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "detail stream does not exist"))?;
+            producer.next_frames(max_frames as usize, max_payload_bytes as usize)
+        };
+        match result {
             Ok(frames) => {
+                self.stream_performance.detail_generate_ms += duration_ms(start.elapsed());
+                self.stream_performance.detail_batches += 1;
+                self.stream_performance.detail_transfer.record_batch(&frames);
                 if frames.is_empty() {
                     self.detail_streams.remove(&stream_id);
                 }
@@ -476,6 +493,9 @@ impl DuetServer for DuetServerImpl {
         frames: Vec<DetailFrame>,
     ) -> Result<(), RPCError> {
         let base = self.base.clone();
+        self.stream_performance.apply_batches += 1;
+        self.stream_performance.apply_transfer.record_batch(&frames);
+        let start = Instant::now();
         let applier = self
             .apply_streams
             .get_mut(&stream_id)
@@ -485,6 +505,7 @@ impl DuetServer for DuetServerImpl {
                 .apply_frame(frame)
                 .map_err(|e| rpc_report_error("apply detail stream", Some(&base), e))?;
         }
+        self.stream_performance.apply_frames_ms += duration_ms(start.elapsed());
         Ok(())
     }
 
@@ -522,6 +543,10 @@ impl DuetServer for DuetServerImpl {
         let tuning = sync::SyncTuning::preferred_with_env().negotiate(request.preferred);
         self.tuning = tuning;
         Ok(tuning)
+    }
+
+    fn stream_performance(&self) -> Result<RemoteStreamProfile, RPCError> {
+        Ok(self.stream_performance.clone())
     }
 }
 
@@ -616,7 +641,8 @@ mod tests {
                 CAPABILITY_APPLY_ATTEMPT_PREPARE.to_string(),
                 CAPABILITY_APPLY_ATTEMPT_ID.to_string(),
                 CAPABILITY_CREATABLE_ADDED_PARENTS.to_string(),
-                CAPABILITY_SYNC_TUNING.to_string()
+                CAPABILITY_SYNC_TUNING.to_string(),
+                CAPABILITY_STREAM_PERFORMANCE.to_string()
             ]
         );
     }
@@ -628,9 +654,9 @@ mod tests {
             preferred: sync::SyncTuning {
                 signature_window_min: 4096,
                 signature_window_max: 8 * 1024 * 1024,
-                detail_chunk_bytes: 8 * 1024 * 1024,
+                detail_chunk_bytes: 128 * 1024 * 1024,
                 detail_batch_frames: 512,
-                detail_batch_payload_bytes: 8 * 1024 * 1024,
+                detail_batch_payload_bytes: 128 * 1024 * 1024,
             },
         };
 
