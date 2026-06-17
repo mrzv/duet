@@ -20,6 +20,16 @@ pub use crate::rustsync::{Delta, Signature};
 pub const LEGACY_SIGNATURE_WINDOW: usize = 1024;
 pub const DEFAULT_SIGNATURE_WINDOW_MIN: usize = LEGACY_SIGNATURE_WINDOW;
 pub const DEFAULT_SIGNATURE_WINDOW_MAX: usize = 1024 * 1024;
+pub const LEGACY_DETAIL_CHUNK_BYTES: usize = 1024 * 1024;
+pub const LEGACY_DETAIL_BATCH_FRAMES: usize = 256;
+pub const LEGACY_DETAIL_BATCH_PAYLOAD_BYTES: usize = LEGACY_DETAIL_CHUNK_BYTES;
+pub const DEFAULT_DETAIL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_DETAIL_BATCH_FRAMES: usize = LEGACY_DETAIL_BATCH_FRAMES;
+pub const DEFAULT_DETAIL_BATCH_PAYLOAD_BYTES: usize = DEFAULT_DETAIL_CHUNK_BYTES;
+const MAX_SIGNATURE_WINDOW: u32 = 16 * 1024 * 1024;
+const MAX_DETAIL_CHUNK_BYTES: u32 = 64 * 1024 * 1024;
+const MAX_DETAIL_BATCH_FRAMES: u32 = 4096;
+const MAX_DETAIL_BATCH_PAYLOAD_BYTES: u32 = 64 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 128 * 1024;
 const SYNCED_MODE_MASK: u32 = 0o7777;
 static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -31,20 +41,6 @@ pub struct SignatureWindowConfig {
 }
 
 impl SignatureWindowConfig {
-    pub fn legacy() -> Self {
-        Self {
-            min: LEGACY_SIGNATURE_WINDOW,
-            max: LEGACY_SIGNATURE_WINDOW,
-        }
-    }
-
-    pub fn adaptive() -> Self {
-        Self {
-            min: DEFAULT_SIGNATURE_WINDOW_MIN,
-            max: DEFAULT_SIGNATURE_WINDOW_MAX,
-        }
-    }
-
     pub fn normalized(self) -> Self {
         let min = self.min.max(1);
         let max = self.max.max(min);
@@ -72,12 +68,108 @@ fn integer_sqrt(n: u64) -> u64 {
     x
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncTuningRequest {
+    pub preferred: SyncTuning,
+}
+
+impl SyncTuningRequest {
+    pub fn preferred() -> Self {
+        Self {
+            preferred: SyncTuning::preferred(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncTuning {
+    pub signature_window_min: u32,
+    pub signature_window_max: u32,
+    pub detail_chunk_bytes: u32,
+    pub detail_batch_frames: u32,
+    pub detail_batch_payload_bytes: u32,
+}
+
+impl SyncTuning {
+    pub fn legacy() -> Self {
+        Self {
+            signature_window_min: LEGACY_SIGNATURE_WINDOW as u32,
+            signature_window_max: LEGACY_SIGNATURE_WINDOW as u32,
+            detail_chunk_bytes: LEGACY_DETAIL_CHUNK_BYTES as u32,
+            detail_batch_frames: LEGACY_DETAIL_BATCH_FRAMES as u32,
+            detail_batch_payload_bytes: LEGACY_DETAIL_BATCH_PAYLOAD_BYTES as u32,
+        }
+    }
+
+    pub fn preferred() -> Self {
+        Self {
+            signature_window_min: DEFAULT_SIGNATURE_WINDOW_MIN as u32,
+            signature_window_max: DEFAULT_SIGNATURE_WINDOW_MAX as u32,
+            detail_chunk_bytes: DEFAULT_DETAIL_CHUNK_BYTES as u32,
+            detail_batch_frames: DEFAULT_DETAIL_BATCH_FRAMES as u32,
+            detail_batch_payload_bytes: DEFAULT_DETAIL_BATCH_PAYLOAD_BYTES as u32,
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        let signature_window_min = self.signature_window_min.clamp(1, MAX_SIGNATURE_WINDOW);
+        let signature_window_max = self
+            .signature_window_max
+            .clamp(signature_window_min, MAX_SIGNATURE_WINDOW);
+        Self {
+            signature_window_min,
+            signature_window_max,
+            detail_chunk_bytes: self.detail_chunk_bytes.clamp(1, MAX_DETAIL_CHUNK_BYTES),
+            detail_batch_frames: self.detail_batch_frames.clamp(1, MAX_DETAIL_BATCH_FRAMES),
+            detail_batch_payload_bytes: self
+                .detail_batch_payload_bytes
+                .clamp(1, MAX_DETAIL_BATCH_PAYLOAD_BYTES),
+        }
+    }
+
+    pub fn negotiate(self, peer: Self) -> Self {
+        let local = self.normalized();
+        let peer = peer.normalized();
+        let signature_window_min = local.signature_window_min.max(peer.signature_window_min);
+        let signature_window_max = local
+            .signature_window_max
+            .min(peer.signature_window_max)
+            .max(signature_window_min);
+        Self {
+            signature_window_min,
+            signature_window_max,
+            detail_chunk_bytes: local.detail_chunk_bytes.min(peer.detail_chunk_bytes),
+            detail_batch_frames: local.detail_batch_frames.min(peer.detail_batch_frames),
+            detail_batch_payload_bytes: local
+                .detail_batch_payload_bytes
+                .min(peer.detail_batch_payload_bytes),
+        }
+        .normalized()
+    }
+
+    pub fn signature_window_config(self) -> SignatureWindowConfig {
+        let tuning = self.normalized();
+        SignatureWindowConfig {
+            min: tuning.signature_window_min as usize,
+            max: tuning.signature_window_max as usize,
+        }
+    }
+
+    pub fn detail_chunk_bytes(self) -> usize {
+        self.normalized().detail_chunk_bytes as usize
+    }
+
+    pub fn detail_batch_frames(self) -> usize {
+        self.normalized().detail_batch_frames as usize
+    }
+
+    pub fn detail_batch_payload_bytes(self) -> usize {
+        self.normalized().detail_batch_payload_bytes as usize
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureWithPath(PathBuf, Signature);
-
-pub fn get_signatures(base: &PathBuf, actions: &Vec<Action>) -> Result<Vec<SignatureWithPath>> {
-    get_signatures_with_config(base, actions, SignatureWindowConfig::legacy())
-}
 
 pub fn get_signatures_with_config(
     base: &PathBuf,

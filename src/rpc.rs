@@ -27,6 +27,7 @@ pub(crate) const CAPABILITY_STREAMED_DETAIL_BATCHES: &str = "streamed-detail-bat
 pub(crate) const CAPABILITY_APPLY_ATTEMPT_PREPARE: &str = "apply-attempt-prepare-v1";
 pub(crate) const CAPABILITY_APPLY_ATTEMPT_ID: &str = "apply-attempt-id-v1";
 pub(crate) const CAPABILITY_CREATABLE_ADDED_PARENTS: &str = "creatable-added-parents-v1";
+pub(crate) const CAPABILITY_SYNC_TUNING: &str = "sync-tuning-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -34,6 +35,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_APPLY_ATTEMPT_PREPARE,
     CAPABILITY_APPLY_ATTEMPT_ID,
     CAPABILITY_CREATABLE_ADDED_PARENTS,
+    CAPABILITY_SYNC_TUNING,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -103,6 +105,10 @@ pub trait DuetServer {
     ) -> Result<(), RPCError>;
     fn prepare_apply_attempt(&mut self) -> Result<(), RPCError>;
     fn prepare_apply_attempt_with_id(&mut self, attempt_id: String) -> Result<(), RPCError>;
+    fn negotiate_sync_tuning(
+        &mut self,
+        request: sync::SyncTuningRequest,
+    ) -> Result<sync::SyncTuning, RPCError>;
 }
 
 struct DuetServerImpl {
@@ -115,6 +121,7 @@ struct DuetServerImpl {
     detail_streams: HashMap<DetailStreamId, DetailProducer>,
     apply_streams: HashMap<ApplyStreamId, sync::DetailApplier>,
     next_stream_id: u64,
+    tuning: sync::SyncTuning,
 }
 
 impl DuetServerImpl {
@@ -129,6 +136,7 @@ impl DuetServerImpl {
             detail_streams: HashMap::new(),
             apply_streams: HashMap::new(),
             next_stream_id: 1,
+            tuning: sync::SyncTuning::legacy(),
         })
     }
 
@@ -226,7 +234,11 @@ impl DuetServer for DuetServerImpl {
 
     fn get_signatures(&self) -> Result<Vec<SignatureWithPath>, RPCError> {
         log::debug!("Getting signatures");
-        let result = sync::get_signatures(&self.base, &self.actions);
+        let result = sync::get_signatures_with_config(
+            &self.base,
+            &self.actions,
+            self.tuning.signature_window_config(),
+        );
         match result {
             Ok(signatures) => Ok(signatures),
             Err(e) => Err(rpc_report_error("read signatures", Some(&self.base), e)),
@@ -502,6 +514,15 @@ impl DuetServer for DuetServerImpl {
         )
         .map_err(|e| rpc_report_error("prepare apply recovery", Some(&remote_state), e))
     }
+
+    fn negotiate_sync_tuning(
+        &mut self,
+        request: sync::SyncTuningRequest,
+    ) -> Result<sync::SyncTuning, RPCError> {
+        let tuning = sync::SyncTuning::preferred().negotiate(request.preferred);
+        self.tuning = tuning;
+        Ok(tuning)
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -594,9 +615,45 @@ mod tests {
                 CAPABILITY_STREAMED_DETAIL_BATCHES.to_string(),
                 CAPABILITY_APPLY_ATTEMPT_PREPARE.to_string(),
                 CAPABILITY_APPLY_ATTEMPT_ID.to_string(),
-                CAPABILITY_CREATABLE_ADDED_PARENTS.to_string()
+                CAPABILITY_CREATABLE_ADDED_PARENTS.to_string(),
+                CAPABILITY_SYNC_TUNING.to_string()
             ]
         );
+    }
+
+    #[test]
+    fn negotiate_sync_tuning_stores_clamped_intersection() {
+        let mut server = DuetServerImpl::new().unwrap();
+        let request = sync::SyncTuningRequest {
+            preferred: sync::SyncTuning {
+                signature_window_min: 4096,
+                signature_window_max: 8 * 1024 * 1024,
+                detail_chunk_bytes: 8 * 1024 * 1024,
+                detail_batch_frames: 512,
+                detail_batch_payload_bytes: 8 * 1024 * 1024,
+            },
+        };
+
+        let tuning = server.negotiate_sync_tuning(request).unwrap();
+
+        assert_eq!(tuning.signature_window_min, 4096);
+        assert_eq!(
+            tuning.signature_window_max,
+            sync::DEFAULT_SIGNATURE_WINDOW_MAX as u32
+        );
+        assert_eq!(
+            tuning.detail_chunk_bytes,
+            sync::DEFAULT_DETAIL_CHUNK_BYTES as u32
+        );
+        assert_eq!(
+            tuning.detail_batch_frames,
+            sync::DEFAULT_DETAIL_BATCH_FRAMES as u32
+        );
+        assert_eq!(
+            tuning.detail_batch_payload_bytes,
+            sync::DEFAULT_DETAIL_BATCH_PAYLOAD_BYTES as u32
+        );
+        assert_eq!(server.tuning, tuning);
     }
 
     #[test]

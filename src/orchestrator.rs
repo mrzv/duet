@@ -28,9 +28,6 @@ const PROFILE_ERROR_CODE: u8 = 2;
 const SSH_ERROR_CODE: u8 = 3;
 const SERVER_ERROR_CODE: u8 = 4;
 const CTRLC_CODE: u8 = 6;
-const DETAIL_CHUNK_BYTES: usize = 1024 * 1024;
-const DETAIL_BATCH_FRAMES: usize = 256;
-const DETAIL_BATCH_PAYLOAD_BYTES: usize = DETAIL_CHUNK_BYTES;
 #[cfg(debug_assertions)]
 const TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS: &str =
     "DUET_TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS";
@@ -119,10 +116,11 @@ pub async fn sync(
     let (local_result, remote_result) = tokio::join!(local_fut, remote_fut);
     let (mut local_all_old, local_changes) = local_result?;
     let (remote_changes, remote_info) = remote_result?;
+    let tuning = negotiate_sync_tuning(&remote, &remote_info).await?;
 
     let mut actions = build_actions(&local_changes, &remote_changes);
     if options.debug_info {
-        show_debug_info(&remote_info);
+        show_debug_info(&remote_info, tuning);
     }
     let resolution = resolve_actions(&mut actions, options)?;
 
@@ -163,7 +161,10 @@ pub async fn sync(
     let local_signatures_fut = {
         let local_base = local_base.clone();
         let actions = actions.clone();
-        tokio::task::spawn_blocking(move || sync_ops::get_signatures(&local_base, &actions))
+        let window_config = tuning.signature_window_config();
+        tokio::task::spawn_blocking(move || {
+            sync_ops::get_signatures_with_config(&local_base, &actions, window_config)
+        })
     };
     let remote_signatures_fut = remote.get_signatures();
     let (local_signatures, remote_signatures) =
@@ -201,6 +202,7 @@ pub async fn sync(
             local_all_old,
             local_signatures,
             remote_signatures,
+            tuning,
         )
         .await?
     } else {
@@ -317,6 +319,23 @@ where
         test_pause_after_remote_apply_prepare().await;
     }
     Ok(())
+}
+
+async fn negotiate_sync_tuning<R>(
+    remote: &R,
+    info: &rpc::ServerInfo,
+) -> Result<sync_ops::SyncTuning>
+where
+    R: DuetServerAsync,
+{
+    if !has_remote_capability(info, rpc::CAPABILITY_SYNC_TUNING) {
+        return Ok(sync_ops::SyncTuning::legacy());
+    }
+
+    remote
+        .negotiate_sync_tuning(sync_ops::SyncTuningRequest::preferred())
+        .await
+        .map_err(|e| remote_rpc_error("Couldn't negotiate sync tuning", e))
 }
 
 fn new_apply_attempt_id(local_id: &str) -> String {
@@ -445,6 +464,7 @@ async fn stream_detailed_changes<R>(
     local_all_old: state::Entries,
     local_signatures: Vec<sync_ops::SignatureWithPath>,
     remote_signatures: Vec<sync_ops::SignatureWithPath>,
+    tuning: sync_ops::SyncTuning,
 ) -> Result<state::Entries>
 where
     R: DuetServerAsync,
@@ -457,7 +477,7 @@ where
         local_base.clone(),
         actions.clone(),
         remote_signatures,
-        DETAIL_CHUNK_BYTES,
+        tuning.detail_chunk_bytes(),
     );
     let mut local_applier = sync_ops::DetailApplier::new_with_attempt(
         local_base.clone(),
@@ -467,7 +487,7 @@ where
     );
 
     let remote_detail_stream = remote
-        .begin_detail_stream(local_signatures, DETAIL_CHUNK_BYTES as u32)
+        .begin_detail_stream(local_signatures, tuning.detail_chunk_bytes() as u32)
         .await
         .map_err(|e| remote_rpc_error("Couldn't begin remote detail stream", e))?;
     let remote_apply_stream = remote
@@ -482,8 +502,8 @@ where
             let frames = remote
                 .next_detail_chunks(
                     remote_detail_stream,
-                    DETAIL_BATCH_FRAMES as u32,
-                    DETAIL_BATCH_PAYLOAD_BYTES as u32,
+                    tuning.detail_batch_frames() as u32,
+                    tuning.detail_batch_payload_bytes() as u32,
                 )
                 .await
                 .map_err(|e| post_preflight_rpc_error("Couldn't read remote detail stream", e))?;
@@ -507,7 +527,10 @@ where
 
         if !local_done {
             let frames = local_producer
-                .next_frames(DETAIL_BATCH_FRAMES, DETAIL_BATCH_PAYLOAD_BYTES)
+                .next_frames(
+                    tuning.detail_batch_frames(),
+                    tuning.detail_batch_payload_bytes(),
+                )
                 .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
             if frames.is_empty() {
                 local_done = true;
@@ -601,7 +624,7 @@ fn format_capabilities(capabilities: &[impl AsRef<str>]) -> String {
     }
 }
 
-fn show_debug_info(info: &rpc::ServerInfo) {
+fn show_debug_info(info: &rpc::ServerInfo, tuning: sync_ops::SyncTuning) {
     println!("Debug information:");
     println!("  client protocol: {}", rpc::PROTOCOL_VERSION);
     println!(
@@ -618,6 +641,19 @@ fn show_debug_info(info: &rpc::ServerInfo) {
         "  agreed capabilities: {}",
         format_capabilities(&agreed_capabilities(info))
     );
+    println!("  sync tuning: {}", format_sync_tuning(tuning));
+}
+
+fn format_sync_tuning(tuning: sync_ops::SyncTuning) -> String {
+    let tuning = tuning.normalized();
+    format!(
+        "signature-window={}..{} bytes, detail-chunk={}, detail-batch-frames={}, detail-batch-payload={}",
+        indicatif::HumanBytes(tuning.signature_window_min as u64),
+        indicatif::HumanBytes(tuning.signature_window_max as u64),
+        indicatif::HumanBytes(tuning.detail_chunk_bytes as u64),
+        tuning.detail_batch_frames,
+        indicatif::HumanBytes(tuning.detail_batch_payload_bytes as u64)
+    )
 }
 
 fn server_info_error(error: RPCError) -> color_eyre::eyre::Report {
