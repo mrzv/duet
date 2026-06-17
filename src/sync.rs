@@ -260,13 +260,7 @@ pub fn describe_apply_attempt(state_path: &Path) -> Result<Option<String>> {
             marker_path.display()
         )
     })?;
-    let recovery_advice = apply_attempt_recovery_advice(&marker);
-    Ok(Some(format!(
-        "previous Duet apply attempt did not finish: {}\n{}\n{}",
-        marker_path.display(),
-        marker.trim_end(),
-        recovery_advice
-    )))
+    Ok(Some(apply_attempt_description(&marker_path, &marker)))
 }
 
 pub fn start_apply_attempt(
@@ -303,12 +297,7 @@ pub fn start_apply_attempt(
             if existing == contents {
                 Ok(())
             } else {
-                Err(eyre!(
-                    "previous Duet apply attempt did not finish: {}\n{}\n{}",
-                    marker_path.display(),
-                    existing.trim_end(),
-                    apply_attempt_recovery_advice(&existing)
-                ))
+                Err(eyre!("{}", apply_attempt_description(&marker_path, &existing)))
             }
         }
         Err(e) => Err(e).wrap_err_with(|| {
@@ -661,15 +650,29 @@ fn committed_steps_from_marker(marker: &str) -> Vec<String> {
         .collect()
 }
 
-fn apply_attempt_recovery_advice(marker: &str) -> String {
+fn apply_attempt_description(marker_path: &Path, marker: &str) -> String {
+    format!(
+        "previous Duet apply attempt did not finish: {}\n{}\nRecovery marker contents:\n{}",
+        marker_path.display(),
+        apply_attempt_recovery_advice(marker_path, marker),
+        marker.trim_end()
+    )
+}
+
+fn apply_attempt_recovery_advice(marker_path: &Path, marker: &str) -> String {
     let marker = parse_apply_attempt_marker(marker);
     let mut advice = if marker.phase.as_deref() == Some("state-save") {
-        "Recovery: filesystem changes were applied, but Duet state may not have been saved on this side. Fix state-storage permissions if needed, inspect the listed paths if needed, then remove this marker and rerun Duet before making unrelated changes."
+        "Recovery: filesystem changes were applied, but Duet state may not have been saved on this side. Fix state-storage permissions if needed, inspect the listed paths if needed, then remove only this marker and rerun Duet before making unrelated changes."
             .to_string()
     } else {
-        "Recovery: filesystem changes may have been partially applied on this side. Inspect the listed paths on both sides, fix any permission or filesystem problem, then remove this marker and rerun Duet."
+        "Recovery: filesystem changes may have been partially applied on this side. Inspect the listed paths on both sides, fix any permission or filesystem problem, then remove only this marker and rerun Duet."
             .to_string()
     };
+
+    advice.push_str(&format!(
+        " Marker to remove after inspection: rm {}.",
+        marker_path.display()
+    ));
 
     if marker
         .operations
@@ -695,24 +698,41 @@ fn apply_attempt_recovery_advice(marker: &str) -> String {
         );
     }
     if !marker.committed_operations.is_empty() {
-        advice.push_str(
-            " The marker records committed operations; inspect those paths first before removing the marker.",
-        );
+        advice.push_str(&format!(
+            " The marker records {} committed operation(s); inspect those paths first before removing the marker.",
+            marker.committed_operations.len()
+        ));
     }
     if !marker.committed_steps.is_empty() {
-        advice.push_str(
-            " The marker records committed apply steps; inspect those step paths before removing the marker.",
-        );
+        advice.push_str(&format!(
+            " The marker records {} committed apply step(s); inspect those step paths before removing the marker.",
+            marker.committed_steps.len()
+        ));
     }
     if !marker.staged_files.is_empty() {
-        advice.push_str(
-            " The marker lists staged temporary files that may be safe to remove after inspection if they were not renamed into place.",
-        );
+        let existing_staged_files = marker
+            .staged_files
+            .iter()
+            .filter(|path| Path::new(path.as_str()).exists())
+            .count();
+        if existing_staged_files == 0 {
+            advice.push_str(&format!(
+                " The marker lists {} staged temporary file(s), but none still exist; they were likely renamed into place or already cleaned up.",
+                marker.staged_files.len()
+            ));
+        } else {
+            advice.push_str(&format!(
+                " The marker lists {} staged temporary file(s), and {} still exist; inspect them before removing leftover temp files.",
+                marker.staged_files.len(),
+                existing_staged_files
+            ));
+        }
     }
     if !marker.unstaged_operations.is_empty() {
-        advice.push_str(
-            " The marker lists unstaged operations that commit directly; inspect those paths for partial changes.",
-        );
+        advice.push_str(&format!(
+            " The marker lists {} unstaged operation(s) that commit directly; inspect those paths for partial changes.",
+            marker.unstaged_operations.len()
+        ));
     }
 
     advice
@@ -2442,6 +2462,8 @@ mod tests {
         let error = check_apply_attempt_clear(&state).unwrap_err().to_string();
 
         assert!(error.contains("previous Duet apply attempt did not finish"));
+        assert!(error.contains("Marker to remove after inspection: rm "));
+        assert!(error.contains("Recovery marker contents:"));
         assert!(error.contains("side: local"));
         assert!(error.contains("phase: apply"));
         assert!(error.contains("path: a.txt"));
@@ -2468,8 +2490,8 @@ mod tests {
         let error = check_apply_attempt_clear(&state).unwrap_err().to_string();
         assert!(error.contains("phase: state-save"));
         assert!(error.contains("state may not have been saved"));
-        assert!(error.contains("committed operations"));
-        assert!(error.contains("committed apply steps"));
+        assert!(error.contains("committed operation(s)"));
+        assert!(error.contains("committed apply step(s)"));
 
         finish_apply_attempt(&state).unwrap();
         check_apply_attempt_clear(&state).unwrap();
@@ -2479,8 +2501,13 @@ mod tests {
     fn apply_attempt_recovery_advice_uses_operation_summaries() {
         let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\nunstaged-operation: remove-file old.txt\nstaged-file: /tmp/.duet-part-test\ncommitted-step: rename-file contents.txt\ncommitted-operation: modify-file contents.txt\n";
 
-        let advice = apply_attempt_recovery_advice(marker);
+        let advice = apply_attempt_recovery_advice(Path::new("/tmp/profile.snp.duet-apply"), marker);
 
+        assert!(
+            advice.contains("Marker to remove after inspection: rm /tmp/profile.snp.duet-apply"),
+            "{}",
+            advice
+        );
         assert!(advice.contains("Removed or replaced paths"), "{}", advice);
         assert!(advice.contains("Metadata operations"), "{}", advice);
         assert!(
@@ -2488,9 +2515,9 @@ mod tests {
             "{}",
             advice
         );
-        assert!(advice.contains("committed operations"), "{}", advice);
-        assert!(advice.contains("committed apply steps"), "{}", advice);
-        assert!(advice.contains("staged temporary files"), "{}", advice);
-        assert!(advice.contains("unstaged operations"), "{}", advice);
+        assert!(advice.contains("committed operation(s)"), "{}", advice);
+        assert!(advice.contains("committed apply step(s)"), "{}", advice);
+        assert!(advice.contains("staged temporary file(s)"), "{}", advice);
+        assert!(advice.contains("unstaged operation(s)"), "{}", advice);
     }
 }
