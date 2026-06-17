@@ -674,6 +674,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_derive",
+ "serde_json",
  "shellexpand",
  "simple-logging",
  "tempfile",

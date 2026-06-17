@@ -1,8 +1,6 @@
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-#[cfg(debug_assertions)]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::{eyre, Result, WrapErr};
@@ -12,6 +10,7 @@ use openssh::{KnownHosts, Session, SessionBuilder};
 
 use crate::actions::{num_identical, num_unresolved_conflicts, reverse, Action, Actions};
 use crate::cli::SyncOptions;
+use crate::performance::{PerformanceProfile, StreamingProfile};
 use crate::profile::{self, ProfileSource};
 use crate::remote;
 use crate::resolution::{self, AllResolution};
@@ -52,8 +51,19 @@ pub async fn sync(
     path: Option<PathBuf>,
     options: SyncOptions,
 ) -> Result<()> {
+    let total_start = Instant::now();
+    let print_performance = options.profile_performance;
+    let performance_json = options.profile_performance_json.clone();
+    let profiling_enabled = print_performance || performance_json.is_some();
+    let mut performance = PerformanceProfile::default();
+
+    let setup_start = Instant::now();
     env_logger::init();
     install_ctrlc_handler()?;
+
+    let context = prepare_context(source, path)?;
+    sync_ops::check_apply_attempt_clear(&context.local_state)?;
+    performance.record_phase("setup", setup_start.elapsed());
 
     let SyncContext {
         profile: prf,
@@ -66,19 +76,23 @@ pub async fn sync(
         local_state,
         remote_state_dir,
         server_log,
-    } = prepare_context(source, path)?;
-
-    sync_ops::check_apply_attempt_clear(&local_state)?;
+    } = context;
     let apply_attempt_id = new_apply_attempt_id(&local_id);
 
-    let local_fut = state::old_and_changes(
-        &local_base,
-        &path,
-        &prf.locations,
-        &prf.ignore,
-        Some(&local_state),
-    );
+    let local_fut = async {
+        let start = Instant::now();
+        let result = state::old_and_changes(
+            &local_base,
+            &path,
+            &prf.locations,
+            &prf.ignore,
+            Some(&local_state),
+        )
+        .await;
+        (result, start.elapsed())
+    };
 
+    let remote_setup_start = Instant::now();
     let remote_session = open_remote_session(remote_server).await;
     let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
         .await
@@ -89,40 +103,65 @@ pub async fn sync(
             quit::with_code(SERVER_ERROR_CODE);
         });
     let remote = remote::get_remote(&mut server)?;
+    performance.record_phase("remote_setup", remote_setup_start.elapsed());
 
     let remote_path = path.clone();
     let remote_locations = prf.locations.clone();
     let remote_ignore = prf.ignore.clone();
     let remote_fut = async {
-        remote
-            .set_base(remote_base)
-            .await
-            .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
-        let remote_info = remote.server_info().await.map_err(server_info_error)?;
-        if let Some(remote_state_dir) = remote_state_dir {
-            require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
+        let start = Instant::now();
+        let result = async {
             remote
-                .set_remote_state_dir(remote_state_dir)
+                .set_base(remote_base)
                 .await
-                .map_err(remote_state_dir_error)?;
+                .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
+            let remote_info = remote.server_info().await.map_err(server_info_error)?;
+            if let Some(remote_state_dir) = remote_state_dir {
+                require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
+                remote
+                    .set_remote_state_dir(remote_state_dir)
+                    .await
+                    .map_err(remote_state_dir_error)?;
+            }
+            let changes = remote
+                .changes(remote_path, remote_locations, remote_ignore, local_id)
+                .await
+                .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))?;
+            Ok::<_, color_eyre::eyre::Report>((changes, remote_info))
         }
-        let changes = remote
-            .changes(remote_path, remote_locations, remote_ignore, local_id)
-            .await
-            .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))?;
-        Ok::<_, color_eyre::eyre::Report>((changes, remote_info))
+        .await;
+        (result, start.elapsed())
     };
 
     let (local_result, remote_result) = tokio::join!(local_fut, remote_fut);
+    let (local_result, local_scan_duration) = local_result;
+    let (remote_result, remote_scan_duration) = remote_result;
+    performance.record_phase("local_scan", local_scan_duration);
+    performance.record_phase("remote_scan_rpc", remote_scan_duration);
     let (mut local_all_old, local_changes) = local_result?;
     let (remote_changes, remote_info) = remote_result?;
-    let tuning = negotiate_sync_tuning(&remote, &remote_info).await?;
 
+    performance.counters.local_entries = local_all_old.len();
+    performance.counters.local_changes = local_changes.len();
+    performance.counters.remote_changes = remote_changes.len();
+    performance.counters.local_changed_bytes = changed_bytes(&local_changes);
+    performance.counters.remote_changed_bytes = changed_bytes(&remote_changes);
+
+    let tuning_start = Instant::now();
+    let tuning = negotiate_sync_tuning(&remote, &remote_info).await?;
+    performance.record_phase("sync_tuning", tuning_start.elapsed());
+    performance.sync_tuning = Some(tuning.normalized());
+
+    let resolve_start = Instant::now();
     let mut actions = build_actions(&local_changes, &remote_changes);
     if options.debug_info {
         show_debug_info(&remote_info, tuning);
     }
+    performance.counters.total_actions = actions.len();
     let resolution = resolve_actions(&mut actions, options)?;
+    performance.counters.unresolved_conflicts = num_unresolved_conflicts(actions.iter());
+    performance.counters.identical_actions = num_identical(actions.iter());
+    performance.record_phase("resolve_actions", resolve_start.elapsed());
 
     if let AllResolution::Abort = resolution {
         println!("Aborting");
@@ -138,6 +177,9 @@ pub async fn sync(
             .filter(|a| !a.is_unresolved_conflict())
             .collect(),
     );
+    performance.counters.active_actions = actions.len();
+
+    let preflight_start = Instant::now();
     sync_ops::preflight_state_save(&local_state)?;
     sync_ops::preflight_apply(&local_base, actions.as_ref())?;
     let remote_actions: Actions = reverse(&actions);
@@ -156,6 +198,7 @@ pub async fn sync(
         .set_actions(remote_actions)
         .await
         .map_err(|e| remote_rpc_error("Failed to set remote actions", e))?;
+    performance.record_phase("preflight_and_set_actions", preflight_start.elapsed());
     log::debug!("set remote actions");
 
     let local_signatures_fut = {
@@ -163,15 +206,28 @@ pub async fn sync(
         let actions = actions.clone();
         let window_config = tuning.signature_window_config();
         tokio::task::spawn_blocking(move || {
-            sync_ops::get_signatures_with_config(&local_base, &actions, window_config)
+            let start = Instant::now();
+            let result = sync_ops::get_signatures_with_config(&local_base, &actions, window_config);
+            (result, start.elapsed())
         })
     };
-    let remote_signatures_fut = remote.get_signatures();
+    let remote_signatures_fut = async {
+        let start = Instant::now();
+        let result = remote.get_signatures().await;
+        (result, start.elapsed())
+    };
     let (local_signatures, remote_signatures) =
         tokio::join!(local_signatures_fut, remote_signatures_fut);
-    let local_signatures = local_signatures.wrap_err("local signature task failed")??;
+    let (local_signatures, local_signature_duration) =
+        local_signatures.wrap_err("local signature task failed")?;
+    let local_signatures = local_signatures?;
+    let (remote_signatures, remote_signature_duration) = remote_signatures;
     let remote_signatures =
         remote_signatures.map_err(|e| remote_rpc_error("couldn't get remote signatures", e))?;
+    performance.record_phase("local_signatures", local_signature_duration);
+    performance.record_phase("remote_signatures_rpc", remote_signature_duration);
+    performance.counters.local_signatures = local_signatures.len();
+    performance.counters.remote_signatures = remote_signatures.len();
     log::debug!(
         "{} local signatures; {} remote signatures",
         local_signatures.len(),
@@ -194,7 +250,7 @@ pub async fn sync(
             actions.as_ref(),
             Some(&apply_attempt_id),
         )?;
-        stream_detailed_changes(
+        let stream_result = stream_detailed_changes(
             &remote,
             &local_base,
             &local_state,
@@ -204,22 +260,44 @@ pub async fn sync(
             remote_signatures,
             tuning,
         )
-        .await?
+        .await?;
+        performance.record_phase(
+            "stream_remote_detail_and_local_apply",
+            stream_result.remote_detail_and_local_apply_duration,
+        );
+        performance.record_phase(
+            "stream_local_detail_and_remote_apply",
+            stream_result.local_detail_and_remote_apply_duration,
+        );
+        performance.counters.streamed_details = true;
+        performance.counters.streaming = stream_result.profile;
+        stream_result.local_all_old
     } else {
         let local_detailed_changes_fut = {
             let local_base = local_base.clone();
             let actions = actions.clone();
             tokio::task::spawn_blocking(move || {
-                sync_ops::get_detailed_changes(&local_base, &actions, &remote_signatures)
+                let start = Instant::now();
+                let result =
+                    sync_ops::get_detailed_changes(&local_base, &actions, &remote_signatures);
+                (result, start.elapsed())
             })
         };
-        let remote_detailed_changes_fut = remote.get_detailed_changes(local_signatures);
+        let remote_detailed_changes_fut = async {
+            let start = Instant::now();
+            let result = remote.get_detailed_changes(local_signatures).await;
+            (result, start.elapsed())
+        };
         let (local_detailed_changes, remote_detailed_changes) =
             tokio::join!(local_detailed_changes_fut, remote_detailed_changes_fut);
-        let local_detailed_changes =
-            local_detailed_changes.wrap_err("local detailed changes task failed")??;
+        let (local_detailed_changes, local_detail_duration) =
+            local_detailed_changes.wrap_err("local detailed changes task failed")?;
+        let local_detailed_changes = local_detailed_changes?;
+        let (remote_detailed_changes, remote_detail_duration) = remote_detailed_changes;
         let remote_detailed_changes = remote_detailed_changes
             .map_err(|e| remote_rpc_error("couldn't get remote detailed changes", e))?;
+        performance.record_phase("local_details", local_detail_duration);
+        performance.record_phase("remote_details_rpc", remote_detail_duration);
         log::debug!("got detailed changes");
 
         prepare_remote_apply_attempt(
@@ -241,6 +319,7 @@ pub async fn sync(
             let local_state = local_state.clone();
             let actions = actions.clone();
             tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
                 sync_ops::apply_detailed_changes(
                     &local_base,
                     &actions,
@@ -248,16 +327,24 @@ pub async fn sync(
                     &mut local_all_old,
                     Some(&local_state),
                 )?;
-                Ok::<state::Entries, color_eyre::eyre::Report>(local_all_old)
+                Ok::<_, color_eyre::eyre::Report>((local_all_old, start.elapsed()))
             })
         };
-        let remote_apply_fut = remote.apply_detailed_changes(local_detailed_changes);
+        let remote_apply_fut = async {
+            let start = Instant::now();
+            let result = remote.apply_detailed_changes(local_detailed_changes).await;
+            (result, start.elapsed())
+        };
         let (local_apply, remote_apply) = tokio::join!(local_apply_fut, remote_apply_fut);
+        let (remote_apply, remote_apply_duration) = remote_apply;
         let _ = remote_apply
             .map_err(|e| post_preflight_rpc_error("remote apply failed after preflight", e))?;
-        local_apply
+        let (local_all_old, local_apply_duration) = local_apply
             .wrap_err("local apply task failed")?
-            .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?
+            .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
+        performance.record_phase("local_apply", local_apply_duration);
+        performance.record_phase("remote_apply_rpc", remote_apply_duration);
+        local_all_old
     };
 
     sync_ops::mark_apply_attempt_state_save(
@@ -268,29 +355,50 @@ pub async fn sync(
         Some(&apply_attempt_id),
     )?;
 
+    let state_save_start = Instant::now();
     let local_state_display = local_state.display().to_string();
     let local_state_for_save = local_state.clone();
     let (remote_result, local_result) = tokio::join!(
-        remote.save_state(),
+        async {
+            let start = Instant::now();
+            let result = remote.save_state().await;
+            (result, start.elapsed())
+        },
         tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
             use atomicwrites::{AllowOverwrite, AtomicFile};
             let af = AtomicFile::new(local_state_for_save, AllowOverwrite);
-            af.write(|f| {
+            let result = af.write(|f| {
                 let mut f = BufWriter::new(f);
                 serialize_into(&local_all_old, &mut f, bincode::config::legacy())
-            })
+            });
+            (result, start.elapsed())
         })
     );
-    local_result
-        .wrap_err("local state save task failed")?
-        .wrap_err_with(|| {
-            format!(
-                "failed to save local state {}\n{}",
-                local_state_display, STATE_SAVE_RECOVERY_ADVICE
-            )
-        })?;
+    let (local_result, local_state_save_duration) =
+        local_result.wrap_err("local state save task failed")?;
+    local_result.wrap_err_with(|| {
+        format!(
+            "failed to save local state {}\n{}",
+            local_state_display, STATE_SAVE_RECOVERY_ADVICE
+        )
+    })?;
     sync_ops::finish_apply_attempt(&local_state)?;
+    let (remote_result, remote_state_save_duration) = remote_result;
     remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
+    performance.record_phase("local_state_save", local_state_save_duration);
+    performance.record_phase("remote_state_save_rpc", remote_state_save_duration);
+    performance.record_phase("state_save_total", state_save_start.elapsed());
+
+    if profiling_enabled {
+        performance.finish(total_start.elapsed());
+        if print_performance {
+            performance.print_human();
+        }
+        if let Some(path) = performance_json {
+            performance.write_json(&path)?;
+        }
+    }
 
     Ok(())
 }
@@ -456,6 +564,13 @@ fn post_state_save_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre
     )
 }
 
+struct StreamDetailedChangesResult {
+    local_all_old: state::Entries,
+    profile: StreamingProfile,
+    remote_detail_and_local_apply_duration: Duration,
+    local_detail_and_remote_apply_duration: Duration,
+}
+
 async fn stream_detailed_changes<R>(
     remote: &R,
     local_base: &PathBuf,
@@ -465,7 +580,7 @@ async fn stream_detailed_changes<R>(
     local_signatures: Vec<sync_ops::SignatureWithPath>,
     remote_signatures: Vec<sync_ops::SignatureWithPath>,
     tuning: sync_ops::SyncTuning,
-) -> Result<state::Entries>
+) -> Result<StreamDetailedChangesResult>
 where
     R: DuetServerAsync,
 {
@@ -497,8 +612,12 @@ where
 
     let mut local_done = false;
     let mut remote_done = false;
+    let mut profile = StreamingProfile::default();
+    let mut remote_detail_and_local_apply_duration = Duration::default();
+    let mut local_detail_and_remote_apply_duration = Duration::default();
     while !local_done || !remote_done {
         if !remote_done {
+            let start = Instant::now();
             let frames = remote
                 .next_detail_chunks(
                     remote_detail_stream,
@@ -507,6 +626,7 @@ where
                 )
                 .await
                 .map_err(|e| post_preflight_rpc_error("Couldn't read remote detail stream", e))?;
+            profile.remote_to_local.record_batch(&frames);
             if frames.is_empty() {
                 remote_done = true;
             } else {
@@ -523,15 +643,18 @@ where
                     transfer_bytes,
                 );
             }
+            remote_detail_and_local_apply_duration += start.elapsed();
         }
 
         if !local_done {
+            let start = Instant::now();
             let frames = local_producer
                 .next_frames(
                     tuning.detail_batch_frames(),
                     tuning.detail_batch_payload_bytes(),
                 )
                 .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
+            profile.local_to_remote.record_batch(&frames);
             if frames.is_empty() {
                 local_done = true;
             } else {
@@ -549,18 +672,28 @@ where
                     transfer_bytes,
                 );
             }
+            local_detail_and_remote_apply_duration += start.elapsed();
         }
     }
 
+    let start = Instant::now();
     let local_all_old = local_applier
         .finish()
         .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
+    remote_detail_and_local_apply_duration += start.elapsed();
+    let start = Instant::now();
     remote
         .finish_apply_stream(remote_apply_stream)
         .await
         .map_err(|e| post_preflight_rpc_error("Couldn't finish remote apply stream", e))?;
+    local_detail_and_remote_apply_duration += start.elapsed();
     progress.finish_and_clear();
-    Ok(local_all_old)
+    Ok(StreamDetailedChangesResult {
+        local_all_old,
+        profile,
+        remote_detail_and_local_apply_duration,
+        local_detail_and_remote_apply_duration,
+    })
 }
 
 fn stream_progress_bar(total_transfer_bytes: u64) -> Result<indicatif::ProgressBar> {
@@ -759,6 +892,25 @@ fn build_actions(local_changes: &state::Changes, remote_changes: &state::Changes
         .collect()
 }
 
+fn changed_bytes(changes: &state::Changes) -> u64 {
+    changes
+        .iter()
+        .map(|change| match change {
+            Change::Added(entry) => entry.is_file().then_some(entry.size()).unwrap_or(0),
+            Change::Removed(entry) => entry.is_file().then_some(entry.size()).unwrap_or(0),
+            Change::Modified(old, new) => {
+                if new.is_file() && (!old.is_file() || !old.same_contents(new)) {
+                    new.size()
+                } else if old.is_file() && !new.is_file() {
+                    old.size()
+                } else {
+                    0
+                }
+            }
+        })
+        .sum()
+}
+
 fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllResolution> {
     let SyncOptions {
         interactive,
@@ -768,6 +920,8 @@ fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllRes
         force,
         verbose,
         debug_info: _,
+        profile_performance: _,
+        profile_performance_json: _,
     } = options;
 
     if actions.is_empty() {

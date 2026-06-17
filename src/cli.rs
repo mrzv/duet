@@ -4,7 +4,7 @@ use color_eyre::eyre::Result;
 
 use crate::profile::ProfileSource;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOptions {
     pub interactive: bool,
     pub yes: bool,
@@ -13,6 +13,8 @@ pub struct SyncOptions {
     pub force: bool,
     pub verbose: bool,
     pub debug_info: bool,
+    pub profile_performance: bool,
+    pub profile_performance_json: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -70,6 +72,8 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
     }
 
     let profile_file = pargs.opt_value_from_os_str("--profile-file", parse_path)?;
+    let profile_performance_json =
+        pargs.opt_value_from_os_str("--profile-performance-json", parse_path)?;
 
     let options = SyncOptions {
         interactive: pargs.contains(["-i", "--interactive"]),
@@ -79,6 +83,8 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         force: pargs.contains(["-f", "--force"]),
         verbose: pargs.contains(["-v", "--verbose"]),
         debug_info: pargs.contains("--debug-info"),
+        profile_performance: pargs.contains("--profile-performance"),
+        profile_performance_json,
     };
 
     if let Some(profile_file) = profile_file {
@@ -171,6 +177,8 @@ mod tests {
                     force: true,
                     verbose: true,
                     debug_info: false,
+                    profile_performance: false,
+                    profile_performance_json: None,
                 },
             }
         );
@@ -191,6 +199,35 @@ mod tests {
                     force: false,
                     verbose: false,
                     debug_info: true,
+                    profile_performance: false,
+                    profile_performance_json: None,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_sync_command_with_performance_profile() {
+        assert_eq!(
+            parse_args(&[
+                "--profile-performance",
+                "--profile-performance-json",
+                "profile.json",
+                "work",
+            ]),
+            Command::Sync {
+                profile: ProfileSource::Named("work".to_string()),
+                path: None,
+                options: SyncOptions {
+                    interactive: false,
+                    yes: false,
+                    dry_run: false,
+                    batch: false,
+                    force: false,
+                    verbose: false,
+                    debug_info: false,
+                    profile_performance: true,
+                    profile_performance_json: Some(PathBuf::from("profile.json")),
                 },
             }
         );
@@ -211,6 +248,8 @@ mod tests {
                     force: false,
                     verbose: false,
                     debug_info: false,
+                    profile_performance: false,
+                    profile_performance_json: None,
                 },
             }
         );

@@ -251,6 +251,38 @@ fn named_profile_debug_info_reports_negotiated_capabilities() {
 }
 
 #[test]
+fn performance_profile_reports_human_and_json_output() {
+    let case = SyncCase::new();
+    write(&case.local.join("a.txt"), "from local");
+    let profile_json = case.local.parent().unwrap().join("performance.json");
+    let profile_json_arg = profile_json.to_str().unwrap();
+
+    let output = case.sync_with_args(&[
+        "--profile-performance",
+        "--profile-performance-json",
+        profile_json_arg,
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert_success(output);
+    assert!(stdout.contains("Performance profile:"), "{}", stdout);
+    assert!(stdout.contains("phases:"), "{}", stdout);
+    assert!(stdout.contains("local_scan"), "{}", stdout);
+    assert!(stdout.contains("remote_scan_rpc"), "{}", stdout);
+    assert!(stdout.contains("signatures:"), "{}", stdout);
+    assert!(stdout.contains("stream remote->local"), "{}", stdout);
+    assert!(stdout.contains("stream local->remote"), "{}", stdout);
+
+    let json = fs::read_to_string(profile_json).unwrap();
+    assert!(json.contains("\"total_ms\""), "{}", json);
+    assert!(json.contains("\"phases\""), "{}", json);
+    assert!(json.contains("\"sync_tuning\""), "{}", json);
+    assert!(json.contains("\"streamed_details\": true"), "{}", json);
+    assert!(json.contains("\"local_to_remote\""), "{}", json);
+    assert_eq!(read(&case.remote.join("a.txt")), "from local");
+}
+
+#[test]
 fn large_local_added_file_streams_to_remote() {
     let case = SyncCase::new();
     let contents = patterned_bytes(3 * 1024 * 1024 + 17);

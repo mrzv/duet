@@ -28,6 +28,10 @@ FLAGS:
     -v, --verbose       verbose output
     -n, --dry-run       don't apply changes
         --debug-info    print protocol and capability negotiation details
+        --profile-performance
+                         print sync phase timings and transfer counters
+        --profile-performance-json <file>
+                         write sync phase timings and transfer counters as JSON
 
         --profile-file <file>
                          read profile from a local file and keep state next to it

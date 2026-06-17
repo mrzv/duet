@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Added developer-facing sync performance profiling flags for phase timings, transfer counters, and optional JSON output.
+
 ## 0.8.0 - 2026-06-17
 
 ### Added
