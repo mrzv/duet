@@ -198,6 +198,7 @@ fn debug_info_reports_negotiated_capabilities() {
     );
     assert!(stdout.contains("sync-tuning-v1"), "{}", stdout);
     assert!(stdout.contains("stream-performance-v1"), "{}", stdout);
+    assert!(stdout.contains("file-byte-chunks-v1"), "{}", stdout);
     assert!(stdout.contains("sync tuning:"), "{}", stdout);
     assert!(stdout.contains("detail-batch-frames=256"), "{}", stdout);
 }
@@ -246,6 +247,7 @@ fn named_profile_debug_info_reports_negotiated_capabilities() {
         stdout
     );
     assert!(stdout.contains("sync-tuning-v1"), "{}", stdout);
+    assert!(stdout.contains("file-byte-chunks-v1"), "{}", stdout);
     assert!(stdout.contains("sync tuning:"), "{}", stdout);
     assert!(stdout.contains("detail-batch-frames=256"), "{}", stdout);
     assert_eq!(read(&remote.join("a.txt")), "from local");

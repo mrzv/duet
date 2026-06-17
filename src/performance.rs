@@ -152,6 +152,17 @@ pub struct DetailTransferStats {
 }
 
 impl DetailTransferStats {
+    pub fn record_file_byte_chunk(&mut self, len: u64) {
+        self.batches += 1;
+        self.frames += 1;
+        self.file_byte_frames += 1;
+        self.file_bytes += len;
+        self.message_payload_bytes += len;
+        self.reconstructed_bytes += len;
+        self.max_batch_frames = self.max_batch_frames.max(1);
+        self.max_batch_payload_bytes = self.max_batch_payload_bytes.max(len);
+    }
+
     pub fn record_batch(&mut self, frames: &[DetailFrame]) {
         self.batches += 1;
         if frames.is_empty() {

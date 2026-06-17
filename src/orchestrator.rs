@@ -260,6 +260,7 @@ pub async fn sync(
             remote_signatures,
             tuning,
             has_remote_capability(&remote_info, rpc::CAPABILITY_STREAM_PERFORMANCE),
+            has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
         )
         .await?;
         performance.record_phase(
@@ -590,6 +591,7 @@ async fn stream_detailed_changes<R>(
     remote_signatures: Vec<sync_ops::SignatureWithPath>,
     tuning: sync_ops::SyncTuning,
     remote_stream_performance: bool,
+    file_byte_chunks: bool,
 ) -> Result<StreamDetailedChangesResult>
 where
     R: DuetServerAsync,
@@ -675,12 +677,7 @@ where
             } else {
                 let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
                 let start = Instant::now();
-                remote
-                    .apply_detail_chunks(remote_apply_stream, frames)
-                    .await
-                    .map_err(|e| {
-                        post_preflight_rpc_error("Couldn't apply remote detail stream", e)
-                    })?;
+                apply_detail_frames(remote, remote_apply_stream, frames, file_byte_chunks).await?;
                 advance_stream_progress(
                     &progress,
                     &mut progress_position,
@@ -723,6 +720,62 @@ where
         local_detail_duration,
         remote_apply_duration,
     })
+}
+
+async fn apply_detail_frames<R>(
+    remote: &R,
+    remote_apply_stream: sync_ops::ApplyStreamId,
+    frames: Vec<sync_ops::DetailFrame>,
+    file_byte_chunks: bool,
+) -> Result<()>
+where
+    R: DuetServerAsync,
+{
+    if !file_byte_chunks {
+        return remote
+            .apply_detail_chunks(remote_apply_stream, frames)
+            .await
+            .map_err(|e| post_preflight_rpc_error("Couldn't apply remote detail stream", e));
+    }
+
+    let mut buffered = Vec::new();
+    for frame in frames {
+        match frame.payload {
+            sync_ops::DetailPayload::FileBytes(bytes) => {
+                if !buffered.is_empty() {
+                    let pending = std::mem::take(&mut buffered);
+                    remote
+                        .apply_detail_chunks(remote_apply_stream, pending)
+                        .await
+                        .map_err(|e| {
+                            post_preflight_rpc_error("Couldn't apply remote detail stream", e)
+                        })?;
+                }
+                remote
+                    .apply_file_byte_chunk(
+                        remote_apply_stream,
+                        sync_ops::FileByteChunk::new(frame.action_index, bytes),
+                    )
+                    .await
+                    .map_err(|e| {
+                        post_preflight_rpc_error("Couldn't apply remote file byte stream", e)
+                    })?;
+            }
+            payload => buffered.push(sync_ops::DetailFrame {
+                action_index: frame.action_index,
+                payload,
+            }),
+        }
+    }
+
+    if !buffered.is_empty() {
+        remote
+            .apply_detail_chunks(remote_apply_stream, buffered)
+            .await
+            .map_err(|e| post_preflight_rpc_error("Couldn't apply remote detail stream", e))?;
+    }
+
+    Ok(())
 }
 
 fn stream_progress_bar(total_transfer_bytes: u64) -> Result<indicatif::ProgressBar> {

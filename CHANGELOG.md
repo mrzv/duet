@@ -6,6 +6,7 @@
 - Added developer-facing sync performance profiling flags for phase timings, transfer counters, and optional JSON output.
 - Added hidden `DUET_SYNC_*` environment overrides for experimenting with sync tuning values during profiling.
 - Added streamed sync server-side performance telemetry to separate transport time from remote detail/apply work.
+- Added a `file-byte-chunks-v1` streamed apply fast path that uses byte-optimized RPC parameters for large whole-file uploads.
 
 ### Changed
 - Split streamed sync performance profile output into detail-generation and apply sub-phases for both directions.

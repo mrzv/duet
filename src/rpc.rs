@@ -31,6 +31,7 @@ pub(crate) const CAPABILITY_APPLY_ATTEMPT_ID: &str = "apply-attempt-id-v1";
 pub(crate) const CAPABILITY_CREATABLE_ADDED_PARENTS: &str = "creatable-added-parents-v1";
 pub(crate) const CAPABILITY_SYNC_TUNING: &str = "sync-tuning-v1";
 pub(crate) const CAPABILITY_STREAM_PERFORMANCE: &str = "stream-performance-v1";
+pub(crate) const CAPABILITY_FILE_BYTE_CHUNKS: &str = "file-byte-chunks-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -40,6 +41,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_CREATABLE_ADDED_PARENTS,
     CAPABILITY_SYNC_TUNING,
     CAPABILITY_STREAM_PERFORMANCE,
+    CAPABILITY_FILE_BYTE_CHUNKS,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -106,6 +108,11 @@ pub trait DuetServer {
         &mut self,
         stream_id: ApplyStreamId,
         frames: Vec<DetailFrame>,
+    ) -> Result<(), RPCError>;
+    fn apply_file_byte_chunk(
+        &mut self,
+        stream_id: ApplyStreamId,
+        chunk: sync::FileByteChunk,
     ) -> Result<(), RPCError>;
     fn prepare_apply_attempt(&mut self) -> Result<(), RPCError>;
     fn prepare_apply_attempt_with_id(&mut self, attempt_id: String) -> Result<(), RPCError>;
@@ -509,6 +516,28 @@ impl DuetServer for DuetServerImpl {
         Ok(())
     }
 
+    fn apply_file_byte_chunk(
+        &mut self,
+        stream_id: ApplyStreamId,
+        chunk: sync::FileByteChunk,
+    ) -> Result<(), RPCError> {
+        let base = self.base.clone();
+        self.stream_performance.apply_batches += 1;
+        self.stream_performance
+            .apply_transfer
+            .record_file_byte_chunk(chunk.len() as u64);
+        let start = Instant::now();
+        let applier = self
+            .apply_streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
+        applier
+            .apply_file_byte_chunk(chunk)
+            .map_err(|e| rpc_report_error("apply file byte stream", Some(&base), e))?;
+        self.stream_performance.apply_frames_ms += duration_ms(start.elapsed());
+        Ok(())
+    }
+
     fn prepare_apply_attempt(&mut self) -> Result<(), RPCError> {
         self.apply_attempt_id = None;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
@@ -642,7 +671,8 @@ mod tests {
                 CAPABILITY_APPLY_ATTEMPT_ID.to_string(),
                 CAPABILITY_CREATABLE_ADDED_PARENTS.to_string(),
                 CAPABILITY_SYNC_TUNING.to_string(),
-                CAPABILITY_STREAM_PERFORMANCE.to_string()
+                CAPABILITY_STREAM_PERFORMANCE.to_string(),
+                CAPABILITY_FILE_BYTE_CHUNKS.to_string()
             ]
         );
     }

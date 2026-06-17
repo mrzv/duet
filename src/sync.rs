@@ -254,6 +254,29 @@ pub enum DetailPayload {
     DiffEnd,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileByteChunk {
+    pub action_index: u32,
+    pub bytes: serde_bytes::ByteBuf,
+}
+
+impl FileByteChunk {
+    pub fn new(action_index: u32, bytes: Vec<u8>) -> Self {
+        Self {
+            action_index,
+            bytes: serde_bytes::ByteBuf::from(bytes),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes.into_vec()
+    }
+}
+
 pub fn detail_transfer_bytes(actions: &[Action]) -> u64 {
     actions.iter().map(action_detail_bytes).sum()
 }
@@ -1822,6 +1845,13 @@ impl DetailApplier {
         }
     }
 
+    pub fn apply_file_byte_chunk(&mut self, chunk: FileByteChunk) -> Result<()> {
+        self.apply_frame(DetailFrame {
+            action_index: chunk.action_index,
+            payload: DetailPayload::FileBytes(chunk.into_bytes()),
+        })
+    }
+
     pub fn finish(mut self) -> Result<Vec<Entry>> {
         if self.state.is_some() {
             return Err(eyre!("detail stream ended with an unfinished file"));
@@ -2642,7 +2672,7 @@ mod tests {
             ENV_SIGNATURE_WINDOW_MAX => Some("33554432".to_string()),
             ENV_DETAIL_CHUNK_BYTES => Some("8388608".to_string()),
             ENV_DETAIL_BATCH_FRAMES => Some("invalid".to_string()),
-            ENV_DETAIL_BATCH_PAYLOAD_BYTES => Some("134217728".to_string()),
+            ENV_DETAIL_BATCH_PAYLOAD_BYTES => Some("536870912".to_string()),
             _ => None,
         });
 
