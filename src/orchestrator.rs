@@ -16,7 +16,7 @@ use crate::profile::{self, ProfileSource};
 use crate::remote;
 use crate::resolution::{self, AllResolution};
 use crate::rpc::{self, DuetServerAsync};
-use crate::scan;
+use crate::scan::{self, Change};
 use crate::state;
 use crate::sync as sync_ops;
 use crate::sync_error;
@@ -151,6 +151,9 @@ pub async fn sync(
         has_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_ATTEMPT_PREPARE);
     let can_prepare_remote_apply_with_id =
         has_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_ATTEMPT_ID);
+    if actions_require_creatable_added_parents(&remote_actions) {
+        require_remote_capability(&remote_info, rpc::CAPABILITY_CREATABLE_ADDED_PARENTS)?;
+    }
     remote
         .set_actions(remote_actions)
         .await
@@ -642,6 +645,15 @@ fn require_remote_capability(info: &rpc::ServerInfo, capability: &str) -> Result
     ))
 }
 
+fn actions_require_creatable_added_parents(actions: &Actions) -> bool {
+    actions.iter().any(|action| {
+        matches!(
+            action,
+            Action::Local(Change::Added(_)) | Action::ResolvedLocal((_, _), Change::Added(_))
+        )
+    })
+}
+
 fn profile_source_path(source: &ProfileSource) -> Option<PathBuf> {
     match source {
         ProfileSource::Named(name) => profile::location(name).ok(),
@@ -856,6 +868,24 @@ mod tests {
 
         assert!(error.contains("0.3.2"));
         assert!(error.contains(rpc::CAPABILITY_PROFILE_FILE_STATE_DIR));
+    }
+
+    #[test]
+    fn added_local_apply_actions_require_creatable_parent_capability() {
+        let actions = vec![Action::Local(Change::Added(
+            scan::DirEntryWithMeta::test_file(PathBuf::from(".git/objects/0c/object"), 0),
+        ))];
+
+        assert!(actions_require_creatable_added_parents(&actions));
+    }
+
+    #[test]
+    fn removals_do_not_require_creatable_parent_capability() {
+        let actions = vec![Action::Local(Change::Removed(
+            scan::DirEntryWithMeta::test_file(PathBuf::from("removed.txt"), 0),
+        ))];
+
+        assert!(!actions_require_creatable_added_parents(&actions));
     }
 
     #[test]

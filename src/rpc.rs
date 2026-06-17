@@ -26,12 +26,14 @@ pub(crate) const CAPABILITY_STREAMED_DETAILS: &str = "streamed-details-v1";
 pub(crate) const CAPABILITY_STREAMED_DETAIL_BATCHES: &str = "streamed-detail-batches-v1";
 pub(crate) const CAPABILITY_APPLY_ATTEMPT_PREPARE: &str = "apply-attempt-prepare-v1";
 pub(crate) const CAPABILITY_APPLY_ATTEMPT_ID: &str = "apply-attempt-id-v1";
+pub(crate) const CAPABILITY_CREATABLE_ADDED_PARENTS: &str = "creatable-added-parents-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
     CAPABILITY_STREAMED_DETAIL_BATCHES,
     CAPABILITY_APPLY_ATTEMPT_PREPARE,
     CAPABILITY_APPLY_ATTEMPT_ID,
+    CAPABILITY_CREATABLE_ADDED_PARENTS,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -591,7 +593,8 @@ mod tests {
                 CAPABILITY_STREAMED_DETAILS.to_string(),
                 CAPABILITY_STREAMED_DETAIL_BATCHES.to_string(),
                 CAPABILITY_APPLY_ATTEMPT_PREPARE.to_string(),
-                CAPABILITY_APPLY_ATTEMPT_ID.to_string()
+                CAPABILITY_APPLY_ATTEMPT_ID.to_string(),
+                CAPABILITY_CREATABLE_ADDED_PARENTS.to_string()
             ]
         );
     }
