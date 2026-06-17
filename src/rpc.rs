@@ -519,7 +519,7 @@ impl DuetServer for DuetServerImpl {
         &mut self,
         request: sync::SyncTuningRequest,
     ) -> Result<sync::SyncTuning, RPCError> {
-        let tuning = sync::SyncTuning::preferred().negotiate(request.preferred);
+        let tuning = sync::SyncTuning::preferred_with_env().negotiate(request.preferred);
         self.tuning = tuning;
         Ok(tuning)
     }

@@ -34,6 +34,12 @@ const COPY_BUFFER_BYTES: usize = 128 * 1024;
 const SYNCED_MODE_MASK: u32 = 0o7777;
 static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+const ENV_SIGNATURE_WINDOW_MIN: &str = "DUET_SYNC_SIGNATURE_WINDOW_MIN";
+const ENV_SIGNATURE_WINDOW_MAX: &str = "DUET_SYNC_SIGNATURE_WINDOW_MAX";
+const ENV_DETAIL_CHUNK_BYTES: &str = "DUET_SYNC_DETAIL_CHUNK_BYTES";
+const ENV_DETAIL_BATCH_FRAMES: &str = "DUET_SYNC_DETAIL_BATCH_FRAMES";
+const ENV_DETAIL_BATCH_PAYLOAD_BYTES: &str = "DUET_SYNC_DETAIL_BATCH_PAYLOAD_BYTES";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignatureWindowConfig {
     pub min: usize,
@@ -76,7 +82,7 @@ pub struct SyncTuningRequest {
 impl SyncTuningRequest {
     pub fn preferred() -> Self {
         Self {
-            preferred: SyncTuning::preferred(),
+            preferred: SyncTuning::preferred_with_env(),
         }
     }
 }
@@ -109,6 +115,31 @@ impl SyncTuning {
             detail_batch_frames: DEFAULT_DETAIL_BATCH_FRAMES as u32,
             detail_batch_payload_bytes: DEFAULT_DETAIL_BATCH_PAYLOAD_BYTES as u32,
         }
+    }
+
+    pub fn preferred_with_env() -> Self {
+        Self::preferred().with_env_overrides_from(|name| std::env::var(name).ok())
+    }
+
+    fn with_env_overrides_from(mut self, mut get: impl FnMut(&str) -> Option<String>) -> Self {
+        if let Some(value) = get(ENV_SIGNATURE_WINDOW_MIN).and_then(|value| value.parse().ok()) {
+            self.signature_window_min = value;
+        }
+        if let Some(value) = get(ENV_SIGNATURE_WINDOW_MAX).and_then(|value| value.parse().ok()) {
+            self.signature_window_max = value;
+        }
+        if let Some(value) = get(ENV_DETAIL_CHUNK_BYTES).and_then(|value| value.parse().ok()) {
+            self.detail_chunk_bytes = value;
+        }
+        if let Some(value) = get(ENV_DETAIL_BATCH_FRAMES).and_then(|value| value.parse().ok()) {
+            self.detail_batch_frames = value;
+        }
+        if let Some(value) = get(ENV_DETAIL_BATCH_PAYLOAD_BYTES)
+            .and_then(|value| value.parse().ok())
+        {
+            self.detail_batch_payload_bytes = value;
+        }
+        self.normalized()
     }
 
     pub fn normalized(self) -> Self {
@@ -2495,6 +2526,27 @@ mod tests {
         let config = SignatureWindowConfig { min: 0, max: 0 };
 
         assert_eq!(config.window_for_size(1), 1);
+    }
+
+    #[test]
+    fn sync_tuning_applies_env_overrides_and_ignores_invalid_values() {
+        let tuning = SyncTuning::preferred().with_env_overrides_from(|name| match name {
+            ENV_SIGNATURE_WINDOW_MIN => Some("4096".to_string()),
+            ENV_SIGNATURE_WINDOW_MAX => Some("33554432".to_string()),
+            ENV_DETAIL_CHUNK_BYTES => Some("8388608".to_string()),
+            ENV_DETAIL_BATCH_FRAMES => Some("invalid".to_string()),
+            ENV_DETAIL_BATCH_PAYLOAD_BYTES => Some("134217728".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(tuning.signature_window_min, 4096);
+        assert_eq!(tuning.signature_window_max, MAX_SIGNATURE_WINDOW);
+        assert_eq!(tuning.detail_chunk_bytes, 8 * 1024 * 1024);
+        assert_eq!(
+            tuning.detail_batch_frames,
+            DEFAULT_DETAIL_BATCH_FRAMES as u32
+        );
+        assert_eq!(tuning.detail_batch_payload_bytes, MAX_DETAIL_BATCH_PAYLOAD_BYTES);
     }
 
     #[test]
