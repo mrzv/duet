@@ -10,6 +10,7 @@
 - Split streamed sync performance profile output into detail-generation and apply sub-phases for both directions.
 - Lowered the preferred adaptive signature-window ceiling to 64 KiB to avoid large-window diff performance cliffs observed during profiling.
 - Reduced allocation overhead when streaming many small whole-file changes.
+- Reused the streamed apply recovery-marker append handle to reduce per-file apply overhead.
 
 ## 0.8.0 - 2026-06-17
 

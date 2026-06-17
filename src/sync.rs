@@ -1608,6 +1608,88 @@ impl Drop for TempOutput {
     }
 }
 
+struct ApplyRecorder {
+    state_path: Option<PathBuf>,
+    marker_path: Option<PathBuf>,
+    file: Option<fs::File>,
+}
+
+impl ApplyRecorder {
+    fn new(state_path: Option<PathBuf>) -> Self {
+        Self {
+            state_path,
+            marker_path: None,
+            file: None,
+        }
+    }
+
+    fn record_staged_file(&mut self, path: &Path) -> Result<()> {
+        self.write_line(
+            "record staged file",
+            format!("staged-file: {}\n", path.display()),
+        )
+    }
+
+    fn record_committed_step(&mut self, operation: &str, path: &Path) -> Result<()> {
+        self.write_line(
+            "record committed step",
+            format!("committed-step: {} {}\n", operation, path.display()),
+        )
+    }
+
+    fn record_committed_action(&mut self, action: &Action) -> Result<()> {
+        let Some(change) = applied_change(action) else {
+            return Ok(());
+        };
+        self.write_line(
+            "record committed operation",
+            format!(
+                "committed-operation: {} {}\n",
+                change_operation(change),
+                action.path().display()
+            ),
+        )
+    }
+
+    fn write_line(&mut self, operation: &str, line: String) -> Result<()> {
+        let Some(state_path) = &self.state_path else {
+            return Ok(());
+        };
+
+        if self.file.is_none() {
+            let marker_path = apply_attempt_path(state_path)?;
+            let file = fs::OpenOptions::new()
+                .append(true)
+                .open(&marker_path)
+                .wrap_err_with(|| {
+                    format!(
+                        "unable to {} in apply recovery marker {}",
+                        operation,
+                        marker_path.display()
+                    )
+                })?;
+            self.marker_path = Some(marker_path);
+            self.file = Some(file);
+        }
+
+        let marker_path = self
+            .marker_path
+            .as_ref()
+            .expect("marker path is initialized");
+        self.file
+            .as_mut()
+            .expect("marker file is initialized")
+            .write_all(line.as_bytes())
+            .wrap_err_with(|| {
+                format!(
+                    "unable to {} in apply recovery marker {}",
+                    operation,
+                    marker_path.display()
+                )
+            })
+    }
+}
+
 fn ensure_parent_directory(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).wrap_err_with(|| {
@@ -1637,6 +1719,7 @@ pub struct DetailApplier {
     actions: Vec<Action>,
     all_old: Vec<Entry>,
     attempt_state: Option<PathBuf>,
+    recorder: ApplyRecorder,
     old_index: usize,
     action_index: usize,
     new_entries: Vec<Entry>,
@@ -1654,6 +1737,7 @@ impl DetailApplier {
             base,
             actions,
             all_old,
+            recorder: ApplyRecorder::new(attempt_state.clone()),
             attempt_state,
             old_index: 0,
             action_index: 0,
@@ -1952,7 +2036,7 @@ impl DetailApplier {
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         ensure_parent_directory(&filename)?;
         let output = TempOutput::new(filename)?;
-        record_staged_file(self.attempt_state.as_deref(), output.temp_path())?;
+        self.recorder.record_staged_file(output.temp_path())?;
         self.state = Some(ApplyState::File {
             action_index,
             output,
@@ -1965,7 +2049,7 @@ impl DetailApplier {
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         let source = fs::File::open(&filename)?;
         let output = TempOutput::new(filename)?;
-        record_staged_file(self.attempt_state.as_deref(), output.temp_path())?;
+        self.recorder.record_staged_file(output.temp_path())?;
         self.state = Some(ApplyState::Diff {
             action_index,
             source,
@@ -1999,10 +2083,13 @@ impl DetailApplier {
         };
         let filename = self.base.join(entry.path());
         output.finish()?;
-        record_committed_step(self.attempt_state.as_deref(), "rename-file", entry.path())?;
+        self.recorder
+            .record_committed_step("rename-file", entry.path())?;
         self.new_entries.push(update_meta(&filename, entry)?);
-        record_committed_step(self.attempt_state.as_deref(), "update-metadata", entry.path())?;
-        record_committed_action(self.attempt_state.as_deref(), &self.actions[action_index])?;
+        self.recorder
+            .record_committed_step("update-metadata", entry.path())?;
+        self.recorder
+            .record_committed_action(&self.actions[action_index])?;
         self.action_index = action_index + 1;
         Ok(())
     }
