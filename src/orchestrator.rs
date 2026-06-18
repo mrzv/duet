@@ -375,8 +375,12 @@ pub async fn sync(
             use atomicwrites::{AllowOverwrite, AtomicFile};
             let af = AtomicFile::new(local_state_for_save, AllowOverwrite);
             let result = af.write(|f| {
+                use std::io::{self, Write};
                 let mut f = BufWriter::new(f);
                 serialize_into(&local_all_old, &mut f, bincode::config::legacy())
+                    .map_err(io::Error::other)?;
+                f.flush()?;
+                Ok::<(), io::Error>(())
             });
             (result, start.elapsed())
         })
@@ -389,9 +393,9 @@ pub async fn sync(
             local_state_display, STATE_SAVE_RECOVERY_ADVICE
         )
     })?;
-    sync_ops::finish_apply_attempt(&local_state)?;
     let (remote_result, remote_state_save_duration) = remote_result;
     remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
+    sync_ops::finish_apply_attempt(&local_state)?;
     performance.record_phase("local_state_save", local_state_save_duration);
     performance.record_phase("remote_state_save_rpc", remote_state_save_duration);
     performance.record_phase("state_save_total", state_save_start.elapsed());

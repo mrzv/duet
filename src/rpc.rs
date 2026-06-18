@@ -339,8 +339,12 @@ impl DuetServer for DuetServerImpl {
         use atomicwrites::{AllowOverwrite, AtomicFile};
         let af = AtomicFile::new(&remote_state, AllowOverwrite);
         let result = af.write(|f| {
+            use std::io::{self, Write};
             let mut f = BufWriter::new(f);
             serialize_into(&self.all_old, &mut f, bincode::config::legacy())
+                .map_err(io::Error::other)?;
+            f.flush()?;
+            Ok::<(), io::Error>(())
         });
         match result {
             Ok(_) => {

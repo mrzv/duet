@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
 use bincode::serde::decode_from_std_read as deserialize_from;
@@ -40,6 +40,8 @@ pub fn save_entries(statefile: &PathBuf, entries: &Entries) -> Result<()> {
     );
     serialize_into(entries, &mut f, bincode::config::legacy())
         .wrap_err_with(|| format!("unable to encode state file {}", statefile.display()))?;
+    f.flush()
+        .wrap_err_with(|| format!("unable to flush state file {}", statefile.display()))?;
     Ok(())
 }
 
