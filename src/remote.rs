@@ -32,7 +32,9 @@ pub(crate) fn parse_remote(remote: &String) -> Result<(String, Option<String>, S
         (elements[i].to_string(), elements[i + 1].to_string(), i + 2)
     };
     if i < elements.len() {
-        Err(eyre!("Couldn't parse remote, elements remaining"))
+        Err(eyre!(
+            "couldn't parse remote profile entry; remote commands and paths containing spaces are not supported"
+        ))
     } else {
         Ok((remote_base, remote_server, remote_cmd))
     }

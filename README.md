@@ -9,6 +9,7 @@ changes from that state.
 ```
 USAGE:
     duet [FLAGS] <profile> [path]
+    duet [FLAGS] --profile-file <file> [path]
 
 FLAGS:
     -i, --interactive   interactive conflict resolution
@@ -17,6 +18,14 @@ FLAGS:
     -f, --force         in batch mode, apply what's possible, even if there are conflicts
     -v, --verbose       verbose output
     -n, --dry-run       don't apply changes
+        --debug-info    print protocol and capability negotiation details
+        --profile-performance
+                         print sync phase timings and transfer counters
+        --profile-performance-json <file>
+                         write sync phase timings and transfer counters as JSON
+
+        --profile-file <file>
+                         read profile from a local file and keep state next to it
 
         --version       prints version information
         --license       prints license information (including dependencies)
@@ -50,8 +59,11 @@ The first two lines specify the directories to synchronize. Either both are
 local, or the second one can have the form `ssh server-name path/to/duet
 directory-to-synchronize`. After a blank line, there is a list of
 inclusion-exclusion of paths under `directory-to-synchronize` (by default
-nothing is included). An optional `[ignore]` section specifies glob patterns to
-ignore.
+nothing is included). Remote commands and base paths are split on whitespace;
+paths containing spaces are not supported in remote profile entries. An optional
+`[ignore]` section specifies glob patterns to ignore. Ignore globs match entry
+basenames, not full relative paths, so `*.tmp` matches `dir/file.tmp` but
+`dir/*.tmp` does not.
 
 Subsequently, `duet my_profile` will synchronize the two directories.
 

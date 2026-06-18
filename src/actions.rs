@@ -127,7 +127,19 @@ fn abbreviate_hex_components(path: &PathBuf) -> PathBuf {
 }
 
 fn show_path(p: &PathBuf) -> String {
-    abbreviate_hex_components(p).display().to_string()
+    escape_control_chars(&abbreviate_hex_components(p).display().to_string())
+}
+
+fn escape_control_chars(value: &str) -> String {
+    let mut escaped = String::new();
+    for c in value.chars() {
+        if c.is_control() {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
 }
 
 impl fmt::Display for Action {
@@ -142,6 +154,21 @@ impl fmt::Display for Action {
             Action::ResolvedRemote((_,_),r) => write!(f, "{} ====>   {}", r, show_path(r.path())),
             Action::Identical(l,r)          => write!(f, "{} --I-- {} {}", l, r, show_path(l.path())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn show_path_escapes_control_characters() {
+        let shown = show_path(&PathBuf::from("bad\x1b[31m\nname"));
+
+        assert!(!shown.contains('\x1b'));
+        assert!(!shown.contains('\n'));
+        assert!(shown.contains("\\u{1b}"));
+        assert!(shown.contains("\\n"));
     }
 }
 

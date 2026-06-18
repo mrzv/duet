@@ -68,6 +68,8 @@ Hidden maintenance commands:
 - `_changes <profile> [statefile]`: print local changes against a snapshot.
 - `_info <profile>`: print the profile file location.
 - `_walk <path>`: print paths discovered by the scanner.
+- `_recover <statefile>`: print any unfinished apply-attempt marker for a state
+  file.
 
 `src/commands.rs` implements the informational and maintenance commands. Normal
 synchronization is implemented in `src/orchestrator.rs`.
@@ -315,6 +317,9 @@ Core RPC methods:
 - `apply_detailed_changes(details)`: mutate the server filesystem using the
   non-streamed detail vector and update the server snapshot in memory.
 - `save_state()`: atomically persist the server snapshot.
+- `select_remote_state_id(stable_id, legacy_id)`: choose the stable remote state
+  id for new state, or an existing legacy id when a legacy state file is already
+  present.
 
 Streaming RPC methods:
 
@@ -328,9 +333,11 @@ Streaming RPC methods:
 - `apply_detail_chunks(stream_id, frames)`
 
 `ServerInfo` currently advertises protocol version `2` and capabilities for
-profile-file remote state directories, streamed details, and batched streamed
-detail frames. `orchestrator::show_debug_info()` prints client, server, and
-agreed capabilities when `--debug-info` is used.
+profile-file remote state directories, streamed details, batched streamed detail
+frames, apply-attempt preparation and ids, creatable added parents, sync tuning,
+stream performance, file byte chunks, and remote state id selection.
+`orchestrator::show_debug_info()` prints client, server, and agreed capabilities
+when `--debug-info` is used.
 
 `rpc::server()` uses `DUET_SERVER_LOG` (`rpc::SERVER_LOG_ENV`) when provided or
 falls back to `~/.config/duet/remote.log`, initializes logging, and serves

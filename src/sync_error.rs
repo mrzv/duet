@@ -123,22 +123,26 @@ impl StructuredSyncError {
     }
 
     pub fn render_for_user(&self) -> String {
-        let mut rendered = format!("{} {} failed", self.side, self.operation);
+        let mut rendered = format!(
+            "{} {} failed",
+            escape_control_chars(&self.side),
+            escape_control_chars(&self.operation)
+        );
         if let Some(path) = &self.path {
-            rendered.push_str(&format!(" at {}", path.display()));
+            rendered.push_str(&format!(" at {}", display_path(path)));
         }
         if self.kind != "other" {
-            rendered.push_str(&format!(" ({})", self.kind));
+            rendered.push_str(&format!(" ({})", escape_control_chars(&self.kind)));
         }
         if let Some(summary) = first_error_line(&self.message) {
-            rendered.push_str(&format!(": {}", summary));
+            rendered.push_str(&format!(": {}", escape_control_chars(summary)));
         }
         if let Some(source) = self.sources.first() {
-            rendered.push_str(&format!("; caused by: {}", source));
+            rendered.push_str(&format!("; caused by: {}", escape_control_chars(source)));
         }
         if let Some(recovery) = recovery_line(&self.message) {
             rendered.push('\n');
-            rendered.push_str(recovery);
+            rendered.push_str(&escape_control_chars(recovery));
         }
         rendered
     }
@@ -147,12 +151,12 @@ impl StructuredSyncError {
 impl fmt::Display for StructuredSyncError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "duet-sync-error-v{}", self.version)?;
-        writeln!(f, "side: {}", self.side)?;
-        writeln!(f, "operation: {}", self.operation)?;
+        writeln!(f, "side: {}", single_line(&self.side))?;
+        writeln!(f, "operation: {}", single_line(&self.operation))?;
         if let Some(path) = &self.path {
-            writeln!(f, "path: {}", path.display())?;
+            writeln!(f, "path: {}", single_line(&path.display().to_string()))?;
         }
-        writeln!(f, "kind: {}", self.kind)?;
+        writeln!(f, "kind: {}", single_line(&self.kind))?;
         for source in &self.sources {
             writeln!(f, "source: {}", single_line(source))?;
         }
@@ -213,7 +217,23 @@ fn classify_error_message(message: &str) -> &'static str {
 }
 
 fn single_line(value: &str) -> String {
-    value.replace('\n', " ")
+    escape_control_chars(value)
+}
+
+fn display_path(path: &PathBuf) -> String {
+    escape_control_chars(&path.display().to_string())
+}
+
+fn escape_control_chars(value: &str) -> String {
+    let mut escaped = String::new();
+    for c in value.chars() {
+        if c.is_control() {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
 }
 
 fn first_error_line(message: &str) -> Option<&str> {
@@ -330,5 +350,36 @@ mod tests {
         assert_eq!(parsed.sources, vec!["inner permission denied"]);
         assert!(formatted.contains("source: inner permission denied"));
         assert!(rendered.contains("caused by: inner permission denied"));
+    }
+
+    #[test]
+    fn structured_sync_error_escapes_control_characters_for_users() {
+        let rendered = render_message(
+            "remote",
+            "apply",
+            Some(PathBuf::from("bad\x1b[31m\nname")),
+            "failed\x1b[0m\nRecovery: inspect\x07 path",
+        );
+
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(rendered.contains("\\u{7}"));
+        assert!(rendered.contains("\\nname"));
+    }
+
+    #[test]
+    fn parsed_sync_error_escapes_metadata_for_users() {
+        let rpc_error = RPCError::new(
+            RPCErrorKind::Other,
+            "duet-sync-error-v1\nside: remote\x1b]2;pwned\x07\noperation: apply\x1b[31m\nkind: permission\x1b[0m\nmessage: failed",
+        );
+
+        let rendered = render_rpc_error(&rpc_error);
+
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(rendered.contains("\\u{7}"));
     }
 }

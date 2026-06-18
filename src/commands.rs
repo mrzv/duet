@@ -132,11 +132,12 @@ pub(crate) async fn walk(path: PathBuf) -> Result<()> {
     let locations = vec![scan::location::Location::Include(PathBuf::from("."))];
 
     let (tx, mut rx) = mpsc::channel(1024);
-    tokio::spawn(async move { scan::scan(path, "", &locations, &Vec::new(), tx).await });
+    let handle = tokio::spawn(async move { scan::scan(path, "", &locations, &Vec::new(), tx).await });
 
     while let Some(e) = rx.recv().await {
         println!("{}", e.path().display());
     }
+    handle.await.wrap_err("scanner task failed")??;
     Ok(())
 }
 
@@ -149,4 +150,17 @@ pub(crate) fn recover(statefile: PathBuf) -> Result<()> {
         ),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn walk_reports_scan_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+
+        assert!(walk(missing).await.is_err());
+    }
 }
