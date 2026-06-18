@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Result};
 
 use crate::profile::ProfileSource;
 
@@ -56,18 +56,22 @@ pub fn parse_from_env() -> Result<Command> {
 
 fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
     if pargs.contains(["-h", "--help"]) {
+        ensure_no_args(pargs)?;
         return Ok(Command::Help);
     }
 
     if pargs.contains("--version") {
+        ensure_no_args(pargs)?;
         return Ok(Command::Version);
     }
 
     if pargs.contains("--license") {
+        ensure_no_args(pargs)?;
         return Ok(Command::License);
     }
 
     if pargs.contains("--server") {
+        ensure_no_args(pargs)?;
         return Ok(Command::Server);
     }
 
@@ -88,9 +92,11 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
     };
 
     if let Some(profile_file) = profile_file {
+        let path = pargs.opt_free_from_os_str(parse_path)?;
+        ensure_no_args(pargs)?;
         return Ok(Command::Sync {
             profile: ProfileSource::File(profile_file),
-            path: pargs.opt_free_from_os_str(parse_path)?,
+            path,
             options,
         });
     }
@@ -99,33 +105,82 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         Ok(profile) => profile,
         Err(_) => return Ok(Command::Help),
     };
+    if profile.starts_with('-') {
+        return Err(eyre!("unexpected argument: {}", profile));
+    }
 
-    match profile.as_str() {
-        "_snapshot" => Ok(Command::Snapshot {
-            profile: pargs.free_from_str()?,
-            statefile: pargs.opt_free_from_os_str(parse_path)?,
-        }),
-        "_inspect" => Ok(Command::Inspect {
-            statefile: pargs.free_from_os_str(parse_path)?,
-        }),
-        "_changes" => Ok(Command::Changes {
-            profile: pargs.free_from_str()?,
-            statefile: pargs.opt_free_from_os_str(parse_path)?,
-        }),
-        "_info" => Ok(Command::Info {
-            profile: pargs.free_from_str()?,
-        }),
-        "_walk" => Ok(Command::Walk {
-            path: pargs.free_from_os_str(parse_path)?,
-        }),
-        "_recover" => Ok(Command::Recover {
-            statefile: pargs.free_from_os_str(parse_path)?,
-        }),
-        _ => Ok(Command::Sync {
+    let command = match profile.as_str() {
+        "_snapshot" => {
+            reject_sync_options(&options)?;
+            Command::Snapshot {
+                profile: pargs.free_from_str()?,
+                statefile: pargs.opt_free_from_os_str(parse_path)?,
+            }
+        }
+        "_inspect" => {
+            reject_sync_options(&options)?;
+            Command::Inspect {
+                statefile: pargs.free_from_os_str(parse_path)?,
+            }
+        }
+        "_changes" => {
+            reject_sync_options(&options)?;
+            Command::Changes {
+                profile: pargs.free_from_str()?,
+                statefile: pargs.opt_free_from_os_str(parse_path)?,
+            }
+        }
+        "_info" => {
+            reject_sync_options(&options)?;
+            Command::Info {
+                profile: pargs.free_from_str()?,
+            }
+        }
+        "_walk" => {
+            reject_sync_options(&options)?;
+            Command::Walk {
+                path: pargs.free_from_os_str(parse_path)?,
+            }
+        }
+        "_recover" => {
+            reject_sync_options(&options)?;
+            Command::Recover {
+                statefile: pargs.free_from_os_str(parse_path)?,
+            }
+        }
+        _ => Command::Sync {
             profile: ProfileSource::Named(profile),
             path: pargs.opt_free_from_os_str(parse_path)?,
             options,
-        }),
+        },
+    };
+    ensure_no_args(pargs)?;
+    Ok(command)
+}
+
+fn reject_sync_options(options: &SyncOptions) -> Result<()> {
+    if options.interactive
+        || options.yes
+        || options.dry_run
+        || options.batch
+        || options.force
+        || options.verbose
+        || options.debug_info
+        || options.profile_performance
+        || options.profile_performance_json.is_some()
+    {
+        Err(eyre!("sync options are not supported for this command"))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_no_args(pargs: pico_args::Arguments) -> Result<()> {
+    let remaining = pargs.finish();
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(eyre!("unexpected argument: {}", remaining[0].to_string_lossy()))
     }
 }
 
@@ -143,6 +198,14 @@ mod tests {
             args.iter().map(OsString::from).collect(),
         ))
         .unwrap()
+    }
+
+    fn parse_args_error(args: &[&str]) -> String {
+        parse(pico_args::Arguments::from_vec(
+            args.iter().map(OsString::from).collect(),
+        ))
+        .unwrap_err()
+        .to_string()
     }
 
     #[test]
@@ -295,5 +358,16 @@ mod tests {
                 statefile: PathBuf::from("state.bin"),
             }
         );
+    }
+
+    #[test]
+    fn rejects_unknown_flags_and_extra_arguments() {
+        assert!(parse_args_error(&["--dryrun", "work"]).contains("unexpected argument"));
+        assert!(parse_args_error(&["work", "path1", "path2"]).contains("unexpected argument"));
+        assert!(parse_args_error(&["--profile-file", "profile.prf", "path1", "path2"])
+            .contains("unexpected argument"));
+        assert!(parse_args_error(&["--help", "work"]).contains("unexpected argument"));
+        assert!(parse_args_error(&["--dry-run", "_inspect", "state.bin"])
+            .contains("sync options"));
     }
 }

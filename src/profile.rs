@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, prelude::*, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use shellexpand;
 
@@ -43,9 +43,28 @@ fn config_dir() -> Result<PathBuf, io::Error> {
 }
 
 pub fn location(name: &str) -> Result<PathBuf, io::Error> {
+    validate_profile_name(name)?;
     let mut base = config_dir()?;
     base.push(name.to_owned() + ".prf");
     Ok(base)
+}
+
+fn validate_profile_name(name: &str) -> Result<(), io::Error> {
+    if name.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid profile name: {}", name),
+        ));
+    }
+
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) if name != "." && name != ".." => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid profile name: {}", name),
+        )),
+    }
 }
 
 pub fn local_state(name: &str) -> Result<PathBuf, io::Error> {
@@ -125,7 +144,8 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
     let mut locations = 0;
     for line in reader.lines() {
         let line = line?;
-        if line.is_empty() || line.starts_with('#') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
@@ -141,13 +161,13 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
 
         // includes/excludes
         if locations == 2 {
-            if line.trim().starts_with('+') {
+            if let Some(path) = trimmed.strip_prefix('+') {
                 p.locations
-                    .push(Location::Include(PathBuf::from(&line[1..])));
-            } else if line.trim().starts_with('-') {
+                    .push(Location::Include(PathBuf::from(path.trim())));
+            } else if let Some(path) = trimmed.strip_prefix('-') {
                 p.locations
-                    .push(Location::Exclude(PathBuf::from(&line[1..])));
-            } else if line == "[ignore]" {
+                    .push(Location::Exclude(PathBuf::from(path.trim())));
+            } else if trimmed == "[ignore]" {
                 locations += 1;
             } else {
                 return parse_error(&line);
@@ -165,4 +185,44 @@ fn parse_error(line: &str) -> Result<Profile, io::Error> {
         io::ErrorKind::InvalidInput,
         format!("can't parse line: {}", line),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn rejects_profile_names_with_path_components() {
+        assert!(location("work").is_ok());
+        assert!(location("../work").is_err());
+        assert!(location("/tmp/work").is_err());
+        assert!(location("work/other").is_err());
+        assert!(location("work\\other").is_err());
+        assert!(location(".").is_err());
+        assert!(location("..").is_err());
+    }
+
+    #[test]
+    fn parses_include_exclude_markers_after_leading_whitespace() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "/local").unwrap();
+        writeln!(file, "remote /remote").unwrap();
+        writeln!(file, "  +src").unwrap();
+        writeln!(file, "  -target").unwrap();
+        writeln!(file, "  [ignore]").unwrap();
+        writeln!(file, "*.tmp").unwrap();
+
+        let profile = parse_file(file.path()).unwrap();
+
+        assert!(matches!(
+            &profile.locations[1],
+            Location::Include(path) if path == &PathBuf::from("src")
+        ));
+        assert!(matches!(
+            &profile.locations[2],
+            Location::Exclude(path) if path == &PathBuf::from("target")
+        ));
+        assert_eq!(profile.ignore, vec!["*.tmp".to_string()]);
+    }
 }

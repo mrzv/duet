@@ -1,5 +1,5 @@
 use std::io::BufWriter;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bincode::serde::encode_into_std_write as serialize_into;
@@ -1058,6 +1058,7 @@ fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllRes
 }
 
 fn normalize_path(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
+    reject_parent_components(path)?;
     if path.starts_with("./")
         || path.starts_with("../")
         || path == Path::new(".")
@@ -1066,15 +1067,64 @@ fn normalize_path(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
         let cwd = std::env::current_dir()?;
         use path_clean::PathClean;
         let path = cwd.join(path).clean();
-        return Ok(scan::relative(local_base, &path).to_path_buf());
+        return normalize_absolute_restriction(local_base, &path);
     }
 
     let path = PathBuf::from(path);
     if path.is_absolute() {
-        Ok(scan::relative(local_base, &path).to_path_buf())
+        normalize_absolute_restriction(local_base, &path)
     } else {
+        validate_relative_restriction(&path)?;
         Ok(path)
     }
+}
+
+fn reject_parent_components(path: &Path) -> Result<()> {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(eyre!(
+            "restricted path {} must not contain .. components",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_absolute_restriction(local_base: &PathBuf, path: &Path) -> Result<PathBuf> {
+    use path_clean::PathClean;
+    let path = path.clean();
+    let relative = path
+        .strip_prefix(local_base)
+        .map(Path::to_path_buf)
+        .wrap_err_with(|| {
+            format!(
+                "restricted path {} is outside local base {}",
+                path.display(),
+                local_base.display()
+            )
+        })?;
+    validate_relative_restriction(&relative)?;
+    Ok(relative)
+}
+
+fn validate_relative_restriction(path: &Path) -> Result<()> {
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(eyre!(
+                    "restricted path {} must not contain .. components",
+                    path.display()
+                ));
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(eyre!(
+                    "restricted path {} must be relative to the local base",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn local_id(name: &str) -> String {
@@ -1111,6 +1161,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(normalized, PathBuf::from("sub/path"));
+    }
+
+    #[test]
+    fn normalize_path_rejects_absolute_paths_outside_base() {
+        assert!(normalize_path(
+            &PathBuf::from("/tmp/duet-base"),
+            &PathBuf::from("/tmp/other/path"),
+        )
+        .is_err());
+        assert!(normalize_path(
+            &PathBuf::from("/tmp/duet-base"),
+            &PathBuf::from("/tmp/duet-base/../other/path"),
+        )
+        .is_err());
+        assert!(normalize_path(
+            &PathBuf::from("/tmp/duet-base"),
+            &PathBuf::from("/tmp/duet-base/sub/../path"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn normalize_path_rejects_relative_parent_components() {
+        assert!(normalize_path(&PathBuf::from("/tmp/duet-base"), &PathBuf::from("sub/../path"),)
+            .is_err());
+        assert!(normalize_path(&PathBuf::from("/tmp/duet-base"), &PathBuf::from("../path"),)
+            .is_err());
     }
 
     #[test]
