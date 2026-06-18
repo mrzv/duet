@@ -49,7 +49,11 @@ ARGS:
 }
 
 pub(crate) fn version() {
-    println!("duet {}", built_info::PKG_VERSION);
+    println!(
+        "duet {}{}",
+        built_info::PKG_VERSION,
+        option_env!("DUET_VERSION_SUFFIX").unwrap_or("")
+    );
     for (name, version) in built_info::DEPENDENCIES {
         println!("  {} {}", name, version);
     }
