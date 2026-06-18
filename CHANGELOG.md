@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.8.6 - 2026-06-18
+
+### Added
+- Added build-time version suffixes for unreleased commits and dirty working copies while keeping RPC version negotiation on the package version.
+
+### Fixed
+- Preserved append-only RPC method ordering for file-byte chunk streaming so existing essrpc method numbers remain stable.
+- Clamped RPC detail stream size requests to negotiated server limits.
+
 ## 0.8.5 - 2026-06-17
 
 ### Added
