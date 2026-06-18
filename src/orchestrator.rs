@@ -1106,41 +1106,24 @@ fn normalize_path(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
 }
 
 fn normalize_path_from_cwd(local_base: &PathBuf, path: &PathBuf, cwd: &Path) -> Result<PathBuf> {
-    if path.starts_with("./")
+    if path.is_absolute() {
+        return normalize_absolute_restriction(local_base, path);
+    }
+
+    let anchor = if path.starts_with("./")
+        || path.starts_with("../")
         || path == Path::new(".")
         || path == Path::new("..")
     {
-        if path != Path::new("..") && path != Path::new(".") {
-            reject_parent_components(path)?;
-        }
-        use path_clean::PathClean;
-        let path = cwd.join(path).clean();
-        return normalize_absolute_restriction(local_base, &path);
-    }
-
-    reject_parent_components(path)?;
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        normalize_absolute_restriction(local_base, &path)
+        cwd
     } else {
-        validate_relative_restriction(&path)?;
-        Ok(path)
-    }
-}
-
-fn reject_parent_components(path: &Path) -> Result<()> {
-    if path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(eyre!(
-            "restricted path {} must not contain .. components",
-            path.display()
-        ));
-    }
-    Ok(())
+        local_base.as_path()
+    };
+    normalize_absolute_restriction(local_base, &anchor.join(path))
 }
 
 fn normalize_absolute_restriction(local_base: &PathBuf, path: &Path) -> Result<PathBuf> {
-    use path_clean::PathClean;
-    let path = path.clean();
+    let path = resolve_existing_prefix(path)?;
     let relative = match path.strip_prefix(local_base) {
         Ok(relative) => relative.to_path_buf(),
         Err(_) => {
@@ -1160,6 +1143,29 @@ fn normalize_absolute_restriction(local_base: &PathBuf, path: &Path) -> Result<P
     };
     validate_relative_restriction(&relative)?;
     Ok(relative)
+}
+
+fn resolve_existing_prefix(path: &Path) -> Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved = PathBuf::from("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(component) => {
+                resolved.push(component);
+                if resolved.exists() {
+                    resolved = resolved.canonicalize().wrap_err_with(|| {
+                        format!("unable to resolve restricted path {}", path.display())
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn validate_relative_restriction(path: &Path) -> Result<()> {
@@ -1239,48 +1245,92 @@ mod tests {
 
     #[test]
     fn normalize_path_leaves_relative_paths_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
         let normalized =
-            normalize_path(&PathBuf::from("/tmp/duet-base"), &PathBuf::from("sub/path")).unwrap();
+            normalize_path(&base, &PathBuf::from("sub/path")).unwrap();
 
         assert_eq!(normalized, PathBuf::from("sub/path"));
     }
 
     #[test]
     fn normalize_path_makes_absolute_paths_relative_to_base() {
-        let normalized = normalize_path(
-            &PathBuf::from("/tmp/duet-base"),
-            &PathBuf::from("/tmp/duet-base/sub/path"),
-        )
-        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let normalized = normalize_path(&base, &base.join("sub/path")).unwrap();
 
         assert_eq!(normalized, PathBuf::from("sub/path"));
     }
 
     #[test]
     fn normalize_path_rejects_absolute_paths_outside_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
         assert!(normalize_path(
-            &PathBuf::from("/tmp/duet-base"),
-            &PathBuf::from("/tmp/other/path"),
+            &base,
+            &dir.path().join("other/path"),
         )
         .is_err());
         assert!(normalize_path(
-            &PathBuf::from("/tmp/duet-base"),
-            &PathBuf::from("/tmp/duet-base/../other/path"),
-        )
-        .is_err());
-        assert!(normalize_path(
-            &PathBuf::from("/tmp/duet-base"),
-            &PathBuf::from("/tmp/duet-base/sub/../path"),
+            &base,
+            &base.join("../other/path"),
         )
         .is_err());
     }
 
     #[test]
-    fn normalize_path_rejects_relative_parent_components() {
-        assert!(normalize_path(&PathBuf::from("/tmp/duet-base"), &PathBuf::from("sub/../path"),)
-            .is_err());
-        assert!(normalize_path(&PathBuf::from("/tmp/duet-base"), &PathBuf::from("../path"),)
-            .is_err());
+    fn normalize_path_allows_resolved_in_base_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(
+            normalize_path(&base, &base.join("sub/../path"))
+            .unwrap(),
+            PathBuf::from("path")
+        );
+        assert_eq!(
+            normalize_path(&base, &PathBuf::from("sub/../path"),).unwrap(),
+            PathBuf::from("path")
+        );
+    }
+
+    #[test]
+    fn normalize_path_rejects_symlink_resolved_parent_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(outside.join("child")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("link")).unwrap();
+
+        assert!(normalize_path(&base, &PathBuf::from("link/child/../secret")).is_err());
+    }
+
+    #[test]
+    fn normalize_path_resolves_symlink_before_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let outside_child = dir.path().join("outside/child");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&outside_child).unwrap();
+        std::os::unix::fs::symlink(&outside_child, base.join("link")).unwrap();
+
+        assert!(normalize_path(&base, &PathBuf::from("link/../secret")).is_err());
+    }
+
+    #[test]
+    fn normalize_path_resolves_symlink_before_missing_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("link")).unwrap();
+
+        assert!(normalize_path(&base, &PathBuf::from("link/missing/../secret")).is_err());
     }
 
     #[test]
@@ -1296,15 +1346,22 @@ mod tests {
     }
 
     #[test]
-    fn normalize_path_rejects_cwd_relative_parent_components_beyond_exact_parent() {
+    fn normalize_path_checks_resolved_cwd_relative_parent_components() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let subdir = base.join("subdir");
         std::fs::create_dir_all(&subdir).unwrap();
 
-        assert!(normalize_path_from_cwd(&base, &PathBuf::from("./sub/../secret"), &subdir)
-            .is_err());
-        assert!(normalize_path_from_cwd(&base, &PathBuf::from("../secret"), &subdir).is_err());
+        assert_eq!(
+            normalize_path_from_cwd(&base, &PathBuf::from("./nested/../secret"), &subdir)
+                .unwrap(),
+            PathBuf::from("subdir/secret")
+        );
+        assert_eq!(
+            normalize_path_from_cwd(&base, &PathBuf::from("../secret"), &subdir).unwrap(),
+            PathBuf::from("secret")
+        );
+        assert!(normalize_path_from_cwd(&base, &PathBuf::from("../../secret"), &subdir).is_err());
     }
 
     #[test]
