@@ -17,7 +17,7 @@ use crate::profile::{self, ProfileSource};
 use crate::remote;
 use crate::resolution::{self, AllResolution};
 use crate::rpc::{self, DuetServerAsync};
-use crate::scan::{self, Change};
+use crate::scan::Change;
 use crate::state;
 use crate::sync as sync_ops;
 use crate::sync_error;
@@ -1242,6 +1242,7 @@ fn stable_local_id(machine_id: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan;
 
     #[test]
     fn normalize_path_leaves_relative_paths_unchanged() {
