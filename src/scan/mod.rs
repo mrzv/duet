@@ -65,6 +65,20 @@ impl DirEntryWithMeta {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_file_with_size(path: PathBuf, size: u64, checksum: u32) -> Self {
+        Self {
+            path,
+            size,
+            mtime: 0,
+            ino: 0,
+            mode: 0o100644,
+            target: None,
+            is_dir: false,
+            checksum,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_dir(path: PathBuf) -> Self {
         Self {
             path,

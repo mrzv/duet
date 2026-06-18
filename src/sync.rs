@@ -283,6 +283,45 @@ pub fn validate_actions(actions: &[Action]) -> Result<()> {
     Ok(())
 }
 
+fn validate_signature_window(window: usize) -> Result<()> {
+    if window == 0 || window > MAX_SIGNATURE_WINDOW as usize {
+        return Err(eyre!(
+            "invalid signature window {}, expected 1..={}",
+            window,
+            MAX_SIGNATURE_WINDOW
+        ));
+    }
+    Ok(())
+}
+
+fn validate_delta(delta: &Delta) -> Result<()> {
+    validate_signature_window(delta.window)
+        .wrap_err_with(|| format!("invalid diff window {}", delta.window))
+}
+
+fn next_signature<'a, I>(sig_iter: &mut I, path: &Path) -> Result<&'a Signature>
+where
+    I: Iterator<Item = &'a SignatureWithPath>,
+{
+    let signature = sig_iter
+        .next()
+        .ok_or_else(|| eyre!("missing signature for {}", path.display()))?;
+    if signature.0 != path {
+        return Err(eyre!(
+            "signature path mismatch: expected {}, got {}",
+            path.display(),
+            signature.0.display()
+        ));
+    }
+    validate_signature_window(signature.1.window).wrap_err_with(|| {
+        format!(
+            "invalid signature window for {}",
+            signature.0.display()
+        )
+    })?;
+    Ok(&signature.1)
+}
+
 fn validate_change_paths(change: &Change) -> Result<()> {
     match change {
         Change::Added(entry) | Change::Removed(entry) => validate_entry_path(entry),
@@ -1342,12 +1381,7 @@ pub fn get_detailed_changes(
                     Change::Modified(e1, e2) => {
                         if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
                             let f = fs::File::open(safe_join(base, e1.path())?)?;
-                            let sig = &sig_iter
-                                .next()
-                                .ok_or_else(|| {
-                                    eyre!("missing signature for {}", e1.path().display())
-                                })?
-                                .1;
+                            let sig = next_signature(&mut sig_iter, e1.path())?;
                             let block = vec![0; sig.window];
                             let delta = compare(sig, f, block)?;
                             details.push(ChangeDetails::Diff(delta))
@@ -1361,6 +1395,13 @@ pub fn get_detailed_changes(
             _ => {}
         }
     }
+    if let Some(extra) = sig_iter.next() {
+        return Err(eyre!(
+            "unexpected signature for {}",
+            extra.0.display()
+        ));
+    }
+
     Ok(details)
 }
 
@@ -1489,12 +1530,24 @@ impl DetailProducer {
                     }));
                 }
                 SourceDetailKind::Diff(path) => {
-                    let signature = self
+                    let signature_with_path = self
                         .signatures
                         .get(self.signature_index)
-                        .ok_or_else(|| eyre!("missing signature for {}", path.display()))?
-                        .1
-                        .clone();
+                        .ok_or_else(|| eyre!("missing signature for {}", path.display()))?;
+                    if signature_with_path.0 != *path {
+                        return Err(eyre!(
+                            "signature path mismatch: expected {}, got {}",
+                            path.display(),
+                            signature_with_path.0.display()
+                        ));
+                    }
+                    validate_signature_window(signature_with_path.1.window).wrap_err_with(|| {
+                        format!(
+                            "invalid signature window for {}",
+                            signature_with_path.0.display()
+                        )
+                    })?;
+                    let signature = signature_with_path.1.clone();
                     self.signature_index += 1;
 
                     let file_path = safe_join(&self.base, path)?;
@@ -1519,6 +1572,13 @@ impl DetailProducer {
                     }));
                 }
             }
+        }
+
+        if let Some(extra) = self.signatures.get(self.signature_index) {
+            return Err(eyre!(
+                "unexpected signature for {}",
+                extra.0.display()
+            ));
         }
 
         Ok(None)
@@ -1597,6 +1657,7 @@ fn stream_diff_frames(
     max_chunk_bytes: usize,
     sender: mpsc::SyncSender<Result<DetailFrame>>,
 ) -> Result<()> {
+    validate_signature_window(signature.window)?;
     let file = fs::File::open(file_path)?;
     let block = vec![0; signature.window];
     let mut pending_copy: Option<(u64, u64)> = None;
@@ -1667,13 +1728,11 @@ impl TempOutput {
     }
 
     fn finish(mut self) -> Result<()> {
-        let mut file = self
+        self.flush()?;
+        let file = self
             .file
             .take()
             .ok_or_else(|| eyre!("temporary output is closed"))?;
-        file.flush().wrap_err_with(|| {
-            format!("failed to flush temporary file {}", self.temp_path.display())
-        })?;
         drop(file);
         fs::rename(&self.temp_path, &self.final_path).wrap_err_with(|| {
             format!(
@@ -1687,6 +1746,16 @@ impl TempOutput {
 
     fn temp_path(&self) -> &Path {
         &self.temp_path
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| eyre!("temporary output is closed"))?
+            .flush()
+            .wrap_err_with(|| {
+                format!("failed to flush temporary file {}", self.temp_path.display())
+            })
     }
 }
 
@@ -1981,10 +2050,27 @@ impl DetailApplier {
             None => {}
         }
 
+        if frame_index < self.action_index {
+            return Err(eyre!(
+                "detail frame for action {} arrived after action {} was already processed",
+                frame_index,
+                self.action_index.saturating_sub(1)
+            ));
+        }
+
         self.advance_to_action(frame_index)?;
+        let expected_detail = apply_detail_kind(&self.actions[frame_index]);
         match frame.payload {
-            DetailPayload::FileBegin => self.begin_file_detail(frame_index),
-            DetailPayload::DiffBegin => self.begin_diff_detail(frame_index),
+            DetailPayload::FileBegin if expected_detail == Some(ApplyDetailKind::File) => {
+                self.begin_file_detail(frame_index)
+            }
+            DetailPayload::DiffBegin if expected_detail == Some(ApplyDetailKind::Diff) => {
+                self.begin_diff_detail(frame_index)
+            }
+            DetailPayload::FileBegin | DetailPayload::DiffBegin => Err(eyre!(
+                "unexpected detail kind for action {}",
+                frame_index
+            )),
             _ => Err(eyre!(
                 "detail stream for action {} did not begin with a begin frame",
                 frame_index
@@ -2224,6 +2310,12 @@ impl DetailApplier {
     fn begin_diff_detail(&mut self, action_index: usize) -> Result<()> {
         self.prepare_action(action_index);
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
+        let old_entry = match &self.actions[action_index] {
+            Action::Local(Change::Modified(e, _))
+            | Action::ResolvedLocal((_, _), Change::Modified(e, _)) => e,
+            _ => return Err(eyre!("diff detail began for non-diff action")),
+        };
+        verify_file_matches_entry(&filename, old_entry, "diff source")?;
         let source = fs::File::open(&filename)?;
         let output = TempOutput::new(filename)?;
         self.recorder.record_staged_file(output.temp_path())?;
@@ -2240,7 +2332,7 @@ impl DetailApplier {
             .state
             .take()
             .ok_or_else(|| eyre!("no file detail in progress"))?;
-        let (action_index, output) = match state {
+        let (action_index, mut output) = match state {
             ApplyState::File {
                 action_index,
                 output,
@@ -2259,6 +2351,8 @@ impl DetailApplier {
             _ => return Err(eyre!("file detail finished for non-file action")),
         };
         let filename = safe_join(&self.base, entry.path())?;
+        output.flush()?;
+        verify_file_matches_entry(output.temp_path(), entry, "file output")?;
         output.finish()?;
         self.recorder
             .record_committed_step("rename-file", entry.path())?;
@@ -2321,6 +2415,7 @@ impl DetailApplier {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ApplyDetailKind {
     File,
     Diff,
@@ -2374,15 +2469,23 @@ fn copy_from_source(
 ) -> Result<()> {
     source.seek(SeekFrom::Start(offset))?;
     let mut remaining = len;
+    let mut copied = 0u64;
     let mut buf = vec![0; COPY_BUFFER_BYTES];
     while remaining > 0 {
         let want = std::cmp::min(remaining as usize, buf.len());
         let n = source.read(&mut buf[..want])?;
         if n == 0 {
+            if copied == 0 {
+                return Err(eyre!(
+                    "diff copy at offset {} did not read any source bytes",
+                    offset
+                ));
+            }
             break;
         }
         output.write_all(&buf[..n])?;
         remaining -= n as u64;
+        copied += n as u64;
     }
     Ok(())
 }
@@ -2467,7 +2570,7 @@ pub fn apply_detailed_changes(
                         } else {
                             log::debug!("Adding {}", e.path().display());
                             let detail = next_detail(&mut details_iter, e.path())?;
-                            create_file(&filename, detail, attempt_state)?;
+                            create_file(&filename, detail, e, attempt_state)?;
                             new_entries.push(update_meta(&filename, e)?);
                             record_committed_step(attempt_state, "update-metadata", e.path())?;
                         }
@@ -2479,9 +2582,13 @@ pub fn apply_detailed_changes(
                                 if !e1.same_contents(&e2) {
                                     let detail = next_detail(&mut details_iter, e2.path())?;
                                     match detail {
-                                        ChangeDetails::Diff(delta) => {
-                                            update_file_with_diff(&filename, delta, attempt_state)?;
-                                        }
+                                        ChangeDetails::Diff(delta) => update_file_with_diff(
+                                            &filename,
+                                            e1,
+                                            e2,
+                                            delta,
+                                            attempt_state,
+                                        )?,
                                         _ => {
                                             return Err(eyre!(
                                             "mismatch when adding {}, expected Diff, but not found",
@@ -2542,7 +2649,7 @@ pub fn apply_detailed_changes(
                             record_committed_step(attempt_state, "remove-symlink", e1.path())?;
                             if e2.is_file() {
                                 let detail = next_detail(&mut details_iter, e2.path())?;
-                                create_file(&filename, detail, attempt_state)?;
+                                create_file(&filename, detail, e2, attempt_state)?;
                                 new_entries.push(update_meta(&filename, e2)?);
                                 record_committed_step(
                                     attempt_state,
@@ -2616,6 +2723,10 @@ pub fn apply_detailed_changes(
         }
     }
 
+    if details_iter.next().is_some() {
+        return Err(eyre!("unexpected extra file detail"));
+    }
+
     // TODO: think how directory removal interacts with "ignore", if we ever implement it
 
     // second pass, in reverse order, to remove directories and update their metadata
@@ -2663,7 +2774,7 @@ pub fn apply_detailed_changes(
                                 let detail = details_iter.next().ok_or_else(|| {
                                     eyre!("missing detail for {}", e2.path().display())
                                 })?;
-                                create_file(&dirname, detail, attempt_state)?;
+                                create_file(&dirname, detail, e2, attempt_state)?;
                             }
                         }
                         new_entries.push(update_meta(&dirname, e2)?);
@@ -2690,10 +2801,11 @@ pub fn apply_detailed_changes(
 fn create_file(
     filename: &Path,
     detail: &ChangeDetails,
+    entry: &Entry,
     attempt_state: Option<&Path>,
 ) -> Result<()> {
     match detail {
-        ChangeDetails::Contents(v) => create_file_with_contents(filename, v, attempt_state),
+        ChangeDetails::Contents(v) => create_file_with_contents(filename, v, entry, attempt_state),
         _ => Err(eyre!(
             "mismatch when adding {}, expected Contents, but not found",
             filename.display()
@@ -2704,8 +2816,28 @@ fn create_file(
 fn create_file_with_contents(
     filename: &Path,
     data: &[u8],
+    entry: &Entry,
     attempt_state: Option<&Path>,
 ) -> Result<()> {
+    if data.len() as u64 != entry.size() {
+        return Err(eyre!(
+            "file detail for {} size mismatch: expected {}, got {}",
+            entry.path().display(),
+            entry.size(),
+            data.len()
+        ));
+    }
+    let checksum = adler32::adler32(data)
+        .wrap_err_with(|| format!("failed to checksum detail for {}", entry.path().display()))?;
+    if checksum != entry.checksum() {
+        return Err(eyre!(
+            "file detail for {} checksum mismatch: expected {}, got {}",
+            entry.path().display(),
+            entry.checksum(),
+            checksum
+        ));
+    }
+
     ensure_parent_directory(filename)?;
     let mut output = TempOutput::new(filename.to_path_buf())?;
     record_staged_file(attempt_state, output.temp_path())?;
@@ -2715,15 +2847,59 @@ fn create_file_with_contents(
         .ok_or_else(|| eyre!("temporary output is closed"))?
         .write_all(data)
         .wrap_err_with(|| format!("failed to write temporary file for {}", filename.display()))?;
+    output.flush()?;
+    verify_file_matches_entry(output.temp_path(), entry, "file output")?;
     output.finish()?;
-    record_committed_step(attempt_state, "rename-file", filename)
+    record_committed_step(attempt_state, "rename-file", filename)?;
+    Ok(())
+}
+
+fn verify_file_matches_entry(filename: &Path, entry: &Entry, description: &str) -> Result<()> {
+    let meta = fs::symlink_metadata(filename)
+        .wrap_err_with(|| format!("failed to read metadata for {}", filename.display()))?;
+    if !meta.is_file() {
+        return Err(eyre!(
+            "{} {} is not a regular file",
+            description,
+            entry.path().display()
+        ));
+    }
+    if meta.size() != entry.size() {
+        return Err(eyre!(
+            "{} {} size mismatch: expected {}, got {}",
+            description,
+            entry.path().display(),
+            entry.size(),
+            meta.size()
+        ));
+    }
+
+    let contents = fs::read(filename)
+        .wrap_err_with(|| format!("failed to read file {}", filename.display()))?;
+    let checksum = adler32::adler32(&contents[..])
+        .wrap_err_with(|| format!("failed to checksum {}", filename.display()))?;
+    if checksum != entry.checksum() {
+        return Err(eyre!(
+            "{} {} checksum mismatch: expected {}, got {}",
+            description,
+            entry.path().display(),
+            entry.checksum(),
+            checksum
+        ));
+    }
+
+    Ok(())
 }
 
 fn update_file_with_diff(
     filename: &Path,
+    old_entry: &Entry,
+    new_entry: &Entry,
     delta: &Delta,
     attempt_state: Option<&Path>,
 ) -> Result<()> {
+    validate_delta(delta)?;
+    verify_file_matches_entry(filename, old_entry, "diff source")?;
     let source = fs::File::open(filename)
         .wrap_err_with(|| format!("failed to open file {}", filename.display()))?;
     let mut output = TempOutput::new(filename.to_path_buf())?;
@@ -2734,8 +2910,11 @@ fn update_file_with_diff(
         .ok_or_else(|| eyre!("temporary output is closed"))?;
     restore_seek(output_file, source, vec![0; delta.window], delta)
         .wrap_err_with(|| format!("failed to restore diff for {}", filename.display()))?;
+    output.flush()?;
+    verify_file_matches_entry(output.temp_path(), new_entry, "diff output")?;
     output.finish()?;
-    record_committed_step(attempt_state, "rename-file", filename)
+    record_committed_step(attempt_state, "rename-file", filename)?;
+    Ok(())
 }
 
 fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
@@ -2765,7 +2944,16 @@ fn synced_mode(mode: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rustsync::Block;
     use rand::{RngCore, SeedableRng};
+
+    fn test_file_entry(path: &str, contents: &[u8]) -> Entry {
+        Entry::test_file_with_size(
+            PathBuf::from(path),
+            contents.len() as u64,
+            adler32::adler32(contents).unwrap(),
+        )
+    }
 
     #[test]
     fn stream_diff_frames_coalesces_adjacent_copy_ops() {
@@ -2794,6 +2982,151 @@ mod tests {
                 if len >= contents.len() as u64 && len <= (contents.len() + WINDOW) as u64
         ));
         assert!(matches!(frames[1].payload, DetailPayload::DiffEnd));
+    }
+
+    #[test]
+    fn get_detailed_changes_rejects_signature_path_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("file.txt"), b"new contents").unwrap();
+        let old = test_file_entry("file.txt", b"old");
+        let new = test_file_entry("file.txt", b"new contents");
+        let actions = vec![Action::Remote(Change::Modified(old, new))];
+        let sig = signature(&b"old"[..], [0; 4]).unwrap();
+        let signatures = vec![SignatureWithPath(PathBuf::from("other.txt"), sig)];
+
+        let error = get_detailed_changes(&base, &actions, &signatures)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("signature path mismatch"), "{}", error);
+    }
+
+    #[test]
+    fn apply_rejects_invalid_delta_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("file.txt"), b"old").unwrap();
+        let old = test_file_entry("file.txt", b"old");
+        let new = test_file_entry("file.txt", b"new!");
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let details = vec![ChangeDetails::Diff(Delta {
+            blocks: Vec::new(),
+            window: 0,
+        })];
+        let mut all_old = vec![old];
+
+        let error = apply_detailed_changes(&base, &actions, &details, &mut all_old, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid diff window"), "{}", error);
+    }
+
+    #[test]
+    fn apply_verifies_diff_source_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("file.txt"), b"bad").unwrap();
+        let old = test_file_entry("file.txt", b"old");
+        let new = test_file_entry("file.txt", b"new!");
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let details = vec![ChangeDetails::Diff(Delta {
+            blocks: vec![Block::Literal(b"new!".to_vec())],
+            window: 1,
+        })];
+        let mut all_old = vec![old];
+
+        let error = apply_detailed_changes(&base, &actions, &details, &mut all_old, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("diff source"), "{}", error);
+        assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"bad");
+    }
+
+    #[test]
+    fn apply_verifies_diff_output_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("file.txt"), b"old").unwrap();
+        let old = test_file_entry("file.txt", b"old");
+        let new = test_file_entry("file.txt", b"new!");
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let details = vec![ChangeDetails::Diff(Delta {
+            blocks: vec![Block::Literal(b"bad!".to_vec())],
+            window: 1,
+        })];
+        let mut all_old = vec![old];
+
+        let error = apply_detailed_changes(&base, &actions, &details, &mut all_old, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("diff output"), "{}", error);
+        assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn detail_applier_rejects_backward_action_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let first = test_file_entry("a.txt", b"a");
+        let second = test_file_entry("b.txt", b"b");
+        let actions = vec![
+            Action::Local(Change::Added(first)),
+            Action::Local(Change::Added(second)),
+        ];
+        let mut applier = DetailApplier::new_with_attempt(base, actions, Vec::new(), None);
+
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBytes(b"a".to_vec()),
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileEnd,
+            })
+            .unwrap();
+        let error = applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("already processed"), "{}", error);
+    }
+
+    #[test]
+    fn detail_applier_rejects_file_frames_for_diff_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("a.txt"), b"old").unwrap();
+        let old = test_file_entry("a.txt", b"old");
+        let new = test_file_entry("a.txt", b"new!");
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let mut applier = DetailApplier::new_with_attempt(base, actions, vec![old], None);
+
+        let error = applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unexpected detail kind"), "{}", error);
     }
 
     #[test]
@@ -2942,17 +3275,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().to_path_buf();
         let path = PathBuf::from(".git/refs/remotes/origin/main");
-        let actions = vec![Action::Local(Change::Added(Entry::test_file(
+        let contents = b"commit-id\n".to_vec();
+        let checksum = adler32::adler32(&contents[..]).unwrap();
+        let actions = vec![Action::Local(Change::Added(Entry::test_file_with_size(
             path.clone(),
-            0,
+            contents.len() as u64,
+            checksum,
         )))];
-        let details = vec![ChangeDetails::Contents(b"commit-id\n".to_vec())];
+        let details = vec![ChangeDetails::Contents(contents.clone())];
         let mut all_old = Vec::new();
 
         preflight_apply(&base, &actions).unwrap();
         apply_detailed_changes(&base, &actions, &details, &mut all_old, None).unwrap();
 
-        assert_eq!(fs::read(base.join(path)).unwrap(), b"commit-id\n");
+        assert_eq!(fs::read(base.join(path)).unwrap(), contents);
     }
 
     #[test]
