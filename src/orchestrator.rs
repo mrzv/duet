@@ -1101,18 +1101,24 @@ fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllRes
 }
 
 fn normalize_path(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
-    reject_parent_components(path)?;
+    let cwd = std::env::current_dir()?;
+    normalize_path_from_cwd(local_base, path, &cwd)
+}
+
+fn normalize_path_from_cwd(local_base: &PathBuf, path: &PathBuf, cwd: &Path) -> Result<PathBuf> {
     if path.starts_with("./")
-        || path.starts_with("../")
         || path == Path::new(".")
         || path == Path::new("..")
     {
-        let cwd = std::env::current_dir()?;
+        if path != Path::new("..") && path != Path::new(".") {
+            reject_parent_components(path)?;
+        }
         use path_clean::PathClean;
         let path = cwd.join(path).clean();
         return normalize_absolute_restriction(local_base, &path);
     }
 
+    reject_parent_components(path)?;
     let path = PathBuf::from(path);
     if path.is_absolute() {
         normalize_absolute_restriction(local_base, &path)
@@ -1135,16 +1141,23 @@ fn reject_parent_components(path: &Path) -> Result<()> {
 fn normalize_absolute_restriction(local_base: &PathBuf, path: &Path) -> Result<PathBuf> {
     use path_clean::PathClean;
     let path = path.clean();
-    let relative = path
-        .strip_prefix(local_base)
-        .map(Path::to_path_buf)
-        .wrap_err_with(|| {
-            format!(
-                "restricted path {} is outside local base {}",
-                path.display(),
-                local_base.display()
-            )
-        })?;
+    let relative = match path.strip_prefix(local_base) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => {
+            let canonical_base = local_base.canonicalize().wrap_err_with(|| {
+                format!("unable to resolve local base {}", local_base.display())
+            })?;
+            path.strip_prefix(&canonical_base)
+                .map(Path::to_path_buf)
+                .wrap_err_with(|| {
+                    format!(
+                        "restricted path {} is outside local base {}",
+                        path.display(),
+                        local_base.display()
+                    )
+                })?
+        }
+    };
     validate_relative_restriction(&relative)?;
     Ok(relative)
 }
@@ -1268,6 +1281,30 @@ mod tests {
             .is_err());
         assert!(normalize_path(&PathBuf::from("/tmp/duet-base"), &PathBuf::from("../path"),)
             .is_err());
+    }
+
+    #[test]
+    fn normalize_path_allows_cwd_relative_parent_within_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let subdir = base.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let normalized = normalize_path_from_cwd(&base, &PathBuf::from(".."), &subdir).unwrap();
+
+        assert_eq!(normalized, PathBuf::new());
+    }
+
+    #[test]
+    fn normalize_path_rejects_cwd_relative_parent_components_beyond_exact_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let subdir = base.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        assert!(normalize_path_from_cwd(&base, &PathBuf::from("./sub/../secret"), &subdir)
+            .is_err());
+        assert!(normalize_path_from_cwd(&base, &PathBuf::from("../secret"), &subdir).is_err());
     }
 
     #[test]
