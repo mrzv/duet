@@ -294,13 +294,37 @@ async fn scan_dir(
             .wrap_err_with(|| format!("unable to read metadata for {}", path.display()))?;
 
         let file_type = meta.file_type();
+        let location = find_parent(&path, &locations, &pft);
+        let child_pft = narrow_parent_from_to(pft.clone(), &path, &locations);
+        let has_descendant_includes = child_pft.from <= child_pft.to
+            && (child_pft.from..=child_pft.to)
+                .any(|i| locations[i].is_include() && locations[i].path() != &path);
+
+        if location.is_exclude() && !has_descendant_includes {
+            log::trace!("Not reporting (excluded): {:?}", path);
+            continue;
+        }
+
         if file_type.is_block_device()
             || file_type.is_char_device()
             || file_type.is_fifo()
             || file_type.is_socket()
         {
-            log::trace!("Skipping (special): {:?}", path);
+            if path.starts_with(&*restrict) {
+                return Err(eyre!(
+                    "unsupported special file in sync tree: {}",
+                    path.display()
+                ));
+            }
+            log::trace!("Skipping special file outside restriction: {:?}", path);
             continue;
+        }
+
+        if meta.is_dir() && dev != meta.dev() && path.starts_with(&*restrict) {
+            return Err(eyre!(
+                "refusing to cross filesystem boundary at {}",
+                path.display()
+            ));
         }
 
         if meta.is_dir() && dev == meta.dev() {
@@ -308,7 +332,7 @@ async fn scan_dir(
             child_dirs.push(path);
         }
 
-        if find_parent(&path, &locations, &pft).is_exclude() {
+        if location.is_exclude() {
             log::trace!("Not reporting (excluded): {:?}", path);
             continue;
         }
@@ -353,6 +377,147 @@ async fn scan_dir(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[tokio::test]
+    async fn scan_rejects_included_special_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("socket");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let err = scan(
+            temp.path(),
+            "",
+            &vec![Location::Include(PathBuf::new())],
+            &Vec::new(),
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unsupported special file"));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_ignores_excluded_special_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("socket");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        scan(
+            temp.path(),
+            "",
+            &vec![
+                Location::Include(PathBuf::new()),
+                Location::Exclude(PathBuf::from("socket")),
+            ],
+            &Vec::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_ignores_excluded_special_files_with_descendant_excludes() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("socket");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        scan(
+            temp.path(),
+            "",
+            &vec![
+                Location::Include(PathBuf::new()),
+                Location::Exclude(PathBuf::from("socket")),
+                Location::Exclude(PathBuf::from("socket/child")),
+            ],
+            &Vec::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn restricted_scan_ignores_special_file_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("socket");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        tokio::fs::create_dir_all(temp.path().join("wanted"))
+            .await
+            .unwrap();
+        tokio::fs::write(temp.path().join("wanted/file.txt"), b"data")
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        scan(
+            temp.path(),
+            "wanted",
+            &vec![Location::Include(PathBuf::new())],
+            &Vec::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+        let mut paths = Vec::new();
+        while let Some(entry) = rx.recv().await {
+            paths.push(entry.path().clone());
+        }
+
+        assert!(paths.contains(&PathBuf::from("wanted")));
+        assert!(paths.contains(&PathBuf::from("wanted/file.txt")));
+        assert!(!paths.contains(&PathBuf::from("socket")));
+    }
+
+    #[tokio::test]
+    async fn scan_still_descends_into_excluded_dir_for_included_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested_dir = temp.path().join("dir").join("nested");
+        tokio::fs::create_dir_all(&nested_dir).await.unwrap();
+        tokio::fs::write(nested_dir.join("file.txt"), b"data")
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        scan(
+            temp.path(),
+            "",
+            &vec![
+                Location::Include(PathBuf::new()),
+                Location::Exclude(PathBuf::from("dir")),
+                Location::Include(PathBuf::from("dir/nested")),
+            ],
+            &Vec::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+        let mut paths = Vec::new();
+        while let Some(entry) = rx.recv().await {
+            paths.push(entry.path().clone());
+        }
+
+        assert!(paths.contains(&PathBuf::from("dir/nested")));
+        assert!(paths.contains(&PathBuf::from("dir/nested/file.txt")));
+        assert!(!paths.contains(&PathBuf::from("dir")));
+    }
 }
 
 async fn scan_children(

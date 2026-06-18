@@ -81,7 +81,7 @@ extern crate serde;
 //extern crate serde_derive;
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 
 const BLAKE2_SIZE: usize = 32;
 
@@ -220,7 +220,22 @@ where
 {
     let mut st = State::new();
     let block = block.as_mut();
-    assert_eq!(block.len(), sig.window);
+    if sig.window == 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "signature window must be non-zero",
+        ));
+    }
+    if block.len() != sig.window {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "signature window {} does not match buffer length {}",
+                sig.window,
+                block.len()
+            ),
+        ));
+    }
     let max_literal_bytes = max_literal_bytes.max(1);
 
     while st.block_len > 0 {
@@ -228,7 +243,7 @@ where
             let mut j = 0;
             let block = {
                 while j < sig.window {
-                    let r = r.read(&mut block[..])?;
+                    let r = r.read(&mut block[j..sig.window])?;
                     if r == 0 {
                         break;
                     }
@@ -350,6 +365,22 @@ pub fn restore_seek<W: Write, R: Read + Seek, B: AsRef<[u8]> + AsMut<[u8]>>(
     delta: &Delta,
 ) -> Result<(), std::io::Error> {
     let buf = buf.as_mut();
+    if delta.window == 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "delta window must be non-zero",
+        ));
+    }
+    if buf.len() < delta.window {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "delta window {} exceeds buffer length {}",
+                delta.window,
+                buf.len()
+            ),
+        ));
+    }
 
     for d in delta.blocks.iter() {
         match *d {
@@ -362,16 +393,16 @@ pub fn restore_seek<W: Write, R: Read + Seek, B: AsRef<[u8]> + AsMut<[u8]>>(
                     if r == 0 {
                         break;
                     }
-                    n += r
+                    n += r;
+                    if n == delta.window {
+                        break;
+                    }
                 }
                 // write the buffer to w.
-                let mut m = 0;
-                while m < n {
-                    m += w.write(&buf[m..n])?;
-                }
+                w.write_all(&buf[..n])?;
             }
             Block::Literal(ref l) => {
-                w.write(l)?;
+                w.write_all(l)?;
             }
         }
     }
@@ -382,7 +413,21 @@ pub fn restore_seek<W: Write, R: Read + Seek, B: AsRef<[u8]> + AsMut<[u8]>>(
 mod tests {
     use super::*;
     use rand::distributions::{Alphanumeric, DistString};
+    use std::cmp;
     const WINDOW: usize = 32;
+
+    struct ShortReader<R> {
+        inner: R,
+        max_read: usize,
+    }
+
+    impl<R: Read> Read for ShortReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+            let len = cmp::min(buf.len(), self.max_read);
+            self.inner.read(&mut buf[..len])
+        }
+    }
+
     #[test]
     fn basic() {
         for index in 0..10 {
@@ -412,5 +457,58 @@ mod tests {
                 panic!("different");
             }
         }
+    }
+
+    #[test]
+    fn compare_stream_handles_short_reads() {
+        let source = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let modified = b"abcdefghijklmnopqrstuvwxyz9876543210";
+        let sig = signature(&source[..], [0; 8]).unwrap();
+        let reader = ShortReader {
+            inner: &modified[..],
+            max_read: 3,
+        };
+
+        let delta = compare(&sig, reader, [0; 8]).unwrap();
+        let mut restored = Vec::new();
+        restore_seek(&mut restored, std::io::Cursor::new(source), [0; 8], &delta).unwrap();
+
+        assert_eq!(&restored, modified);
+    }
+
+    #[test]
+    fn compare_stream_rejects_invalid_buffers() {
+        let sig = Signature {
+            window: 8,
+            chunks: HashMap::new(),
+        };
+        let err = compare_stream(&sig, &b"data"[..], [0; 4], usize::MAX, |_| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        let sig = Signature {
+            window: 0,
+            chunks: HashMap::new(),
+        };
+        let err = compare_stream(&sig, &b"data"[..], [], usize::MAX, |_| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn restore_seek_rejects_invalid_buffers() {
+        let delta = Delta {
+            blocks: Vec::new(),
+            window: 8,
+        };
+        let err =
+            restore_seek(Vec::new(), std::io::Cursor::new(Vec::new()), [0; 4], &delta).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        let delta = Delta {
+            blocks: Vec::new(),
+            window: 0,
+        };
+        let err =
+            restore_seek(Vec::new(), std::io::Cursor::new(Vec::new()), [], &delta).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }
