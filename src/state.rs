@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::profile;
 use crate::scan::location::Locations;
 use crate::scan::{self, Change, DirEntryWithMeta};
+use crate::sync;
 
 pub type Entries = Vec<DirEntryWithMeta>;
 pub type Changes = Vec<Change>;
@@ -30,6 +31,7 @@ pub fn load_entries(statefile: &PathBuf) -> Result<Entries> {
         Vec::new()
     };
 
+    sync::validate_entries("state file", &entries)?;
     Ok(entries)
 }
 
@@ -126,6 +128,7 @@ pub async fn old_and_changes(
             Vec::new()
         };
         log::debug!("Done reading out entries");
+        sync::validate_entries("state file", &all_old_entries)?;
         Ok::<Entries, color_eyre::eyre::Report>(all_old_entries)
     };
 

@@ -83,6 +83,24 @@ pub fn remote_state_in(dir: &Path, id: &str) -> PathBuf {
     dir.join(id)
 }
 
+pub fn validate_remote_state_id(id: &str) -> Result<(), io::Error> {
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.contains('/')
+        || id.contains('\\')
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid remote state id: {}", id),
+        ));
+    }
+    Ok(())
+}
+
 pub fn load(source: &ProfileSource) -> Result<ProfileConfig, io::Error> {
     match source {
         ProfileSource::Named(name) => Ok(ProfileConfig {

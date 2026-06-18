@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use bincode::serde::encode_into_std_write as serialize_into;
-use color_eyre::eyre::{eyre, Report, Result};
+use color_eyre::eyre::{eyre, Report, Result, WrapErr};
 use essrpc::essrpc;
 use essrpc::transports::{BincodeTransport, ReadWrite};
 use essrpc::{RPCError, RPCErrorKind, RPCServer};
@@ -190,6 +190,18 @@ fn clamp_rpc_limit(requested: u32, max: usize) -> usize {
     requested.clamp(1, max.min(u32::MAX as usize) as u32) as usize
 }
 
+fn validate_locations(locations: &Locations) -> Result<(), Report> {
+    for location in locations {
+        sync::validate_scan_path(location.path()).wrap_err_with(|| {
+            format!(
+                "invalid scan location path {}",
+                location.path().display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 impl DuetServer for DuetServerImpl {
     fn set_base(&mut self, base: String) -> Result<(), RPCError> {
         self.base = match crate::full(&base) {
@@ -202,6 +214,8 @@ impl DuetServer for DuetServerImpl {
 
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError> {
         log::debug!("Setting {} actions", actions.len());
+        sync::validate_actions(&actions)
+            .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
         self.actions = actions;
         self.stream_performance = RemoteStreamProfile::default();
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
@@ -220,6 +234,12 @@ impl DuetServer for DuetServerImpl {
         remote_id: String,
     ) -> Result<Changes, RPCError> {
         log::debug!("remote id = {}", remote_id);
+        sync::validate_scan_path(&path)
+            .map_err(|e| rpc_report_error("validate scan path", Some(&path), e))?;
+        validate_locations(&locations)
+            .map_err(|e| rpc_report_error("validate scan locations", Some(&path), e))?;
+        profile::validate_remote_state_id(&remote_id)
+            .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
         self.remote_id = remote_id;
         self.apply_attempt_id = None;
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
@@ -323,6 +343,10 @@ impl DuetServer for DuetServerImpl {
 
     fn save_state(&self) -> Result<(), RPCError> {
         log::debug!("Saving state");
+        profile::validate_remote_state_id(&self.remote_id)
+            .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
+        sync::validate_entries("remote state", &self.all_old)
+            .map_err(|e| rpc_report_error("validate remote state", Some(&self.base), e))?;
         std::fs::create_dir_all(&self.remote_state_dir).map_err(|e| {
             rpc_error(
                 "create remote state directory",
@@ -381,6 +405,8 @@ impl DuetServer for DuetServerImpl {
     ) -> Result<DetailStreamId, RPCError> {
         let id = self.next_detail_stream_id();
         let max_chunk_bytes = clamp_rpc_limit(max_chunk_bytes, self.tuning.detail_chunk_bytes());
+        sync::validate_actions(&self.actions)
+            .map_err(|e| rpc_report_error("validate detail stream actions", Some(&self.base), e))?;
         let producer = sync::DetailProducer::new(
             self.base.clone(),
             self.actions.clone(),

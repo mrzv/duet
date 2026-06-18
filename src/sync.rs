@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::thread;
@@ -202,18 +202,120 @@ impl SyncTuning {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureWithPath(PathBuf, Signature);
 
+pub fn validate_relative_path(path: &Path) -> Result<()> {
+    validate_relative_path_components(path)?;
+
+    if !path.components().any(|component| matches!(component, Component::Normal(_))) {
+        return Err(eyre!(
+            "path {} must name an entry below the sync base",
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn validate_scan_path(path: &Path) -> Result<()> {
+    validate_relative_path_components(path)
+}
+
+fn validate_relative_path_components(path: &Path) -> Result<()> {
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(eyre!(
+                    "path {} must not contain .. components",
+                    path.display()
+                ));
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(eyre!(
+                    "path {} must be relative to the sync base",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn safe_join(base: &Path, path: &Path) -> Result<PathBuf> {
+    validate_relative_path(path)?;
+    Ok(base.join(path))
+}
+
+pub fn validate_entries(description: &str, entries: &[Entry]) -> Result<()> {
+    for entry in entries {
+        validate_relative_path(entry.path()).wrap_err_with(|| {
+            format!(
+                "invalid {} entry path {}",
+                description,
+                entry.path().display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+pub fn validate_actions(actions: &[Action]) -> Result<()> {
+    for action in actions {
+        match action {
+            Action::Local(change) | Action::Remote(change) => validate_change_paths(change)?,
+            Action::Conflict(left, right) => {
+                validate_change_paths(left)?;
+                validate_change_paths(right)?;
+            }
+            Action::ResolvedLocal((left, right), change)
+            | Action::ResolvedRemote((left, right), change) => {
+                validate_change_paths(left)?;
+                validate_change_paths(right)?;
+                validate_change_paths(change)?;
+            }
+            Action::Identical(left, right) => {
+                validate_change_paths(left)?;
+                validate_change_paths(right)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_change_paths(change: &Change) -> Result<()> {
+    match change {
+        Change::Added(entry) | Change::Removed(entry) => validate_entry_path(entry),
+        Change::Modified(old, new) => {
+            validate_entry_path(old)?;
+            validate_entry_path(new)?;
+            Ok(())
+        }
+    }
+}
+
+fn validate_entry_path(entry: &Entry) -> Result<()> {
+    validate_relative_path(entry.path()).wrap_err_with(|| {
+        format!(
+            "invalid action entry path {}",
+            entry.path().display()
+        )
+    })
+}
+
 pub fn get_signatures_with_config(
     base: &PathBuf,
     actions: &Vec<Action>,
     window_config: SignatureWindowConfig,
 ) -> Result<Vec<SignatureWithPath>> {
+    validate_actions(actions)?;
     let mut signatures: Vec<SignatureWithPath> = Vec::new();
     for action in actions {
         match action {
             Action::Local(Change::Modified(e1, e2))
             | Action::ResolvedLocal((_, _), Change::Modified(e1, e2)) => {
                 if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
-                    let f = fs::File::open(base.join(e1.path()))?;
+                    let f = fs::File::open(safe_join(base, e1.path())?)?;
                     let block = vec![0; window_config.window_for_size(e1.size())];
                     let sig = signature(f, block)?;
                     signatures.push(SignatureWithPath(e1.path().clone(), sig));
@@ -333,13 +435,14 @@ pub fn can_stream_details(actions: &[Action]) -> bool {
 }
 
 pub fn preflight_apply(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
+    validate_actions(actions)?;
     preflight_source_reads(base, actions)?;
     preflight_removed_directories(base, actions)?;
 
     let readonly_metadata_changes = readonly_directory_metadata_changes(actions);
     let planned_directories = planned_destination_directories(actions);
     for target in apply_metadata_targets(actions) {
-        let target_path = base.join(&target);
+        let target_path = safe_join(base, &target)?;
         fs::symlink_metadata(&target_path).wrap_err_with(|| {
             format!(
                 "unable to preflight destination metadata for {}",
@@ -353,7 +456,11 @@ pub fn preflight_apply(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
         let Some(parent) = target.parent() else {
             continue;
         };
-        let parent_path = base.join(parent);
+        let parent_path = if parent.as_os_str().is_empty() {
+            base.clone()
+        } else {
+            safe_join(base, parent)?
+        };
         if !parent_path.try_exists().wrap_err_with(|| {
             format!(
                 "unable to preflight destination parent {}",
@@ -1096,7 +1203,7 @@ fn apply_parent_mutations(actions: &Vec<Action>) -> Vec<ParentMutation> {
 fn preflight_removed_directories(base: &Path, actions: &Vec<Action>) -> Result<()> {
     let removed_paths = removed_destination_paths(actions);
     for path in removed_paths.iter() {
-        let dirname = base.join(path);
+        let dirname = safe_join(base, path)?;
         if dirname.is_dir() {
             preflight_removed_directory_contents(base, &dirname, &removed_paths)?;
         }
@@ -1200,7 +1307,7 @@ fn preflight_source_reads(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
 }
 
 fn preflight_read_file(base: &Path, path: &Path, description: &str) -> Result<()> {
-    let filename = base.join(path);
+    let filename = safe_join(base, path)?;
     fs::File::open(&filename).wrap_err_with(|| {
         format!(
             "unable to preflight {} read for {}",
@@ -1216,6 +1323,7 @@ pub fn get_detailed_changes(
     actions: &Vec<Action>,
     signatures: &Vec<SignatureWithPath>,
 ) -> Result<Vec<ChangeDetails>> {
+    validate_actions(actions)?;
     let mut sig_iter = signatures.iter();
     let mut details: Vec<ChangeDetails> = Vec::new();
 
@@ -1227,13 +1335,13 @@ pub fn get_detailed_changes(
                     Change::Added(e) => {
                         if e.is_file() {
                             log::debug!("Getting detail for adding {}", e.path().display());
-                            let v = fs::read(base.join(e.path()))?;
+                            let v = fs::read(safe_join(base, e.path())?)?;
                             details.push(ChangeDetails::Contents(v));
                         }
                     }
                     Change::Modified(e1, e2) => {
                         if e1.is_file() && e2.is_file() && !e1.same_contents(&e2) {
-                            let f = fs::File::open(base.join(e1.path()))?;
+                            let f = fs::File::open(safe_join(base, e1.path())?)?;
                             let sig = &sig_iter
                                 .next()
                                 .ok_or_else(|| {
@@ -1244,7 +1352,7 @@ pub fn get_detailed_changes(
                             let delta = compare(sig, f, block)?;
                             details.push(ChangeDetails::Diff(delta))
                         } else if !e1.is_file() && e2.is_file() {
-                            let v = fs::read(base.join(e2.path()))?;
+                            let v = fs::read(safe_join(base, e2.path())?)?;
                             details.push(ChangeDetails::Contents(v));
                         } // else: permissions or target change
                     }
@@ -1368,7 +1476,7 @@ impl DetailProducer {
 
             match kind {
                 SourceDetailKind::File(path) => {
-                    let file = fs::File::open(self.base.join(path))?;
+                    let file = fs::File::open(safe_join(&self.base, path)?)?;
                     let remaining = file.metadata()?.len();
                     self.state = Some(ProducerState::File {
                         action_index,
@@ -1389,7 +1497,7 @@ impl DetailProducer {
                         .clone();
                     self.signature_index += 1;
 
-                    let file_path = self.base.join(path);
+                    let file_path = safe_join(&self.base, path)?;
                     let max_chunk_bytes = self.max_chunk_bytes;
                     let (sender, receiver) = mpsc::sync_channel(4);
                     let handle = thread::spawn(move || {
@@ -1545,19 +1653,11 @@ struct TempOutput {
 
 impl TempOutput {
     fn new(final_path: PathBuf) -> Result<Self> {
-        let mut temp_path = final_path.clone();
-        let temp_id = TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        temp_path.set_file_name(format!(
-            ".duet-part-{}-{}",
-            std::process::id(),
-            temp_id
-        ));
         let parent_guard = match final_path.parent() {
             Some(parent) => WritableDirGuard::new(parent)?,
             None => None,
         };
-        let file = fs::File::create(&temp_path)
-            .wrap_err_with(|| format!("failed to create temporary file {}", temp_path.display()))?;
+        let (temp_path, file) = create_temp_output_file(&final_path)?;
         Ok(TempOutput {
             final_path,
             temp_path,
@@ -1588,6 +1688,53 @@ impl TempOutput {
     fn temp_path(&self) -> &Path {
         &self.temp_path
     }
+}
+
+fn create_temp_output_file(final_path: &Path) -> Result<(PathBuf, fs::File)> {
+    let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+    for _ in 0..128 {
+        let temp_path = parent.join(format!(
+            ".duet-part-{}-{:016x}-{}",
+            std::process::id(),
+            temp_nonce(),
+            TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).wrap_err_with(|| {
+                    format!("failed to create temporary file {}", temp_path.display())
+                });
+            }
+        }
+    }
+
+    Err(eyre!(
+        "failed to create a unique temporary file next to {}",
+        final_path.display()
+    ))
+}
+
+fn temp_nonce() -> u64 {
+    let mut bytes = [0u8; 8];
+    if fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return u64::from_ne_bytes(bytes);
+    }
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
 struct WritableDirGuard {
@@ -1911,7 +2058,7 @@ impl DetailApplier {
         match &self.actions[action_index] {
             Action::Local(change) | Action::ResolvedLocal((_, _), change) => match change {
                 Change::Removed(e) => {
-                    let filename = self.base.join(e.path());
+                    let filename = safe_join(&self.base, e.path())?;
                     if !e.is_dir() {
                         fs::remove_file(&filename)?;
                         record_committed_step(
@@ -1922,7 +2069,7 @@ impl DetailApplier {
                     }
                 }
                 Change::Added(e) => {
-                    let filename = self.base.join(e.path());
+                    let filename = safe_join(&self.base, e.path())?;
                     ensure_parent_directory(&filename)?;
                     if let Some(p) = e.target() {
                         std::os::unix::fs::symlink(p, &filename)?;
@@ -1949,7 +2096,7 @@ impl DetailApplier {
                     }
                 }
                 Change::Modified(e1, e2) => {
-                    let filename = self.base.join(e2.path());
+                    let filename = safe_join(&self.base, e2.path())?;
                     if e1.is_file() {
                         if e2.is_file() {
                             if !e1.same_contents(e2) {
@@ -2111,7 +2258,7 @@ impl DetailApplier {
             | Action::ResolvedLocal((_, _), Change::Modified(_, e)) => e,
             _ => return Err(eyre!("file detail finished for non-file action")),
         };
-        let filename = self.base.join(entry.path());
+        let filename = safe_join(&self.base, entry.path())?;
         output.finish()?;
         self.recorder
             .record_committed_step("rename-file", entry.path())?;
@@ -2133,7 +2280,7 @@ impl DetailApplier {
                     }
                     match change {
                         Change::Removed(e) => {
-                            let dirname = self.base.join(e.path());
+                            let dirname = safe_join(&self.base, e.path())?;
                             fs::remove_dir(&dirname)?;
                             record_committed_step(
                                 self.attempt_state.as_deref(),
@@ -2142,7 +2289,7 @@ impl DetailApplier {
                             )?;
                         }
                         Change::Added(e) => {
-                            let dirname = self.base.join(e.path());
+                            let dirname = safe_join(&self.base, e.path())?;
                             self.new_entries.push(update_meta(&dirname, e)?);
                             record_committed_step(
                                 self.attempt_state.as_deref(),
@@ -2151,7 +2298,7 @@ impl DetailApplier {
                             )?;
                         }
                         Change::Modified(e1, e2) => {
-                            let dirname = self.base.join(e2.path());
+                            let dirname = safe_join(&self.base, e2.path())?;
                             if e1.is_dir() && !e2.is_dir() {
                                 return Err(eyre!(
                                     "streaming directory-to-file changes is not supported"
@@ -2205,7 +2352,7 @@ fn detail_filename(base: &Path, action: &Action) -> Result<PathBuf> {
         Action::Local(Change::Added(e))
         | Action::ResolvedLocal((_, _), Change::Added(e))
         | Action::Local(Change::Modified(_, e))
-        | Action::ResolvedLocal((_, _), Change::Modified(_, e)) => Ok(base.join(e.path())),
+        | Action::ResolvedLocal((_, _), Change::Modified(_, e)) => safe_join(base, e.path()),
         _ => Err(eyre!("action has no detail filename")),
     }
 }
@@ -2247,6 +2394,7 @@ pub fn apply_detailed_changes(
     all_old: &mut Vec<Entry>,
     attempt_state: Option<&Path>,
 ) -> Result<()> {
+    validate_actions(actions)?;
     log::debug!("details.len() = {}", details.len());
     let mut details_iter = details.iter();
     let mut new_entries: Vec<Entry> = Vec::new();
@@ -2283,7 +2431,7 @@ pub fn apply_detailed_changes(
                 log::debug!("applying detailed change to {}", action.path().display());
                 match change {
                     Change::Removed(e) => {
-                        let filename = base.join(e.path());
+                        let filename = safe_join(base, e.path())?;
                         log::debug!("Removing {:?}", filename);
                         if !e.is_dir() {
                             fs::remove_file(&filename).wrap_err_with(|| {
@@ -2296,7 +2444,7 @@ pub fn apply_detailed_changes(
                           // nothing gets copied into new_entries
                     }
                     Change::Added(e) => {
-                        let filename = base.join(e.path());
+                        let filename = safe_join(base, e.path())?;
                         ensure_parent_directory(&filename)?;
                         if let Some(p) = e.target() {
                             std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
@@ -2325,7 +2473,7 @@ pub fn apply_detailed_changes(
                         }
                     }
                     Change::Modified(e1, e2) => {
-                        let filename = base.join(e2.path());
+                        let filename = safe_join(base, e2.path())?;
                         if e1.is_file() {
                             if e2.is_file() {
                                 if !e1.same_contents(&e2) {
@@ -2480,19 +2628,19 @@ pub fn apply_detailed_changes(
                 }
                 match change {
                     Change::Removed(e) => {
-                        let dirname = base.join(e.path());
+                        let dirname = safe_join(base, e.path())?;
                         fs::remove_dir(&dirname).wrap_err_with(|| {
                             format!("failed to remove directory {}", dirname.display())
                         })?;
                         record_committed_step(attempt_state, "remove-dir", e.path())?;
                     }
                     Change::Added(e) => {
-                        let dirname = base.join(e.path());
+                        let dirname = safe_join(base, e.path())?;
                         new_entries.push(update_meta(&dirname, e)?);
                         record_committed_step(attempt_state, "update-metadata", e.path())?;
                     }
                     Change::Modified(e1, e2) => {
-                        let dirname = base.join(e2.path());
+                        let dirname = safe_join(base, e2.path())?;
                         if e1.is_dir() && !e2.is_dir() {
                             fs::remove_dir(&dirname).wrap_err_with(|| {
                                 format!("failed to remove directory {}", dirname.display())
@@ -2727,6 +2875,47 @@ mod tests {
 
         output.finish().unwrap();
         assert!(final_path.exists());
+    }
+
+    #[test]
+    fn temp_output_does_not_clobber_predictable_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.txt");
+        let old_predictable = dir.path().join(format!(
+            ".duet-part-{}-0",
+            std::process::id()
+        ));
+        fs::write(&old_predictable, b"do not touch").unwrap();
+
+        let output = TempOutput::new(final_path).unwrap();
+
+        assert_ne!(output.temp_path, old_predictable);
+        assert_eq!(fs::read(&old_predictable).unwrap(), b"do not touch");
+    }
+
+    #[test]
+    fn safe_join_rejects_paths_that_escape_base() {
+        let base = Path::new("/tmp/base");
+
+        assert!(safe_join(base, Path::new("file.txt")).is_ok());
+        assert!(safe_join(base, Path::new("dir/file.txt")).is_ok());
+        assert!(safe_join(base, Path::new("../file.txt")).is_err());
+        assert!(safe_join(base, Path::new("dir/../file.txt")).is_err());
+        assert!(safe_join(base, Path::new("/tmp/file.txt")).is_err());
+    }
+
+    #[test]
+    fn preflight_rejects_action_paths_that_escape_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let actions = vec![Action::Local(Change::Added(Entry::test_file(
+            PathBuf::from("../escape.txt"),
+            0,
+        )))];
+
+        let error = preflight_apply(&base, &actions).unwrap_err().to_string();
+
+        assert!(error.contains("invalid action entry path"), "{}", error);
     }
 
     #[test]
