@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::BufWriter;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +38,7 @@ const STATE_SAVE_RECOVERY_ADVICE: &str = "Recovery: filesystem changes were appl
 struct SyncContext {
     profile: profile::Profile,
     local_id: String,
+    legacy_local_id: Option<String>,
     local_base: PathBuf,
     remote_base: String,
     remote_server: Option<String>,
@@ -44,6 +47,11 @@ struct SyncContext {
     local_state: PathBuf,
     remote_state_dir: Option<PathBuf>,
     server_log: PathBuf,
+}
+
+struct LocalIds {
+    stable: String,
+    legacy: Option<String>,
 }
 
 pub async fn sync(
@@ -68,6 +76,7 @@ pub async fn sync(
     let SyncContext {
         profile: prf,
         local_id,
+        legacy_local_id,
         local_base,
         remote_base,
         remote_server,
@@ -123,8 +132,10 @@ pub async fn sync(
                     .await
                     .map_err(remote_state_dir_error)?;
             }
+            let remote_id = select_remote_state_id(&remote, &remote_info, local_id, legacy_local_id)
+                .await?;
             let changes = remote
-                .changes(remote_path, remote_locations, remote_ignore, local_id)
+                .changes(remote_path, remote_locations, remote_ignore, remote_id)
                 .await
                 .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))?;
             Ok::<_, color_eyre::eyre::Report>((changes, remote_info))
@@ -456,6 +467,25 @@ where
         .map_err(|e| remote_rpc_error("Couldn't negotiate sync tuning", e))
 }
 
+async fn select_remote_state_id<R>(
+    remote: &R,
+    info: &rpc::ServerInfo,
+    stable_id: String,
+    legacy_id: Option<String>,
+) -> Result<String>
+where
+    R: DuetServerAsync,
+{
+    if has_remote_capability(info, rpc::CAPABILITY_REMOTE_STATE_ID_SELECTION) {
+        return remote
+            .select_remote_state_id(stable_id, legacy_id)
+            .await
+            .map_err(|e| remote_rpc_error("Couldn't select remote state id", e));
+    }
+
+    Ok(legacy_id.unwrap_or(stable_id))
+}
+
 fn new_apply_attempt_id(local_id: &str) -> String {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -495,8 +525,6 @@ fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncC
         quit::with_code(PROFILE_ERROR_CODE);
     });
 
-    let local_id = local_id(&config.identity);
-
     let local_base = crate::full(&config.profile.local).map_err(|e| {
         eyre!(
             "{}",
@@ -523,14 +551,13 @@ fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncC
         path.display().to_string().yellow()
     );
 
-    let remote_state_dir = match source {
-        ProfileSource::Named(_) => None,
-        ProfileSource::File(_) => Some(config.remote_state_dir),
-    };
+    let remote_state_dir = remote_state_dir_for_source(&source, remote_server.as_deref(), &config)?;
+    let local_ids = local_ids(&config.identity)?;
 
     Ok(SyncContext {
         profile: config.profile,
-        local_id,
+        local_id: local_ids.stable,
+        legacy_local_id: local_ids.legacy,
         local_base,
         remote_base,
         remote_server,
@@ -1127,17 +1154,54 @@ fn validate_relative_restriction(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn local_id(name: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mid = machine_uid::get().unwrap_or_else(|e| {
-        log::warn!("Unable to read machine id: {:?}", e);
-        "unknown-machine".to_string()
-    });
+fn remote_state_dir_for_source(
+    source: &ProfileSource,
+    remote_server: Option<&str>,
+    config: &profile::ProfileConfig,
+) -> Result<Option<PathBuf>> {
+    match source {
+        ProfileSource::Named(_) => Ok(None),
+        ProfileSource::File(_) if remote_server.is_some() => Err(eyre!(
+            "--profile-file cannot be used with SSH remotes because the derived remote state directory {} is local to this client; use a named profile or a local remote",
+            config.remote_state_dir.display()
+        )),
+        ProfileSource::File(_) => Ok(Some(config.remote_state_dir.clone())),
+    }
+}
+
+fn local_ids(name: &str) -> Result<LocalIds> {
+    let (mid, legacy_mid) = match machine_uid::get() {
+        Ok(mid) => (mid.clone(), mid),
+        Err(e) => {
+            log::warn!("Unable to read machine id: {:?}; using persisted Duet client id", e);
+            (profile::client_id()?, "unknown-machine".to_string())
+        }
+    };
+
+    Ok(LocalIds {
+        stable: stable_local_id(&mid, name),
+        legacy: Some(legacy_local_id(&legacy_mid, name)),
+    })
+}
+
+fn legacy_local_id(machine_id: &str, name: &str) -> String {
     let mut s = DefaultHasher::new();
-    mid.hash(&mut s);
+    machine_id.hash(&mut s);
     name.hash(&mut s);
     format!("{:x}", s.finish())
+}
+
+fn stable_local_id(machine_id: &str, name: &str) -> String {
+    let mut input = Vec::new();
+    input.extend_from_slice(machine_id.as_bytes());
+    input.push(0);
+    input.extend_from_slice(name.as_bytes());
+
+    let hash = blake2_rfc::blake2b::blake2b(16, &[], &input);
+    hash.as_bytes()
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1192,8 +1256,38 @@ mod tests {
 
     #[test]
     fn local_id_is_stable_and_profile_specific() {
-        assert_eq!(local_id("work"), local_id("work"));
-        assert_ne!(local_id("work"), local_id("personal"));
+        assert_eq!(stable_local_id("machine", "work"), stable_local_id("machine", "work"));
+        assert_ne!(stable_local_id("machine", "work"), stable_local_id("machine", "personal"));
+        assert_ne!(stable_local_id("machine", "work"), stable_local_id("other", "work"));
+        assert_eq!(stable_local_id("machine", "work").len(), 32);
+    }
+
+    #[test]
+    fn profile_file_remote_state_dir_rejects_ssh_remotes() {
+        let config = profile::ProfileConfig {
+            display_name: "profile".to_string(),
+            identity: "profile".to_string(),
+            profile: profile::Profile {
+                local: "/local".to_string(),
+                remote: "ssh host /remote".to_string(),
+                locations: Vec::new(),
+                ignore: Vec::new(),
+            },
+            local_state: PathBuf::from("profile.snp"),
+            remote_state_dir: PathBuf::from("profile.remotes"),
+            server_log: PathBuf::from("profile.remote.log"),
+        };
+
+        let error = remote_state_dir_for_source(
+            &ProfileSource::File(PathBuf::from("profile.prf")),
+            Some("host"),
+            &config,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("--profile-file"));
+        assert!(error.contains("SSH"));
     }
 
     #[test]

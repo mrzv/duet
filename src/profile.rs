@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{self, prelude::*, BufReader};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use shellexpand;
 
@@ -77,6 +78,61 @@ pub fn remote_state_dir() -> Result<PathBuf, io::Error> {
     let mut base = config_dir()?;
     base.push("remotes");
     Ok(base)
+}
+
+pub fn client_id() -> Result<String, io::Error> {
+    let mut path = config_dir()?;
+    std::fs::create_dir_all(&path)?;
+    path.push("client-id");
+
+    match std::fs::read_to_string(&path) {
+        Ok(existing) => {
+            let existing = existing.trim();
+            validate_remote_state_id(existing)?;
+            Ok(existing.to_string())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let id = generate_client_id()?;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "{}", id)?;
+                    Ok(id)
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let existing = std::fs::read_to_string(&path)?;
+                    let existing = existing.trim();
+                    validate_remote_state_id(existing)?;
+                    Ok(existing.to_string())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn generate_client_id() -> Result<String, io::Error> {
+    let mut bytes = [0u8; 16];
+    match File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)) {
+        Ok(()) => {}
+        Err(_) => {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            bytes[..8].copy_from_slice(&(nanos as u64).to_le_bytes());
+            bytes[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+        }
+    }
+    Ok(format_client_id(&bytes))
+}
+
+fn format_client_id(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
 }
 
 pub fn remote_state_in(dir: &Path, id: &str) -> PathBuf {
@@ -242,5 +298,13 @@ mod tests {
             Location::Exclude(path) if path == &PathBuf::from("target")
         ));
         assert_eq!(profile.ignore, vec!["*.tmp".to_string()]);
+    }
+
+    #[test]
+    fn formats_client_ids_as_safe_remote_state_ids() {
+        let id = format_client_id(&[0, 1, 2, 10, 15, 16, 254, 255]);
+
+        assert_eq!(id, "0001020a0f10feff");
+        validate_remote_state_id(&id).unwrap();
     }
 }

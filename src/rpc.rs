@@ -32,6 +32,7 @@ pub(crate) const CAPABILITY_CREATABLE_ADDED_PARENTS: &str = "creatable-added-par
 pub(crate) const CAPABILITY_SYNC_TUNING: &str = "sync-tuning-v1";
 pub(crate) const CAPABILITY_STREAM_PERFORMANCE: &str = "stream-performance-v1";
 pub(crate) const CAPABILITY_FILE_BYTE_CHUNKS: &str = "file-byte-chunks-v1";
+pub(crate) const CAPABILITY_REMOTE_STATE_ID_SELECTION: &str = "remote-state-id-selection-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -42,6 +43,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_SYNC_TUNING,
     CAPABILITY_STREAM_PERFORMANCE,
     CAPABILITY_FILE_BYTE_CHUNKS,
+    CAPABILITY_REMOTE_STATE_ID_SELECTION,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -121,6 +123,11 @@ pub trait DuetServer {
         stream_id: ApplyStreamId,
         chunk: sync::FileByteChunk,
     ) -> Result<(), RPCError>;
+    fn select_remote_state_id(
+        &self,
+        stable_id: String,
+        legacy_id: Option<String>,
+    ) -> Result<String, RPCError>;
 }
 
 struct DuetServerImpl {
@@ -616,6 +623,25 @@ impl DuetServer for DuetServerImpl {
         self.stream_performance.apply_frames_ms += duration_ms(start.elapsed());
         Ok(())
     }
+
+    fn select_remote_state_id(
+        &self,
+        stable_id: String,
+        legacy_id: Option<String>,
+    ) -> Result<String, RPCError> {
+        profile::validate_remote_state_id(&stable_id)
+            .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
+        if let Some(legacy_id) = legacy_id {
+            profile::validate_remote_state_id(&legacy_id)
+                .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
+            let stable_state = profile::remote_state_in(&self.remote_state_dir, &stable_id);
+            let legacy_state = profile::remote_state_in(&self.remote_state_dir, &legacy_id);
+            if !stable_state.exists() && legacy_state.exists() {
+                return Ok(legacy_id);
+            }
+        }
+        Ok(stable_id)
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -758,6 +784,9 @@ mod tests {
         assert!(client
             .apply_file_byte_chunk(ApplyStreamId(1), sync::FileByteChunk::new(0, Vec::new()))
             .is_err());
+        assert!(client
+            .select_remote_state_id("stable".to_string(), Some("legacy".to_string()))
+            .is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -767,6 +796,7 @@ mod tests {
                 ("negotiate_sync_tuning", 19),
                 ("stream_performance", 20),
                 ("apply_file_byte_chunk", 21),
+                ("select_remote_state_id", 22),
             ]
         );
     }
@@ -795,8 +825,38 @@ mod tests {
                 CAPABILITY_CREATABLE_ADDED_PARENTS.to_string(),
                 CAPABILITY_SYNC_TUNING.to_string(),
                 CAPABILITY_STREAM_PERFORMANCE.to_string(),
-                CAPABILITY_FILE_BYTE_CHUNKS.to_string()
+                CAPABILITY_FILE_BYTE_CHUNKS.to_string(),
+                CAPABILITY_REMOTE_STATE_ID_SELECTION.to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn select_remote_state_id_preserves_existing_legacy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = DuetServerImpl::new().unwrap();
+        server.remote_state_dir = dir.path().to_path_buf();
+        std::fs::write(dir.path().join("legacy"), b"state").unwrap();
+
+        assert_eq!(
+            server
+                .select_remote_state_id("stable".to_string(), Some("legacy".to_string()))
+                .unwrap(),
+            "legacy"
+        );
+    }
+
+    #[test]
+    fn select_remote_state_id_prefers_stable_for_new_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = DuetServerImpl::new().unwrap();
+        server.remote_state_dir = dir.path().to_path_buf();
+
+        assert_eq!(
+            server
+                .select_remote_state_id("stable".to_string(), Some("legacy".to_string()))
+                .unwrap(),
+            "stable"
         );
     }
 
