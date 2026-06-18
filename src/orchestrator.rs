@@ -34,6 +34,7 @@ const TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS: &str =
     "DUET_TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS";
 const POST_PREFLIGHT_RECOVERY_ADVICE: &str = "Recovery: filesystem changes may have been partially applied, but Duet state was not saved. Fix the reported problem, inspect both sides if needed, then rerun duet. If conflicts appear, resolve them manually.";
 const STATE_SAVE_RECOVERY_ADVICE: &str = "Recovery: filesystem changes were applied, but Duet state was not saved on both sides. Fix state storage permissions, then rerun duet before making unrelated changes.";
+const MAX_NON_STREAMED_DETAIL_BYTES: u64 = 64 * 1024 * 1024;
 
 struct SyncContext {
     profile: profile::Profile,
@@ -198,6 +199,9 @@ pub async fn sync(
         has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAIL_BATCHES)
             && sync_ops::can_stream_details(&actions)
             && sync_ops::can_stream_details(&remote_actions);
+    if !can_stream_details {
+        preflight_non_streamed_detail_size(actions.as_ref(), &remote_actions)?;
+    }
     let can_prepare_remote_apply =
         has_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_ATTEMPT_PREPARE);
     let can_prepare_remote_apply_with_id =
@@ -823,6 +827,18 @@ fn stream_progress_bar(total_transfer_bytes: u64) -> Result<indicatif::ProgressB
     Ok(progress)
 }
 
+fn preflight_non_streamed_detail_size(actions: &[Action], _remote_actions: &[Action]) -> Result<()> {
+    let detail_bytes = sync_ops::detail_transfer_bytes(actions);
+    if detail_bytes > MAX_NON_STREAMED_DETAIL_BYTES {
+        return Err(eyre!(
+            "sync requires {} of file detail data, but this peer cannot stream it; refusing to materialize more than {} in memory",
+            indicatif::HumanBytes(detail_bytes),
+            indicatif::HumanBytes(MAX_NON_STREAMED_DETAIL_BYTES)
+        ));
+    }
+    Ok(())
+}
+
 fn advance_stream_progress(
     progress: &indicatif::ProgressBar,
     position: &mut u64,
@@ -1288,6 +1304,46 @@ mod tests {
 
         assert!(error.contains("--profile-file"));
         assert!(error.contains("SSH"));
+    }
+
+    #[test]
+    fn non_streamed_detail_size_limit_rejects_large_payloads() {
+        let actions = vec![Action::Local(Change::Added(
+            scan::DirEntryWithMeta::test_file_with_size(
+                PathBuf::from("large.bin"),
+                MAX_NON_STREAMED_DETAIL_BYTES + 1,
+                0,
+            ),
+        ))];
+
+        let error = preflight_non_streamed_detail_size(&actions, &Vec::new())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cannot stream"));
+    }
+
+    #[test]
+    fn non_streamed_detail_size_limit_accepts_small_payloads() {
+        let actions = vec![Action::Local(Change::Added(
+            scan::DirEntryWithMeta::test_file_with_size(PathBuf::from("small.bin"), 1024, 0),
+        ))];
+
+        preflight_non_streamed_detail_size(&actions, &Vec::new()).unwrap();
+    }
+
+    #[test]
+    fn non_streamed_detail_size_limit_counts_actions_once() {
+        let actions = vec![Action::Local(Change::Added(
+            scan::DirEntryWithMeta::test_file_with_size(
+                PathBuf::from("fits.bin"),
+                MAX_NON_STREAMED_DETAIL_BYTES,
+                0,
+            ),
+        ))];
+        let remote_actions = reverse(&actions);
+
+        preflight_non_streamed_detail_size(&actions, &remote_actions).unwrap();
     }
 
     #[test]
