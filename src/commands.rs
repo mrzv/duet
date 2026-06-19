@@ -19,7 +19,7 @@ bi-directional synchronization
 USAGE:
     duet [FLAGS] <profile> [path]
     duet [FLAGS] --profile-file <file> [path]
-    duet --recover [--clear] [--yes] <statefile>
+    duet recover [--clear] [--yes] <statefile>
 
 FLAGS:
     -i, --interactive   interactive conflict resolution
@@ -42,12 +42,16 @@ FLAGS:
     -h, --help          prints help information
 
 RECOVERY:
-    --recover <statefile>
+    recover <statefile>
         inspect an unfinished apply marker for a state file
-    --recover --clear <statefile>
+    recover --clear <statefile>
         inspect and then interactively remove the marker after manual recovery
-    --recover --clear --yes <statefile>
+    recover --clear --yes <statefile>
         remove the marker without prompting after manual recovery
+
+    Recovery commands operate on the filesystem where they are run. To inspect or
+    clear a remote-side marker, run the command on the remote host with the
+    remote state file path shown in the marker.
 
 ARGS:
     <profile>    profile to synchronize

@@ -1045,11 +1045,12 @@ fn apply_attempt_recovery_advice(state_path: &Path, marker_path: &Path, marker: 
     };
 
     advice.push_str(&format!(
-        " Inspect this marker with `duet --recover {}`. After inspection, remove it with `duet --recover --clear {}` or manually with `rm {}`.",
+        " Inspect this marker with `duet recover {}`. After inspection, remove it with `duet recover --clear {}` or manually with `rm {}`.",
         state_path.display(),
         state_path.display(),
         marker_path.display()
     ));
+    advice.push_str(" Run recovery commands on the side where this state file exists; for remote-side markers, SSH to the remote host first.");
 
     if marker
         .operations
@@ -3685,8 +3686,9 @@ mod tests {
         let error = check_apply_attempt_clear(&state).unwrap_err().to_string();
 
         assert!(error.contains("previous Duet apply attempt did not finish"));
-        assert!(error.contains("Inspect this marker with `duet --recover "));
-        assert!(error.contains("duet --recover --clear "));
+        assert!(error.contains("Inspect this marker with `duet recover "));
+        assert!(error.contains("duet recover --clear "));
+        assert!(error.contains("Run recovery commands on the side"));
         assert!(error.contains("Recovery marker contents:"));
         assert!(error.contains("side: local"));
         assert!(error.contains("phase: apply"));
@@ -3732,17 +3734,18 @@ mod tests {
         );
 
         assert!(
-            advice.contains("Inspect this marker with `duet --recover /tmp/profile.snp`"),
+            advice.contains("Inspect this marker with `duet recover /tmp/profile.snp`"),
             "{}",
             advice
         );
         assert!(
-            advice.contains("duet --recover --clear /tmp/profile.snp"),
+            advice.contains("duet recover --clear /tmp/profile.snp"),
             "{}",
             advice
         );
 
         assert!(advice.contains("rm /tmp/.profile.snp.duet-apply"));
+        assert!(advice.contains("SSH to the remote host first"));
         assert!(advice.contains("Removed or replaced paths"), "{}", advice);
         assert!(advice.contains("Metadata operations"), "{}", advice);
         assert!(

@@ -9,7 +9,7 @@
 - Raised the streamed file-byte chunk RPC cutoff from 64 KiB to 8 MiB based on SSH benchmarks, keeping medium payloads in batched detail frames.
 
 ### Added
-- Added a public `duet --recover` command to inspect unfinished apply markers and optionally clear them after manual recovery.
+- Added a public `duet recover` command to inspect unfinished apply markers and optionally clear them after manual recovery.
 
 ### Documentation
 - Updated architecture notes for streamed apply RPCs, file-byte chunk routing, and staged output verification.

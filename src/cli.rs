@@ -77,8 +77,6 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         return Ok(Command::Server);
     }
 
-    let recover = pargs.contains("--recover");
-
     let profile_file = pargs.opt_value_from_os_str("--profile-file", parse_path)?;
     let profile_performance_json =
         pargs.opt_value_from_os_str("--profile-performance-json", parse_path)?;
@@ -95,23 +93,18 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         profile_performance_json,
     };
 
-    if recover {
-        if profile_file.is_some() {
-            return Err(eyre!("--profile-file is not supported for recover"));
-        }
-        let clear = pargs.contains("--clear");
-        reject_recover_options(&options, clear)?;
-        let command = Command::Recover {
-            statefile: pargs.free_from_os_str(parse_path)?,
-            clear,
-            yes: options.yes,
-        };
-        ensure_no_args(pargs)?;
-        return Ok(command);
-    }
-
     if let Some(profile_file) = profile_file {
         let path = pargs.opt_free_from_os_str(parse_path)?;
+        let path_is_recover = path
+            .as_deref()
+            .map(|path| {
+                path == std::path::Path::new("recover")
+                    || path == std::path::Path::new("_recover")
+            })
+            .unwrap_or(false);
+        if path_is_recover {
+            return Err(eyre!("recover is a subcommand, not a profile-file path"));
+        }
         ensure_no_args(pargs)?;
         return Ok(Command::Sync {
             profile: ProfileSource::File(profile_file),
@@ -161,7 +154,7 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
                 path: pargs.free_from_os_str(parse_path)?,
             }
         }
-        "_recover" => {
+        "recover" | "_recover" => {
             let clear = pargs.contains("--clear");
             reject_recover_options(&options, clear)?;
             Command::Recover {
@@ -402,7 +395,15 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args(&["--recover", "--clear", "--yes", "state.bin"]),
+            parse_args(&["recover", "state.bin"]),
+            Command::Recover {
+                statefile: PathBuf::from("state.bin"),
+                clear: false,
+                yes: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["recover", "--clear", "--yes", "state.bin"]),
             Command::Recover {
                 statefile: PathBuf::from("state.bin"),
                 clear: true,
@@ -421,32 +422,16 @@ mod tests {
         assert!(parse_args_error(&["--dry-run", "_inspect", "state.bin"])
             .contains("sync options"));
         assert!(
-            parse_args_error(&["--yes", "--recover", "state.bin"])
+            parse_args_error(&["--yes", "recover", "state.bin"])
                 .contains("--yes requires --clear")
         );
-        assert!(parse_args_error(&["--profile-file", "profile.prf", "--recover", "state.bin"])
-            .contains("--profile-file"));
-    }
-
-    #[test]
-    fn recover_remains_valid_profile_name() {
-        assert_eq!(
-            parse_args(&["recover", "docs"]),
-            Command::Sync {
-                profile: ProfileSource::Named("recover".to_string()),
-                path: Some(PathBuf::from("docs")),
-                options: SyncOptions {
-                    interactive: false,
-                    yes: false,
-                    dry_run: false,
-                    batch: false,
-                    force: false,
-                    verbose: false,
-                    debug_info: false,
-                    profile_performance: false,
-                    profile_performance_json: None,
-                },
-            }
-        );
+        assert!(parse_args_error(&["recover", "--profile-file", "profile.prf"])
+            .contains("recover is a subcommand"));
+        assert!(parse_args_error(&["recover", "--profile-file", "profile.prf", "state.bin"])
+            .contains("recover is a subcommand"));
+        assert!(parse_args_error(&["_recover", "--profile-file", "profile.prf"])
+            .contains("recover is a subcommand"));
+        assert!(parse_args_error(&["--profile-file", "profile.prf", "_recover"])
+            .contains("recover is a subcommand"));
     }
 }

@@ -10,7 +10,7 @@ changes from that state.
 USAGE:
     duet [FLAGS] <profile> [path]
     duet [FLAGS] --profile-file <file> [path]
-    duet --recover [--clear] [--yes] <statefile>
+    duet recover [--clear] [--yes] <statefile>
 
 FLAGS:
     -i, --interactive   interactive conflict resolution
@@ -33,12 +33,16 @@ FLAGS:
     -h, --help          prints help information
 
 RECOVERY:
-    --recover <statefile>
+    recover <statefile>
         inspect an unfinished apply marker for a state file
-    --recover --clear <statefile>
+    recover --clear <statefile>
         inspect and then interactively remove the marker after manual recovery
-    --recover --clear --yes <statefile>
+    recover --clear --yes <statefile>
         remove the marker without prompting after manual recovery
+
+    Recovery commands operate on the filesystem where they are run. To inspect or
+    clear a remote-side marker, run the command on the remote host with the
+    remote state file path shown in the marker.
 
 ARGS:
     <profile>    profile to synchronize
@@ -95,12 +99,14 @@ problem and rerun the sync.
 
 If Duet stops after applying filesystem changes but before saving state, it
 leaves an apply recovery marker next to the affected state file and blocks the
-next sync. Run `duet --recover <statefile>` to inspect the marker, including the
+next sync. Run `duet recover <statefile>` to inspect the marker, including the
 side, phase, affected paths, staged temporary files, and committed operations.
 After you have inspected both sides and reconciled any partial changes, run
-`duet --recover --clear <statefile>` to remove the marker and allow syncs to
-resume. Use `--yes` with `--clear` only for non-interactive cleanup after that
-manual inspection.
+`duet recover --clear <statefile>` to remove the marker and allow syncs to
+resume. Recovery commands operate on the filesystem where they are run: to
+inspect or clear a remote-side marker, run `duet recover` on the remote host with
+the remote state file path shown in the marker. Use `--yes` with `--clear` only
+for non-interactive cleanup after that manual inspection.
 
 ## Caveat
 
