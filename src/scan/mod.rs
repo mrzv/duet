@@ -170,16 +170,24 @@ impl DirEntryWithMeta {
         let filename = base.join(&self.path);
         log::trace!("Computing checksum for {}", filename.display());
 
+        use adler32::RollingAdler32;
         use tokio::io::AsyncReadExt;
         let mut file = tokio::fs::File::open(&filename)
             .await
             .wrap_err_with(|| format!("unable to open {} for checksum", filename.display()))?;
-        let mut contents = vec![];
-        file.read_to_end(&mut contents)
-            .await
-            .wrap_err_with(|| format!("unable to read {} for checksum", filename.display()))?;
-        self.checksum = adler32::adler32(&contents[..])
-            .wrap_err_with(|| format!("unable to checksum {}", filename.display()))?;
+        let mut hash = RollingAdler32::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .await
+                .wrap_err_with(|| format!("unable to read {} for checksum", filename.display()))?;
+            if read == 0 {
+                break;
+            }
+            hash.update_buffer(&buffer[..read]);
+        }
+        self.checksum = hash.hash();
 
         Ok(())
     }
@@ -578,6 +586,27 @@ mod tests {
         }
 
         assert!(paths.contains(&deepest_relative.join("file.txt")));
+    }
+
+    #[tokio::test]
+    async fn compute_checksum_streams_file_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let contents = (0..100_000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        tokio::fs::write(temp.path().join("file.bin"), &contents)
+            .await
+            .unwrap();
+        let mut entry = DirEntryWithMeta::test_file_with_size(
+            PathBuf::from("file.bin"),
+            contents.len() as u64,
+            0,
+        );
+
+        entry
+            .compute_checksum(&temp.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert_eq!(entry.checksum(), adler32::adler32(&contents[..]).unwrap());
     }
 
     #[test]
