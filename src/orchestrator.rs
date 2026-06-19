@@ -35,6 +35,7 @@ const TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS: &str =
 const POST_PREFLIGHT_RECOVERY_ADVICE: &str = "Recovery: filesystem changes may have been partially applied, but Duet state was not saved. Fix the reported problem, inspect both sides if needed, then rerun duet. If conflicts appear, resolve them manually.";
 const STATE_SAVE_RECOVERY_ADVICE: &str = "Recovery: filesystem changes were applied, but Duet state was not saved on both sides. Fix state storage permissions, then rerun duet before making unrelated changes.";
 const MAX_NON_STREAMED_DETAIL_BYTES: u64 = 64 * 1024 * 1024;
+const FILE_BYTE_CHUNK_RPC_THRESHOLD: usize = 64 * 1024;
 
 struct SyncContext {
     profile: profile::Profile,
@@ -773,28 +774,50 @@ where
             .map_err(|e| post_preflight_rpc_error("Couldn't apply remote detail stream", e));
     }
 
-    let mut buffered = Vec::new();
-    for frame in frames {
-        match frame.payload {
-            sync_ops::DetailPayload::FileBytes(bytes) => {
-                if !buffered.is_empty() {
-                    let pending = std::mem::take(&mut buffered);
-                    remote
-                        .apply_detail_chunks(remote_apply_stream, pending)
-                        .await
-                        .map_err(|e| {
-                            post_preflight_rpc_error("Couldn't apply remote detail stream", e)
-                        })?;
-                }
+    for batch in route_file_byte_frames(frames) {
+        match batch {
+            ApplyDetailBatch::Frames(frames) => {
                 remote
-                    .apply_file_byte_chunk(
-                        remote_apply_stream,
-                        sync_ops::FileByteChunk::new(frame.action_index, bytes),
-                    )
+                    .apply_detail_chunks(remote_apply_stream, frames)
+                    .await
+                    .map_err(|e| {
+                        post_preflight_rpc_error("Couldn't apply remote detail stream", e)
+                    })?;
+            }
+            ApplyDetailBatch::FileByteChunk(chunk) => {
+                remote
+                    .apply_file_byte_chunk(remote_apply_stream, chunk)
                     .await
                     .map_err(|e| {
                         post_preflight_rpc_error("Couldn't apply remote file byte stream", e)
                     })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+enum ApplyDetailBatch {
+    Frames(Vec<sync_ops::DetailFrame>),
+    FileByteChunk(sync_ops::FileByteChunk),
+}
+
+fn route_file_byte_frames(frames: Vec<sync_ops::DetailFrame>) -> Vec<ApplyDetailBatch> {
+    let mut batches = Vec::new();
+    let mut buffered = Vec::new();
+    for frame in frames {
+        match frame.payload {
+            sync_ops::DetailPayload::FileBytes(bytes)
+                if should_apply_file_bytes_as_chunk(bytes.len()) =>
+            {
+                if !buffered.is_empty() {
+                    batches.push(ApplyDetailBatch::Frames(std::mem::take(&mut buffered)));
+                }
+                batches.push(ApplyDetailBatch::FileByteChunk(sync_ops::FileByteChunk::new(
+                    frame.action_index,
+                    bytes,
+                )));
             }
             payload => buffered.push(sync_ops::DetailFrame {
                 action_index: frame.action_index,
@@ -804,13 +827,14 @@ where
     }
 
     if !buffered.is_empty() {
-        remote
-            .apply_detail_chunks(remote_apply_stream, buffered)
-            .await
-            .map_err(|e| post_preflight_rpc_error("Couldn't apply remote detail stream", e))?;
+        batches.push(ApplyDetailBatch::Frames(buffered));
     }
 
-    Ok(())
+    batches
+}
+
+fn should_apply_file_bytes_as_chunk(len: usize) -> bool {
+    len >= FILE_BYTE_CHUNK_RPC_THRESHOLD
 }
 
 fn stream_progress_bar(total_transfer_bytes: u64) -> Result<indicatif::ProgressBar> {
@@ -1439,6 +1463,75 @@ mod tests {
         let remote_actions = reverse(&actions);
 
         preflight_non_streamed_detail_size(&actions, &remote_actions).unwrap();
+    }
+
+    #[test]
+    fn small_file_byte_frames_stay_in_detail_batches() {
+        assert!(!should_apply_file_bytes_as_chunk(
+            FILE_BYTE_CHUNK_RPC_THRESHOLD - 1
+        ));
+    }
+
+    #[test]
+    fn large_file_byte_frames_use_dedicated_rpc() {
+        assert!(should_apply_file_bytes_as_chunk(
+            FILE_BYTE_CHUNK_RPC_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn route_file_byte_frames_batches_small_frames_and_splits_large_chunks() {
+        let batches = route_file_byte_frames(vec![
+            sync_ops::DetailFrame {
+                action_index: 7,
+                payload: sync_ops::DetailPayload::FileBegin,
+            },
+            sync_ops::DetailFrame {
+                action_index: 7,
+                payload: sync_ops::DetailPayload::FileBytes(vec![1; 1024]),
+            },
+            sync_ops::DetailFrame {
+                action_index: 7,
+                payload: sync_ops::DetailPayload::FileBytes(vec![
+                    2;
+                    FILE_BYTE_CHUNK_RPC_THRESHOLD
+                ]),
+            },
+            sync_ops::DetailFrame {
+                action_index: 7,
+                payload: sync_ops::DetailPayload::FileEnd,
+            },
+        ]);
+
+        assert_eq!(batches.len(), 3);
+        match &batches[0] {
+            ApplyDetailBatch::Frames(frames) => {
+                assert_eq!(frames.len(), 2);
+                assert!(matches!(
+                    frames[0].payload,
+                    sync_ops::DetailPayload::FileBegin
+                ));
+                assert!(matches!(
+                    frames[1].payload,
+                    sync_ops::DetailPayload::FileBytes(_)
+                ));
+            }
+            ApplyDetailBatch::FileByteChunk(_) => panic!("expected buffered detail frames"),
+        }
+        match &batches[1] {
+            ApplyDetailBatch::FileByteChunk(chunk) => {
+                assert_eq!(chunk.action_index, 7);
+                assert_eq!(chunk.len(), FILE_BYTE_CHUNK_RPC_THRESHOLD);
+            }
+            ApplyDetailBatch::Frames(_) => panic!("expected dedicated file byte chunk"),
+        }
+        match &batches[2] {
+            ApplyDetailBatch::Frames(frames) => {
+                assert_eq!(frames.len(), 1);
+                assert!(matches!(frames[0].payload, sync_ops::DetailPayload::FileEnd));
+            }
+            ApplyDetailBatch::FileByteChunk(_) => panic!("expected trailing detail frames"),
+        }
     }
 
     #[test]
