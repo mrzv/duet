@@ -317,6 +317,13 @@ Core RPC methods:
 - `apply_detailed_changes(details)`: mutate the server filesystem using the
   non-streamed detail vector and update the server snapshot in memory.
 - `save_state()`: atomically persist the server snapshot.
+- `prepare_apply_attempt()`: create the remote recovery marker before apply.
+- `prepare_apply_attempt_with_id(attempt_id)`: create a remote recovery marker
+  with a client-provided correlation id.
+- `negotiate_sync_tuning(request)`: agree on streamed detail chunking and
+  signature-window tuning.
+- `stream_performance()`: return server-side streamed transfer/apply counters
+  for performance profiling.
 - `select_remote_state_id(stable_id, legacy_id)`: choose the stable remote state
   id for new state, or an existing legacy id when a legacy state file is already
   present.
@@ -331,6 +338,7 @@ Streaming RPC methods:
 - `finish_apply_stream(stream_id)`
 - `next_detail_chunks(stream_id, max_frames, max_payload_bytes)`
 - `apply_detail_chunks(stream_id, frames)`
+- `apply_file_byte_chunk(stream_id, chunk)`
 
 `ServerInfo` currently advertises protocol version `2` and capabilities for
 profile-file remote state directories, streamed details, batched streamed detail
@@ -377,6 +385,13 @@ orchestrator interleaves the two directions: it reads remote detail batches and
 feeds the local applier, then produces local detail batches and sends them to the
 remote applier.
 
+When both sides advertise file-byte chunks, local-to-remote streamed apply routes
+large `FileBytes` payloads through `apply_file_byte_chunk()`. Smaller file-byte
+frames stay in normal `apply_detail_chunks()` batches so SSH transfers with many
+small or medium files do not degrade into one apply RPC per file. The current
+cutoff is 8 MiB per `FileBytes` payload: payloads below that size are batched;
+payloads at or above it use the dedicated file-byte RPC.
+
 `sync::preflight_apply()` checks selected destination write targets before
 mutation. The RPC server also runs preflight before non-streamed apply and before
 starting a streamed apply.
@@ -388,10 +403,12 @@ directories.
 
 Regular streamed file output uses `TempOutput`: data is written to a bounded
 `.duet-part-<pid>-<counter>` temporary basename in the destination directory and
-renamed into place on finish. `WritableDirGuard` can temporarily add owner write
-permission to an already-synced read-only destination directory and restore the
-original mode afterward. Metadata updates use Unix permission bits and
-symlink-aware file times.
+renamed into place on finish. Before rename, staged file output is flushed and
+verified against the expected file entry so mismatched content is rejected before
+the synchronized snapshot is recorded. `WritableDirGuard` can temporarily add
+owner write permission to an already-synced read-only destination directory and
+restore the original mode afterward. Metadata updates use Unix permission bits
+and symlink-aware file times.
 
 ## Concurrency Model
 

@@ -4,6 +4,10 @@
 
 ### Fixed
 - Batched small and medium streamed file-byte frames over SSH to avoid one apply RPC per file while preserving the dedicated large-file transfer path.
+- Raised the streamed file-byte chunk RPC cutoff from 64 KiB to 8 MiB based on SSH benchmarks, keeping medium payloads in batched detail frames.
+
+### Documentation
+- Updated architecture notes for streamed apply RPCs, file-byte chunk routing, and staged output verification.
 
 ## 0.8.7 - 2026-06-18
 
