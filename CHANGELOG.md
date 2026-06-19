@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.7 - 2026-06-18
+
 ### Added
 - Added stable remote-state identity selection that preserves existing legacy remote state files while using stable IDs for new state.
 - Added a persisted client ID fallback when the machine ID is unavailable.
