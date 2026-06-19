@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Added
+- Added stable remote-state identity selection that preserves existing legacy remote state files while using stable IDs for new state.
+- Added a persisted client ID fallback when the machine ID is unavailable.
+- Added validation for RPC-selected remote state IDs and named profile names.
+
+### Changed
+- Hardened restricted-path normalization to resolve paths against their intended base before enforcing sync-root boundaries, including symlink-aware parent handling.
+- Rejected `--profile-file` SSH remotes when the derived remote state directory would be local to the client.
+- Limited non-streamed detail transfer to avoid materializing very large payloads when a peer cannot stream details.
+- Documented basename-only ignore glob behavior and unsupported spaces in remote profile entries.
+
+### Fixed
+- Flushed serialized state snapshots before committing atomic state writes and kept local recovery markers until both local and remote state saves succeed.
+- Rejected unknown CLI arguments, extra positionals, unsafe named profile paths, and sync-only flags on hidden maintenance commands.
+- Fixed profile include/exclude parsing when markers are preceded by whitespace.
+- Validated deserialized action, state, RPC, and scan paths before filesystem access.
+- Created apply temporary files with randomized `create_new` names instead of truncating predictable paths.
+- Validated diff signatures, delta windows, detail ordering, expected detail kinds, and staged output contents before recording synchronized state.
+- Detected stale diff sources before applying deltas.
+- Reported unsupported special files and filesystem-boundary crossings inside the requested sync tree instead of silently propagating removals.
+- Fixed short-read handling and invalid-window errors in the rsync-style comparison and restore paths.
+- Propagated `_walk` scanner errors.
+- Escaped control characters in user-facing action paths and structured sync errors.
+- Removed an unused `scan::self` import warning in normal builds.
+
+### Documentation
+- Refreshed README usage for profile-file, debug-info, and performance flags.
+- Updated architecture notes for recovery, RPC capabilities, and remote state ID selection.
+
 ## 0.8.6 - 2026-06-18
 
 ### Added
