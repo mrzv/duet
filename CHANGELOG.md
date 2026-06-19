@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Fixed
+- Released scanner directory concurrency permits before recursive descent to avoid hanging on deeply nested trees.
+- Reported restricted scans that would cross a filesystem boundary on the way to the requested path instead of treating tracked entries as removed.
 - Batched small and medium streamed file-byte frames over SSH to avoid one apply RPC per file while preserving the dedicated large-file transfer path.
 - Raised the streamed file-byte chunk RPC cutoff from 64 KiB to 8 MiB based on SSH benchmarks, keeping medium payloads in batched detail frames.
 

@@ -241,6 +241,10 @@ fn find_parent<'a>(path: &PathBuf, locations: &'a Locations, pft: &ParentFromTo)
     &locations[parent]
 }
 
+fn is_relevant_to_restrict(path: &Path, restrict: &Path) -> bool {
+    path.starts_with(restrict) || restrict.starts_with(path)
+}
+
 #[async_recursion]
 async fn scan_dir(
     path: PathBuf,
@@ -320,7 +324,7 @@ async fn scan_dir(
             continue;
         }
 
-        if meta.is_dir() && dev != meta.dev() && path.starts_with(&*restrict) {
+        if meta.is_dir() && dev != meta.dev() && is_relevant_to_restrict(&path, &restrict) {
             return Err(eyre!(
                 "refusing to cross filesystem boundary at {}",
                 path.display()
@@ -362,6 +366,8 @@ async fn scan_dir(
             .map_err(|_| eyre!("unable to send scan result for {}", path.display()))?
         }
     }
+    drop(dir);
+    drop(_sp);
 
     scan_children(
         child_dirs,
@@ -517,6 +523,63 @@ mod tests {
         assert!(paths.contains(&PathBuf::from("dir/nested")));
         assert!(paths.contains(&PathBuf::from("dir/nested/file.txt")));
         assert!(!paths.contains(&PathBuf::from("dir")));
+    }
+
+    #[tokio::test]
+    async fn scan_handles_deep_directory_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut nested_dir = temp.path().to_path_buf();
+        let mut deepest_relative = PathBuf::new();
+
+        for i in 0..70 {
+            let component = format!("dir{i}");
+            nested_dir.push(&component);
+            deepest_relative.push(component);
+        }
+
+        tokio::fs::create_dir_all(&nested_dir).await.unwrap();
+        tokio::fs::write(nested_dir.join("file.txt"), b"data")
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(128);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scan(
+                temp.path(),
+                "",
+                &vec![Location::Include(PathBuf::new())],
+                &Vec::new(),
+                tx,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut paths = Vec::new();
+        while let Some(entry) = rx.recv().await {
+            paths.push(entry.path().clone());
+        }
+
+        assert!(paths.contains(&deepest_relative.join("file.txt")));
+    }
+
+    #[test]
+    fn filesystem_boundary_relevance_includes_restrict_ancestors() {
+        let restrict = Path::new("/base/mount/wanted");
+
+        assert!(is_relevant_to_restrict(Path::new("/base/mount"), restrict));
+        assert!(is_relevant_to_restrict(
+            Path::new("/base/mount/wanted"),
+            restrict
+        ));
+        assert!(is_relevant_to_restrict(
+            Path::new("/base/mount/wanted/child"),
+            restrict
+        ));
+        assert!(!is_relevant_to_restrict(Path::new("/base/other"), restrict));
     }
 }
 
