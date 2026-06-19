@@ -275,7 +275,7 @@ pub async fn sync(
             local_signatures,
             remote_signatures,
             tuning,
-            has_remote_capability(&remote_info, rpc::CAPABILITY_STREAM_PERFORMANCE),
+            remote_stream_performance_enabled(profiling_enabled, &remote_info),
             has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
         )
         .await?;
@@ -497,6 +497,10 @@ fn new_apply_attempt_id(local_id: &str) -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     format!("{}-{}-{}", local_id, std::process::id(), since_epoch)
+}
+
+fn remote_stream_performance_enabled(profiling_enabled: bool, info: &rpc::ServerInfo) -> bool {
+    profiling_enabled && has_remote_capability(info, rpc::CAPABILITY_STREAM_PERFORMANCE)
 }
 
 #[cfg(debug_assertions)]
@@ -1576,6 +1580,24 @@ mod tests {
 
         assert!(error.contains("0.3.2"));
         assert!(error.contains(rpc::CAPABILITY_PROFILE_FILE_STATE_DIR));
+    }
+
+    #[test]
+    fn remote_stream_performance_requires_profiling_and_capability() {
+        let info = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "0.3.2".to_string(),
+            capabilities: vec![rpc::CAPABILITY_STREAM_PERFORMANCE.to_string()],
+        };
+        let without_capability = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "0.3.2".to_string(),
+            capabilities: Vec::new(),
+        };
+
+        assert!(remote_stream_performance_enabled(true, &info));
+        assert!(!remote_stream_performance_enabled(false, &info));
+        assert!(!remote_stream_performance_enabled(true, &without_capability));
     }
 
     #[test]

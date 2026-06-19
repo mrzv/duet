@@ -469,7 +469,7 @@ pub fn can_stream_details(actions: &[Action]) -> bool {
             Action::Conflict(_, _) | Action::Identical(_, _) => return true,
         };
 
-        !matches!(change, Change::Modified(old, new) if old.is_dir() && new.is_file())
+        !matches!(change, Change::Modified(old, new) if old.is_dir() && !new.is_dir())
     })
 }
 
@@ -3127,6 +3127,26 @@ mod tests {
             .to_string();
 
         assert!(error.contains("unexpected detail kind"), "{}", error);
+    }
+
+    #[test]
+    fn can_stream_details_rejects_directory_to_symlink_replacements() {
+        let actions = vec![Action::Local(Change::Modified(
+            Entry::test_dir(PathBuf::from("path")),
+            Entry::test_symlink(PathBuf::from("path"), PathBuf::from("target")),
+        ))];
+
+        assert!(!can_stream_details(&actions));
+    }
+
+    #[test]
+    fn can_stream_details_accepts_directory_metadata_changes() {
+        let actions = vec![Action::Local(Change::Modified(
+            Entry::test_dir(PathBuf::from("path")),
+            Entry::test_dir(PathBuf::from("path")),
+        ))];
+
+        assert!(can_stream_details(&actions));
     }
 
     #[test]

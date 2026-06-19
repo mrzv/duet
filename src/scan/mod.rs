@@ -92,6 +92,20 @@ impl DirEntryWithMeta {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_symlink(path: PathBuf, target: PathBuf) -> Self {
+        Self {
+            path,
+            size: 0,
+            mtime: 0,
+            ino: 0,
+            mode: 0o120777,
+            target: Some(target),
+            is_dir: false,
+            checksum: 0,
+        }
+    }
+
     fn same(&self, other: &Self) -> bool {
         assert_eq!(self.path, other.path);
         (self.is_symlink() || self.mode == other.mode)
