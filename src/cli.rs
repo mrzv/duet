@@ -42,6 +42,8 @@ pub enum Command {
     },
     Recover {
         statefile: PathBuf,
+        clear: bool,
+        yes: bool,
     },
     Sync {
         profile: ProfileSource,
@@ -75,6 +77,8 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         return Ok(Command::Server);
     }
 
+    let recover = pargs.contains("--recover");
+
     let profile_file = pargs.opt_value_from_os_str("--profile-file", parse_path)?;
     let profile_performance_json =
         pargs.opt_value_from_os_str("--profile-performance-json", parse_path)?;
@@ -90,6 +94,21 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         profile_performance: pargs.contains("--profile-performance"),
         profile_performance_json,
     };
+
+    if recover {
+        if profile_file.is_some() {
+            return Err(eyre!("--profile-file is not supported for recover"));
+        }
+        let clear = pargs.contains("--clear");
+        reject_recover_options(&options, clear)?;
+        let command = Command::Recover {
+            statefile: pargs.free_from_os_str(parse_path)?,
+            clear,
+            yes: options.yes,
+        };
+        ensure_no_args(pargs)?;
+        return Ok(command);
+    }
 
     if let Some(profile_file) = profile_file {
         let path = pargs.opt_free_from_os_str(parse_path)?;
@@ -143,9 +162,12 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
             }
         }
         "_recover" => {
-            reject_sync_options(&options)?;
+            let clear = pargs.contains("--clear");
+            reject_recover_options(&options, clear)?;
             Command::Recover {
                 statefile: pargs.free_from_os_str(parse_path)?,
+                clear,
+                yes: options.yes,
             }
         }
         _ => Command::Sync {
@@ -170,6 +192,25 @@ fn reject_sync_options(options: &SyncOptions) -> Result<()> {
         || options.profile_performance_json.is_some()
     {
         Err(eyre!("sync options are not supported for this command"))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_recover_options(options: &SyncOptions, clear: bool) -> Result<()> {
+    if options.interactive
+        || options.dry_run
+        || options.batch
+        || options.force
+        || options.verbose
+        || options.debug_info
+        || options.profile_performance
+        || options.profile_performance_json.is_some()
+        || (options.yes && !clear)
+    {
+        Err(eyre!(
+            "only --clear and --yes are supported for recover; --yes requires --clear"
+        ))
     } else {
         Ok(())
     }
@@ -356,6 +397,16 @@ mod tests {
             parse_args(&["_recover", "state.bin"]),
             Command::Recover {
                 statefile: PathBuf::from("state.bin"),
+                clear: false,
+                yes: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["--recover", "--clear", "--yes", "state.bin"]),
+            Command::Recover {
+                statefile: PathBuf::from("state.bin"),
+                clear: true,
+                yes: true,
             }
         );
     }
@@ -369,5 +420,33 @@ mod tests {
         assert!(parse_args_error(&["--help", "work"]).contains("unexpected argument"));
         assert!(parse_args_error(&["--dry-run", "_inspect", "state.bin"])
             .contains("sync options"));
+        assert!(
+            parse_args_error(&["--yes", "--recover", "state.bin"])
+                .contains("--yes requires --clear")
+        );
+        assert!(parse_args_error(&["--profile-file", "profile.prf", "--recover", "state.bin"])
+            .contains("--profile-file"));
+    }
+
+    #[test]
+    fn recover_remains_valid_profile_name() {
+        assert_eq!(
+            parse_args(&["recover", "docs"]),
+            Command::Sync {
+                profile: ProfileSource::Named("recover".to_string()),
+                path: Some(PathBuf::from("docs")),
+                options: SyncOptions {
+                    interactive: false,
+                    yes: false,
+                    dry_run: false,
+                    batch: false,
+                    force: false,
+                    verbose: false,
+                    debug_info: false,
+                    profile_performance: false,
+                    profile_performance_json: None,
+                },
+            }
+        );
     }
 }

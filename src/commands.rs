@@ -19,6 +19,7 @@ bi-directional synchronization
 USAGE:
     duet [FLAGS] <profile> [path]
     duet [FLAGS] --profile-file <file> [path]
+    duet --recover [--clear] [--yes] <statefile>
 
 FLAGS:
     -i, --interactive   interactive conflict resolution
@@ -39,6 +40,14 @@ FLAGS:
         --version       prints version information
         --license       prints license information (including dependencies)
     -h, --help          prints help information
+
+RECOVERY:
+    --recover <statefile>
+        inspect an unfinished apply marker for a state file
+    --recover --clear <statefile>
+        inspect and then interactively remove the marker after manual recovery
+    --recover --clear --yes <statefile>
+        remove the marker without prompting after manual recovery
 
 ARGS:
     <profile>    profile to synchronize
@@ -141,15 +150,32 @@ pub(crate) async fn walk(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn recover(statefile: PathBuf) -> Result<()> {
+pub(crate) fn recover(statefile: PathBuf, clear: bool, yes: bool) -> Result<()> {
     match sync::describe_apply_attempt(&statefile)? {
-        Some(description) => println!("{}", description),
+        Some(description) => {
+            println!("{}", description);
+            if clear && confirm_clear_recovery_marker(yes)? {
+                sync::clear_apply_attempt(&statefile)?;
+                println!("Removed recovery marker for {}", statefile.display());
+            }
+        }
         None => println!(
             "No unfinished Duet apply attempt for {}",
             statefile.display()
         ),
     }
     Ok(())
+}
+
+fn confirm_clear_recovery_marker(yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+
+    Ok(dialoguer::Confirm::new()
+        .with_prompt("Remove this recovery marker now? Only do this after inspecting both sides")
+        .default(false)
+        .interact()?)
 }
 
 #[cfg(test)]
@@ -162,5 +188,34 @@ mod tests {
         let missing = dir.path().join("missing");
 
         assert!(walk(missing).await.is_err());
+    }
+
+    #[test]
+    fn recover_clear_yes_removes_apply_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker = dir.path().join(".profile.snp.duet-apply");
+        std::fs::write(
+            &marker,
+            "duet-apply-attempt-v1\nside: local\nphase: apply\npath-count: 0\noperation-count: 0\nunstaged-operation-count: 0\n",
+        )
+        .unwrap();
+
+        recover(state, true, true).unwrap();
+
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn recover_clear_yes_rejects_malformed_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker = dir.path().join(".profile.snp.duet-apply");
+        std::fs::write(&marker, "not a duet marker\n").unwrap();
+
+        let error = recover(state, true, true).unwrap_err().to_string();
+
+        assert!(error.contains("refusing to remove malformed"), "{}", error);
+        assert!(marker.exists());
     }
 }

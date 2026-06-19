@@ -611,7 +611,11 @@ pub fn describe_apply_attempt(state_path: &Path) -> Result<Option<String>> {
             marker_path.display()
         )
     })?;
-    Ok(Some(apply_attempt_description(&marker_path, &marker)))
+    Ok(Some(apply_attempt_description(
+        state_path,
+        &marker_path,
+        &marker,
+    )))
 }
 
 pub fn start_apply_attempt(
@@ -648,7 +652,10 @@ pub fn start_apply_attempt(
             if existing == contents {
                 Ok(())
             } else {
-                Err(eyre!("{}", apply_attempt_description(&marker_path, &existing)))
+                Err(eyre!(
+                    "{}",
+                    apply_attempt_description(state_path, &marker_path, &existing)
+                ))
             }
         }
         Err(e) => Err(e).wrap_err_with(|| {
@@ -789,6 +796,23 @@ pub fn finish_apply_attempt(state_path: &Path) -> Result<()> {
             )
         }),
     }
+}
+
+pub fn clear_apply_attempt(state_path: &Path) -> Result<()> {
+    let marker_path = apply_attempt_path(state_path)?;
+    let marker = fs::read_to_string(&marker_path).wrap_err_with(|| {
+        format!(
+            "unable to read apply recovery marker {}",
+            marker_path.display()
+        )
+    })?;
+    if !marker.starts_with("duet-apply-attempt-v1\n") {
+        return Err(eyre!(
+            "refusing to remove malformed apply recovery marker {}",
+            marker_path.display()
+        ));
+    }
+    finish_apply_attempt(state_path)
 }
 
 fn apply_attempt_path(state_path: &Path) -> Result<PathBuf> {
@@ -1001,16 +1025,16 @@ fn committed_steps_from_marker(marker: &str) -> Vec<String> {
         .collect()
 }
 
-fn apply_attempt_description(marker_path: &Path, marker: &str) -> String {
+fn apply_attempt_description(state_path: &Path, marker_path: &Path, marker: &str) -> String {
     format!(
         "previous Duet apply attempt did not finish: {}\n{}\nRecovery marker contents:\n{}",
         marker_path.display(),
-        apply_attempt_recovery_advice(marker_path, marker),
+        apply_attempt_recovery_advice(state_path, marker_path, marker),
         marker.trim_end()
     )
 }
 
-fn apply_attempt_recovery_advice(marker_path: &Path, marker: &str) -> String {
+fn apply_attempt_recovery_advice(state_path: &Path, marker_path: &Path, marker: &str) -> String {
     let marker = parse_apply_attempt_marker(marker);
     let mut advice = if marker.phase.as_deref() == Some("state-save") {
         "Recovery: filesystem changes were applied, but Duet state may not have been saved on this side. Fix state-storage permissions if needed, inspect the listed paths if needed, then remove only this marker and rerun Duet before making unrelated changes."
@@ -1021,7 +1045,9 @@ fn apply_attempt_recovery_advice(marker_path: &Path, marker: &str) -> String {
     };
 
     advice.push_str(&format!(
-        " Marker to remove after inspection: rm {}.",
+        " Inspect this marker with `duet --recover {}`. After inspection, remove it with `duet --recover --clear {}` or manually with `rm {}`.",
+        state_path.display(),
+        state_path.display(),
         marker_path.display()
     ));
 
@@ -3659,7 +3685,8 @@ mod tests {
         let error = check_apply_attempt_clear(&state).unwrap_err().to_string();
 
         assert!(error.contains("previous Duet apply attempt did not finish"));
-        assert!(error.contains("Marker to remove after inspection: rm "));
+        assert!(error.contains("Inspect this marker with `duet --recover "));
+        assert!(error.contains("duet --recover --clear "));
         assert!(error.contains("Recovery marker contents:"));
         assert!(error.contains("side: local"));
         assert!(error.contains("phase: apply"));
@@ -3698,13 +3725,24 @@ mod tests {
     fn apply_attempt_recovery_advice_uses_operation_summaries() {
         let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\nunstaged-operation: remove-file old.txt\nstaged-file: /tmp/.duet-part-test\ncommitted-step: rename-file contents.txt\ncommitted-operation: modify-file contents.txt\n";
 
-        let advice = apply_attempt_recovery_advice(Path::new("/tmp/profile.snp.duet-apply"), marker);
+        let advice = apply_attempt_recovery_advice(
+            Path::new("/tmp/profile.snp"),
+            Path::new("/tmp/.profile.snp.duet-apply"),
+            marker,
+        );
 
         assert!(
-            advice.contains("Marker to remove after inspection: rm /tmp/profile.snp.duet-apply"),
+            advice.contains("Inspect this marker with `duet --recover /tmp/profile.snp`"),
             "{}",
             advice
         );
+        assert!(
+            advice.contains("duet --recover --clear /tmp/profile.snp"),
+            "{}",
+            advice
+        );
+
+        assert!(advice.contains("rm /tmp/.profile.snp.duet-apply"));
         assert!(advice.contains("Removed or replaced paths"), "{}", advice);
         assert!(advice.contains("Metadata operations"), "{}", advice);
         assert!(

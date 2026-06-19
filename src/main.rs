@@ -41,7 +41,11 @@ pub async fn main() -> Result<()> {
         }
         Command::Info { profile } => return commands::info(profile),
         Command::Walk { path } => return commands::walk(path).await,
-        Command::Recover { statefile } => return commands::recover(statefile),
+        Command::Recover {
+            statefile,
+            clear,
+            yes,
+        } => return commands::recover(statefile, clear, yes),
         Command::Sync {
             profile,
             path,

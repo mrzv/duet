@@ -10,6 +10,7 @@ changes from that state.
 USAGE:
     duet [FLAGS] <profile> [path]
     duet [FLAGS] --profile-file <file> [path]
+    duet --recover [--clear] [--yes] <statefile>
 
 FLAGS:
     -i, --interactive   interactive conflict resolution
@@ -30,6 +31,14 @@ FLAGS:
         --version       prints version information
         --license       prints license information (including dependencies)
     -h, --help          prints help information
+
+RECOVERY:
+    --recover <statefile>
+        inspect an unfinished apply marker for a state file
+    --recover --clear <statefile>
+        inspect and then interactively remove the marker after manual recovery
+    --recover --clear --yes <statefile>
+        remove the marker without prompting after manual recovery
 
 ARGS:
     <profile>    profile to synchronize
@@ -81,6 +90,17 @@ Permission failures are treated as sync errors. Duet fails fast rather than
 silently skipping unreadable or unwritable paths, because skipping a path can be
 mistaken for a deletion or a legitimate update. Fix the reported permission
 problem and rerun the sync.
+
+## Recovery
+
+If Duet stops after applying filesystem changes but before saving state, it
+leaves an apply recovery marker next to the affected state file and blocks the
+next sync. Run `duet --recover <statefile>` to inspect the marker, including the
+side, phase, affected paths, staged temporary files, and committed operations.
+After you have inspected both sides and reconciled any partial changes, run
+`duet --recover --clear <statefile>` to remove the marker and allow syncs to
+resume. Use `--yes` with `--clear` only for non-interactive cleanup after that
+manual inspection.
 
 ## Caveat
 
