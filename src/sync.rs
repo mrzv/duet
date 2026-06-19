@@ -1744,6 +1744,38 @@ impl TempOutput {
         Ok(())
     }
 
+    fn finish_without_replacing(mut self, description: &str) -> Result<()> {
+        self.flush()?;
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| eyre!("temporary output is closed"))?;
+        drop(file);
+        match fs::hard_link(&self.temp_path, &self.final_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(eyre!(
+                    "{} {} already exists",
+                    description,
+                    self.final_path.display()
+                ));
+            }
+            Err(err) => {
+                return Err(err).wrap_err_with(|| {
+                    format!(
+                        "failed to link temporary file {} to {}",
+                        self.temp_path.display(),
+                        self.final_path.display()
+                    )
+                });
+            }
+        }
+        fs::remove_file(&self.temp_path).wrap_err_with(|| {
+            format!("failed to remove temporary file {}", self.temp_path.display())
+        })?;
+        Ok(())
+    }
+
     fn temp_path(&self) -> &Path {
         &self.temp_path
     }
@@ -2146,6 +2178,7 @@ impl DetailApplier {
                 Change::Removed(e) => {
                     let filename = safe_join(&self.base, e.path())?;
                     if !e.is_dir() {
+                        verify_current_matches_entry(&filename, e, "remove target")?;
                         fs::remove_file(&filename)?;
                         record_committed_step(
                             self.attempt_state.as_deref(),
@@ -2190,6 +2223,8 @@ impl DetailApplier {
                                     "missing diff detail for {}",
                                     e2.path().display()
                                 ));
+                            } else {
+                                verify_current_matches_entry(&filename, e1, "metadata target")?;
                             }
                             self.new_entries.push(update_meta(&filename, e2)?);
                             record_committed_step(
@@ -2198,6 +2233,7 @@ impl DetailApplier {
                                 e2.path(),
                             )?;
                         } else {
+                            verify_current_matches_entry(&filename, e1, "replace target")?;
                             fs::remove_file(&filename)?;
                             record_committed_step(
                                 self.attempt_state.as_deref(),
@@ -2235,6 +2271,7 @@ impl DetailApplier {
                         if e2.is_file() {
                             return Err(eyre!("missing file detail for {}", e2.path().display()));
                         }
+                        verify_current_matches_entry(&filename, e1, "replace target")?;
                         fs::remove_file(&filename)?;
                         record_committed_step(
                             self.attempt_state.as_deref(),
@@ -2353,7 +2390,12 @@ impl DetailApplier {
         let filename = safe_join(&self.base, entry.path())?;
         output.flush()?;
         verify_file_matches_entry(output.temp_path(), entry, "file output")?;
-        output.finish()?;
+        if let Some(old_entry) = replacement_old_entry(&self.actions[action_index]) {
+            verify_current_matches_entry(&filename, old_entry, "rename target")?;
+            output.finish()?;
+        } else {
+            output.finish_without_replacing("rename target")?;
+        }
         self.recorder
             .record_committed_step("rename-file", entry.path())?;
         self.new_entries.push(update_meta(&filename, entry)?);
@@ -2375,6 +2417,7 @@ impl DetailApplier {
                     match change {
                         Change::Removed(e) => {
                             let dirname = safe_join(&self.base, e.path())?;
+                            verify_current_matches_entry(&dirname, e, "remove target")?;
                             fs::remove_dir(&dirname)?;
                             record_committed_step(
                                 self.attempt_state.as_deref(),
@@ -2397,6 +2440,9 @@ impl DetailApplier {
                                 return Err(eyre!(
                                     "streaming directory-to-file changes is not supported"
                                 ));
+                            }
+                            if e1.is_dir() && e2.is_dir() {
+                                verify_current_matches_entry(&dirname, e1, "metadata target")?;
                             }
                             self.new_entries.push(update_meta(&dirname, e2)?);
                             record_committed_step(
@@ -2449,6 +2495,14 @@ fn detail_filename(base: &Path, action: &Action) -> Result<PathBuf> {
         | Action::Local(Change::Modified(_, e))
         | Action::ResolvedLocal((_, _), Change::Modified(_, e)) => safe_join(base, e.path()),
         _ => Err(eyre!("action has no detail filename")),
+    }
+}
+
+fn replacement_old_entry(action: &Action) -> Option<&Entry> {
+    match action {
+        Action::Local(Change::Modified(e, _))
+        | Action::ResolvedLocal((_, _), Change::Modified(e, _)) => Some(e),
+        _ => None,
     }
 }
 
@@ -2537,6 +2591,7 @@ pub fn apply_detailed_changes(
                         let filename = safe_join(base, e.path())?;
                         log::debug!("Removing {:?}", filename);
                         if !e.is_dir() {
+                            verify_current_matches_entry(&filename, e, "remove target")?;
                             fs::remove_file(&filename).wrap_err_with(|| {
                                 format!("failed to remove file {}", filename.display())
                             })?;
@@ -2596,6 +2651,12 @@ pub fn apply_detailed_changes(
                                         ))
                                         }
                                     }
+                                } else {
+                                    verify_current_matches_entry(
+                                        &filename,
+                                        e1,
+                                        "metadata target",
+                                    )?;
                                 }
                                 new_entries.push(update_meta(&filename, e2)?);
                                 record_committed_step(
@@ -2606,6 +2667,7 @@ pub fn apply_detailed_changes(
                             } else {
                                 // e2 not a file
                                 // remove the file
+                                verify_current_matches_entry(&filename, e1, "replace target")?;
                                 fs::remove_file(&filename).wrap_err_with(|| {
                                     format!("failed to remove file {}", filename.display())
                                 })?;
@@ -2643,6 +2705,7 @@ pub fn apply_detailed_changes(
                             }
                         } else if e1.is_symlink() {
                             // remove the symlink
+                            verify_current_matches_entry(&filename, e1, "replace target")?;
                             fs::remove_file(&filename).wrap_err_with(|| {
                                 format!("failed to remove file {}", filename.display())
                             })?;
@@ -2740,6 +2803,7 @@ pub fn apply_detailed_changes(
                 match change {
                     Change::Removed(e) => {
                         let dirname = safe_join(base, e.path())?;
+                        verify_current_matches_entry(&dirname, e, "remove target")?;
                         fs::remove_dir(&dirname).wrap_err_with(|| {
                             format!("failed to remove directory {}", dirname.display())
                         })?;
@@ -2753,6 +2817,7 @@ pub fn apply_detailed_changes(
                     Change::Modified(e1, e2) => {
                         let dirname = safe_join(base, e2.path())?;
                         if e1.is_dir() && !e2.is_dir() {
+                            verify_current_matches_entry(&dirname, e1, "replace target")?;
                             fs::remove_dir(&dirname).wrap_err_with(|| {
                                 format!("failed to remove directory {}", dirname.display())
                             })?;
@@ -2776,6 +2841,9 @@ pub fn apply_detailed_changes(
                                 })?;
                                 create_file(&dirname, detail, e2, attempt_state)?;
                             }
+                        }
+                        if e1.is_dir() && e2.is_dir() {
+                            verify_current_matches_entry(&dirname, e1, "metadata target")?;
                         }
                         new_entries.push(update_meta(&dirname, e2)?);
                         record_committed_step(attempt_state, "update-metadata", e2.path())?;
@@ -2849,7 +2917,7 @@ fn create_file_with_contents(
         .wrap_err_with(|| format!("failed to write temporary file for {}", filename.display()))?;
     output.flush()?;
     verify_file_matches_entry(output.temp_path(), entry, "file output")?;
-    output.finish()?;
+    output.finish_without_replacing("rename target")?;
     record_committed_step(attempt_state, "rename-file", filename)?;
     Ok(())
 }
@@ -2891,6 +2959,69 @@ fn verify_file_matches_entry(filename: &Path, entry: &Entry, description: &str) 
     Ok(())
 }
 
+fn verify_current_matches_entry(filename: &Path, entry: &Entry, description: &str) -> Result<()> {
+    let meta = fs::symlink_metadata(filename)
+        .wrap_err_with(|| format!("failed to read metadata for {}", filename.display()))?;
+
+    if entry.is_file() {
+        verify_file_matches_entry(filename, entry, description)?;
+    } else if entry.is_dir() {
+        if !meta.is_dir() {
+            return Err(eyre!(
+                "{} {} is not a directory",
+                description,
+                entry.path().display()
+            ));
+        }
+    } else if entry.is_symlink() {
+        if !meta.file_type().is_symlink() {
+            return Err(eyre!(
+                "{} {} is not a symlink",
+                description,
+                entry.path().display()
+            ));
+        }
+        let target = fs::read_link(filename)
+            .wrap_err_with(|| format!("failed to read symlink {}", filename.display()))?;
+        if Some(&target) != entry.target().as_ref() {
+            return Err(eyre!(
+                "{} {} symlink target mismatch: expected {}, got {}",
+                description,
+                entry.path().display(),
+                entry
+                    .target()
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                target.display()
+            ));
+        }
+    } else {
+        return Err(eyre!("unsupported entry for {}", entry.path().display()));
+    }
+
+    if synced_mode(meta.mode()) != synced_mode(entry.mode()) {
+        return Err(eyre!(
+            "{} {} mode mismatch: expected {:o}, got {:o}",
+            description,
+            entry.path().display(),
+            synced_mode(entry.mode()),
+            synced_mode(meta.mode())
+        ));
+    }
+    if !entry.is_dir() && meta.mtime() != entry.mtime() {
+        return Err(eyre!(
+            "{} {} mtime mismatch: expected {}, got {}",
+            description,
+            entry.path().display(),
+            entry.mtime(),
+            meta.mtime()
+        ));
+    }
+
+    Ok(())
+}
+
 fn update_file_with_diff(
     filename: &Path,
     old_entry: &Entry,
@@ -2912,6 +3043,7 @@ fn update_file_with_diff(
         .wrap_err_with(|| format!("failed to restore diff for {}", filename.display()))?;
     output.flush()?;
     verify_file_matches_entry(output.temp_path(), new_entry, "diff output")?;
+    verify_current_matches_entry(filename, old_entry, "rename target")?;
     output.finish()?;
     record_committed_step(attempt_state, "rename-file", filename)?;
     Ok(())
@@ -2946,6 +3078,7 @@ mod tests {
     use super::*;
     use crate::rustsync::Block;
     use rand::{RngCore, SeedableRng};
+    use std::os::unix::fs::PermissionsExt;
 
     fn test_file_entry(path: &str, contents: &[u8]) -> Entry {
         Entry::test_file_with_size(
@@ -2953,6 +3086,12 @@ mod tests {
             contents.len() as u64,
             adler32::adler32(contents).unwrap(),
         )
+    }
+
+    fn synced_existing_file_entry(base: &Path, path: &str, contents: &[u8]) -> Entry {
+        let filename = base.join(path);
+        fs::write(&filename, contents).unwrap();
+        update_meta(&filename, &test_file_entry(path, contents)).unwrap()
     }
 
     #[test]
@@ -3065,6 +3204,130 @@ mod tests {
 
         assert!(error.contains("diff output"), "{}", error);
         assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn apply_rechecks_removed_file_before_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let old = synced_existing_file_entry(&base, "file.txt", b"old");
+        fs::write(base.join("file.txt"), b"bad").unwrap();
+        let actions = vec![Action::Local(Change::Removed(old.clone()))];
+        let mut all_old = vec![old];
+
+        let error = apply_detailed_changes(&base, &actions, &Vec::new(), &mut all_old, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("remove target"), "{}", error);
+        assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"bad");
+    }
+
+    #[test]
+    fn apply_rechecks_added_file_destination_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("file.txt"), b"race").unwrap();
+        let entry = test_file_entry("file.txt", b"new");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        let details = vec![ChangeDetails::Contents(b"new".to_vec())];
+        let mut all_old = Vec::new();
+
+        let error = apply_detailed_changes(&base, &actions, &details, &mut all_old, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("rename target"), "{}", error);
+        assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"race");
+    }
+
+    #[test]
+    fn apply_rechecks_directory_metadata_target_before_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let dirname = base.join("dir");
+        fs::create_dir(&dirname).unwrap();
+        let old = update_meta(&dirname, &Entry::test_dir(PathBuf::from("dir"))).unwrap();
+        let new = old.clone();
+        let mut perms = fs::metadata(&dirname).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&dirname, perms).unwrap();
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let mut all_old = vec![old];
+
+        let error = apply_detailed_changes(&base, &actions, &Vec::new(), &mut all_old, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("metadata target"), "{}", error);
+        assert_eq!(fs::metadata(&dirname).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn streaming_diff_rechecks_destination_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let old = synced_existing_file_entry(&base, "file.txt", b"old");
+        let new = test_file_entry("file.txt", b"new!");
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let mut applier = DetailApplier::new_with_attempt(base.clone(), actions, vec![old], None);
+
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffBegin,
+            })
+            .unwrap();
+        fs::write(base.join("file.txt"), b"race").unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffBytes(b"new!".to_vec()),
+            })
+            .unwrap();
+        let error = applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffEnd,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("rename target"), "{}", error);
+        assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"race");
+    }
+
+    #[test]
+    fn streaming_file_rechecks_added_destination_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::write(base.join("file.txt"), b"race").unwrap();
+        let entry = test_file_entry("file.txt", b"new");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        let mut applier = DetailApplier::new_with_attempt(base.clone(), actions, Vec::new(), None);
+
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBytes(b"new".to_vec()),
+            })
+            .unwrap();
+        let error = applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileEnd,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("rename target"), "{}", error);
+        assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"race");
     }
 
     #[test]
