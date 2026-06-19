@@ -35,7 +35,7 @@ const TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS: &str =
 const POST_PREFLIGHT_RECOVERY_ADVICE: &str = "Recovery: filesystem changes may have been partially applied, but Duet state was not saved. Fix the reported problem, inspect both sides if needed, then rerun duet. If conflicts appear, resolve them manually.";
 const STATE_SAVE_RECOVERY_ADVICE: &str = "Recovery: filesystem changes were applied, but Duet state was not saved on both sides. Fix state storage permissions, then rerun duet before making unrelated changes.";
 const MAX_NON_STREAMED_DETAIL_BYTES: u64 = 64 * 1024 * 1024;
-const FILE_BYTE_CHUNK_RPC_THRESHOLD: usize = 64 * 1024;
+const FILE_BYTE_CHUNK_RPC_THRESHOLD: usize = 8 * 1024 * 1024;
 
 struct SyncContext {
     profile: profile::Profile,
@@ -1477,6 +1477,23 @@ mod tests {
         assert!(should_apply_file_bytes_as_chunk(
             FILE_BYTE_CHUNK_RPC_THRESHOLD
         ));
+    }
+
+    #[test]
+    fn medium_file_byte_frame_sizes_route_around_threshold() {
+        let cases = [
+            (1 * 1024, false),
+            (16 * 1024, false),
+            (63 * 1024, false),
+            (64 * 1024, false),
+            (128 * 1024, false),
+            (1024 * 1024, false),
+            (8 * 1024 * 1024, true),
+        ];
+
+        for (len, expected_chunk) in cases {
+            assert_eq!(should_apply_file_bytes_as_chunk(len), expected_chunk);
+        }
     }
 
     #[test]

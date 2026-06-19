@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixed
-- Batched small streamed file-byte frames over SSH to avoid one apply RPC per small file while preserving the dedicated large-file transfer path.
+- Batched small and medium streamed file-byte frames over SSH to avoid one apply RPC per file while preserving the dedicated large-file transfer path.
 
 ## 0.8.7 - 2026-06-18
 
