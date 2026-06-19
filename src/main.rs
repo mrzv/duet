@@ -29,7 +29,7 @@ pub async fn main() -> Result<()> {
 
     match cli::parse_from_env()? {
         Command::Help => commands::show_help(),
-        Command::Version => commands::version(),
+        Command::Version { verbose } => commands::version(verbose),
         Command::License => commands::license(),
         Command::Server => return rpc::server().await,
         Command::Snapshot { profile, statefile } => {

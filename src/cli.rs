@@ -20,7 +20,7 @@ pub struct SyncOptions {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
-    Version,
+    Version { verbose: bool },
     License,
     Server,
     Snapshot {
@@ -63,8 +63,9 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
     }
 
     if pargs.contains("--version") {
+        let verbose = pargs.contains(["-v", "--verbose"]);
         ensure_no_args(pargs)?;
-        return Ok(Command::Version);
+        return Ok(Command::Version { verbose });
     }
 
     if pargs.contains("--license") {
@@ -245,7 +246,18 @@ mod tests {
     #[test]
     fn parses_global_commands() {
         assert_eq!(parse_args(&["--help"]), Command::Help);
-        assert_eq!(parse_args(&["--version"]), Command::Version);
+        assert_eq!(
+            parse_args(&["--version"]),
+            Command::Version { verbose: false }
+        );
+        assert_eq!(
+            parse_args(&["--version", "--verbose"]),
+            Command::Version { verbose: true }
+        );
+        assert_eq!(
+            parse_args(&["-v", "--version"]),
+            Command::Version { verbose: true }
+        );
         assert_eq!(parse_args(&["--license"]), Command::License);
         assert_eq!(parse_args(&["--server"]), Command::Server);
     }

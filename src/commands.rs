@@ -61,14 +61,16 @@ ARGS:
     );
 }
 
-pub(crate) fn version() {
+pub(crate) fn version(verbose: bool) {
     println!(
         "duet {}{}",
         built_info::PKG_VERSION,
         option_env!("DUET_VERSION_SUFFIX").unwrap_or("")
     );
-    for (name, version) in built_info::DEPENDENCIES {
-        println!("  {} {}", name, version);
+    if verbose {
+        for (name, version) in built_info::DEPENDENCIES {
+            println!("  {} {}", name, version);
+        }
     }
 }
 
