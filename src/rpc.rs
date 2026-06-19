@@ -133,6 +133,8 @@ pub trait DuetServer {
 struct DuetServerImpl {
     base: PathBuf,
     remote_id: String,
+    changes_ready: bool,
+    actions_ready: bool,
     remote_state_dir: PathBuf,
     all_old: Entries,
     actions: Actions,
@@ -149,6 +151,8 @@ impl DuetServerImpl {
         Ok(DuetServerImpl {
             base: PathBuf::from(""),
             remote_id: "".to_string(),
+            changes_ready: false,
+            actions_ready: false,
             remote_state_dir: profile::remote_state_dir()?,
             all_old: Vec::new(),
             actions: Vec::new(),
@@ -175,6 +179,48 @@ impl DuetServerImpl {
 
     fn apply_attempt_id(&self) -> Option<&str> {
         self.apply_attempt_id.as_deref()
+    }
+
+    fn reset_changes_context(&mut self) {
+        self.changes_ready = false;
+        self.all_old.clear();
+        self.reset_actions_context();
+    }
+
+    fn reset_actions_context(&mut self) {
+        self.actions_ready = false;
+        self.actions.clear();
+        self.apply_attempt_id = None;
+        self.detail_streams.clear();
+        self.apply_streams.clear();
+        self.stream_performance = RemoteStreamProfile::default();
+    }
+
+    fn initialized_remote_state(&self, operation: &str) -> Result<PathBuf, RPCError> {
+        if !self.changes_ready {
+            return Err(rpc_error(
+                operation,
+                Some(&self.base),
+                "changes must be requested before applying changes",
+            ));
+        }
+        profile::validate_remote_state_id(&self.remote_id)
+            .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
+        Ok(profile::remote_state_in(
+            &self.remote_state_dir,
+            &self.remote_id,
+        ))
+    }
+
+    fn accepted_actions(&self, operation: &str) -> Result<(), RPCError> {
+        if !self.actions_ready {
+            return Err(rpc_error(
+                operation,
+                Some(&self.base),
+                "actions must be set before applying changes",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -215,21 +261,24 @@ impl DuetServer for DuetServerImpl {
             Ok(s) => s,
             Err(e) => return Err(rpc_report_error("set base", Some(Path::new(&base)), e)),
         };
+        self.reset_changes_context();
         log::debug!("Set base {}", self.base.display());
         Ok(())
     }
 
     fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError> {
         log::debug!("Setting {} actions", actions.len());
+        self.reset_actions_context();
         sync::validate_actions(&actions)
             .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
-        self.actions = actions;
-        self.stream_performance = RemoteStreamProfile::default();
-        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        let remote_state = self.initialized_remote_state("set actions")?;
         sync::preflight_state_save(&remote_state)
             .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
-        sync::preflight_apply(&self.base, &self.actions)
+        sync::preflight_apply(&self.base, &actions)
             .map_err(|e| rpc_report_error("preflight apply", Some(&self.base), e))?;
+        self.actions = actions;
+        self.actions_ready = true;
+        self.stream_performance = RemoteStreamProfile::default();
         Ok(())
     }
 
@@ -248,7 +297,7 @@ impl DuetServer for DuetServerImpl {
         profile::validate_remote_state_id(&remote_id)
             .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
         self.remote_id = remote_id;
-        self.apply_attempt_id = None;
+        self.reset_changes_context();
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         sync::check_apply_attempt_clear(&remote_state)
             .map_err(|e| rpc_report_error("check apply recovery", Some(&remote_state), e))?;
@@ -268,6 +317,7 @@ impl DuetServer for DuetServerImpl {
         match result {
             Ok((all_old, changes)) => {
                 self.all_old = all_old;
+                self.changes_ready = true;
                 Ok(changes)
             }
             Err(e) => Err(rpc_report_error(
@@ -312,9 +362,10 @@ impl DuetServer for DuetServerImpl {
 
     fn apply_detailed_changes(&mut self, details: Vec<ChangeDetails>) -> Result<(), RPCError> {
         log::debug!("Appling detailed changes, with {} details", details.len());
+        let remote_state = self.initialized_remote_state("apply details")?;
+        self.accepted_actions("apply details")?;
         sync::preflight_apply(&self.base, &self.actions)
             .map_err(|e| rpc_report_error("preflight apply details", Some(&self.base), e))?;
-        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         sync::start_apply_attempt(
             "remote",
             &remote_state,
@@ -350,8 +401,8 @@ impl DuetServer for DuetServerImpl {
 
     fn save_state(&self) -> Result<(), RPCError> {
         log::debug!("Saving state");
-        profile::validate_remote_state_id(&self.remote_id)
-            .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
+        let remote_state = self.initialized_remote_state("save state")?;
+        self.accepted_actions("save state")?;
         sync::validate_entries("remote state", &self.all_old)
             .map_err(|e| rpc_report_error("validate remote state", Some(&self.base), e))?;
         std::fs::create_dir_all(&self.remote_state_dir).map_err(|e| {
@@ -361,7 +412,6 @@ impl DuetServer for DuetServerImpl {
                 e,
             )
         })?;
-        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         log::info!(
             "Saving remote state {} with {} entries",
             remote_state.display(),
@@ -391,6 +441,7 @@ impl DuetServer for DuetServerImpl {
     fn set_remote_state_dir(&mut self, remote_state_dir: PathBuf) -> Result<(), RPCError> {
         log::debug!("Set remote state dir {}", remote_state_dir.display());
         self.remote_state_dir = remote_state_dir;
+        self.reset_changes_context();
         Ok(())
     }
 
@@ -449,9 +500,10 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn begin_apply_stream(&mut self) -> Result<ApplyStreamId, RPCError> {
+        let remote_state = self.initialized_remote_state("begin apply stream")?;
+        self.accepted_actions("begin apply stream")?;
         sync::preflight_apply(&self.base, &self.actions)
             .map_err(|e| rpc_report_error("preflight apply stream", Some(&self.base), e))?;
-        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         sync::start_apply_attempt(
             "remote",
             &remote_state,
@@ -563,10 +615,12 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn prepare_apply_attempt(&mut self) -> Result<(), RPCError> {
-        self.apply_attempt_id = None;
-        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        let remote_state = self.initialized_remote_state("prepare apply recovery")?;
+        self.accepted_actions("prepare apply recovery")?;
         sync::start_apply_attempt("remote", &remote_state, &self.base, &self.actions, None)
-            .map_err(|e| rpc_report_error("prepare apply recovery", Some(&remote_state), e))
+            .map_err(|e| rpc_report_error("prepare apply recovery", Some(&remote_state), e))?;
+        self.apply_attempt_id = None;
+        Ok(())
     }
 
     fn prepare_apply_attempt_with_id(&mut self, attempt_id: String) -> Result<(), RPCError> {
@@ -577,16 +631,18 @@ impl DuetServer for DuetServerImpl {
                 "apply attempt id is empty",
             ));
         }
-        self.apply_attempt_id = Some(attempt_id);
-        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        let remote_state = self.initialized_remote_state("prepare apply recovery")?;
+        self.accepted_actions("prepare apply recovery")?;
         sync::start_apply_attempt(
             "remote",
             &remote_state,
             &self.base,
             &self.actions,
-            self.apply_attempt_id(),
+            Some(attempt_id.as_str()),
         )
-        .map_err(|e| rpc_report_error("prepare apply recovery", Some(&remote_state), e))
+        .map_err(|e| rpc_report_error("prepare apply recovery", Some(&remote_state), e))?;
+        self.apply_attempt_id = Some(attempt_id);
+        Ok(())
     }
 
     fn negotiate_sync_tuning(
@@ -719,6 +775,7 @@ pub async fn server() -> Result<()> {
 mod tests {
     use super::*;
     use crate::actions::Action;
+    use crate::scan::{self, Change};
     use essrpc::RPCClient;
     use std::sync::{Arc, Mutex};
 
@@ -896,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_apply_attempt_with_id_writes_marker_id() {
+    fn apply_entrypoints_require_successful_changes_call() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         std::fs::create_dir(&base).unwrap();
@@ -905,7 +962,130 @@ mod tests {
         server.base = base;
         server.remote_id = "remote-peer".to_string();
         server.remote_state_dir = dir.path().join("state");
+
+        let actions = vec![Action::Local(Change::Added(
+            scan::DirEntryWithMeta::test_file(PathBuf::from("a.txt"), 0),
+        ))];
+        let error = server.set_actions(actions).unwrap_err().to_string();
+        assert!(error.contains("changes must be requested"), "{}", error);
+        assert!(server.actions.is_empty());
+
+        let error = server
+            .prepare_apply_attempt_with_id("attempt-1".to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changes must be requested"), "{}", error);
+        assert!(server.apply_attempt_id.is_none());
+
+        let error = server.apply_detailed_changes(Vec::new()).unwrap_err().to_string();
+        assert!(error.contains("changes must be requested"), "{}", error);
+
+        let error = server.begin_apply_stream().unwrap_err().to_string();
+        assert!(error.contains("changes must be requested"), "{}", error);
+
+        let error = server.save_state().unwrap_err().to_string();
+        assert!(error.contains("changes must be requested"), "{}", error);
+    }
+
+    #[test]
+    fn base_and_state_dir_changes_invalidate_scan_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let other_base = dir.path().join("other-base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&other_base).unwrap();
+
+        let mut server = DuetServerImpl::new().unwrap();
+        server.base = base;
+        server.remote_id = "remote-peer".to_string();
+        server.changes_ready = true;
+        server.all_old = vec![scan::DirEntryWithMeta::test_file(PathBuf::from("a.txt"), 0)];
+        server.actions = vec![Action::Local(Change::Removed(
+            scan::DirEntryWithMeta::test_file(PathBuf::from("a.txt"), 0),
+        ))];
+
+        server.set_base(other_base.to_string_lossy().into()).unwrap();
+
+        assert!(!server.changes_ready);
+        assert!(!server.actions_ready);
+        assert!(server.all_old.is_empty());
+        assert!(server.actions.is_empty());
+
+        server.changes_ready = true;
+        server.all_old = vec![scan::DirEntryWithMeta::test_file(PathBuf::from("b.txt"), 0)];
+        server.actions = vec![Action::Local(Change::Removed(
+            scan::DirEntryWithMeta::test_file(PathBuf::from("b.txt"), 0),
+        ))];
+
+        server.set_remote_state_dir(dir.path().join("state")).unwrap();
+
+        assert!(!server.changes_ready);
+        assert!(!server.actions_ready);
+        assert!(server.all_old.is_empty());
+        assert!(server.actions.is_empty());
+    }
+
+    #[test]
+    fn apply_entrypoints_require_actions_for_current_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+
+        let mut server = DuetServerImpl::new().unwrap();
+        server.base = base;
+        server.remote_id = "remote-peer".to_string();
+        server.changes_ready = true;
+        server.remote_state_dir = dir.path().join("state");
+
+        let error = server.apply_detailed_changes(Vec::new()).unwrap_err().to_string();
+        assert!(error.contains("actions must be set"), "{}", error);
+
+        let error = server.begin_apply_stream().unwrap_err().to_string();
+        assert!(error.contains("actions must be set"), "{}", error);
+
+        let error = server.save_state().unwrap_err().to_string();
+        assert!(error.contains("actions must be set"), "{}", error);
+    }
+
+    #[test]
+    fn set_actions_does_not_store_actions_when_preflight_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state_file = dir.path().join("not-a-directory");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(&state_file, b"file").unwrap();
+
+        let mut server = DuetServerImpl::new().unwrap();
+        server.base = base;
+        server.remote_id = "remote-peer".to_string();
+        server.changes_ready = true;
+        server.remote_state_dir = state_file;
+        server.actions = vec![Action::Local(Change::Removed(
+            scan::DirEntryWithMeta::test_file(PathBuf::from("old.txt"), 0),
+        ))];
+        server.actions_ready = true;
+        let actions = vec![Action::Local(Change::Added(
+            scan::DirEntryWithMeta::test_file(PathBuf::from("a.txt"), 0),
+        ))];
+
+        assert!(server.set_actions(actions).is_err());
+        assert!(server.actions.is_empty());
+        assert!(!server.actions_ready);
+    }
+
+    #[test]
+    fn prepare_apply_attempt_with_id_writes_marker_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+
+        let mut server = DuetServerImpl::new().unwrap();
+        server.base = base;
+        server.remote_id = "remote-peer".to_string();
+        server.changes_ready = true;
+        server.remote_state_dir = dir.path().join("state");
         server.actions = Vec::<Action>::new();
+        server.actions_ready = true;
 
         server
             .prepare_apply_attempt_with_id("attempt-1".to_string())
