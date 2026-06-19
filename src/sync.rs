@@ -2523,23 +2523,15 @@ fn copy_from_source(
 ) -> Result<()> {
     source.seek(SeekFrom::Start(offset))?;
     let mut remaining = len;
-    let mut copied = 0u64;
     let mut buf = vec![0; COPY_BUFFER_BYTES];
     while remaining > 0 {
         let want = std::cmp::min(remaining as usize, buf.len());
         let n = source.read(&mut buf[..want])?;
         if n == 0 {
-            if copied == 0 {
-                return Err(eyre!(
-                    "diff copy at offset {} did not read any source bytes",
-                    offset
-                ));
-            }
             break;
         }
         output.write_all(&buf[..n])?;
         remaining -= n as u64;
-        copied += n as u64;
     }
     Ok(())
 }
@@ -3295,6 +3287,45 @@ mod tests {
 
         assert!(error.contains("rename target"), "{}", error);
         assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"race");
+    }
+
+    #[test]
+    fn streaming_diff_allows_empty_source_copy_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let old = synced_existing_file_entry(&base, "file.txt", b"");
+        let new = test_file_entry("file.txt", b"new");
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let mut applier = DetailApplier::new_with_attempt(base.clone(), actions, vec![old], None);
+
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffBegin,
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffBytes(b"new".to_vec()),
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffCopy { offset: 0, len: 4 },
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffEnd,
+            })
+            .unwrap();
+
+        let new_entries = applier.finish().unwrap();
+        assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"new");
+        assert_eq!(new_entries.len(), 1);
     }
 
     #[test]
