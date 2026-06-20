@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.8 - 2026-06-20
+
 ### Fixed
 - Released scanner directory concurrency permits before recursive descent to avoid hanging on deeply nested trees.
 - Reported restricted scans that would cross a filesystem boundary on the way to the requested path instead of treating tracked entries as removed.
