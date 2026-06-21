@@ -3833,6 +3833,10 @@ mod tests {
         update_meta(&filename, &test_file_entry(path, contents)).unwrap()
     }
 
+    fn synced_existing_dir_entry(base: &Path, path: &str) -> Entry {
+        update_meta(&base.join(path), &Entry::test_dir(PathBuf::from(path))).unwrap()
+    }
+
     #[test]
     fn stream_diff_frames_coalesces_adjacent_copy_ops() {
         const WINDOW: usize = LEGACY_SIGNATURE_WINDOW;
@@ -4719,9 +4723,8 @@ mod tests {
         let base = dir.path().to_path_buf();
         fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
         fs::write(base.join("removed/__pycache__/cache.pyc"), b"cache").unwrap();
-        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
-            PathBuf::from("removed"),
-        )))];
+        let old = synced_existing_dir_entry(&base, "removed");
+        let actions = vec![Action::Local(Change::Removed(old.clone()))];
         let policy = ScanPolicy::new(
             vec![
                 Location::Exclude(PathBuf::from(".")),
@@ -4729,7 +4732,7 @@ mod tests {
             ],
             vec!["__pycache__".to_string()],
         );
-        let mut all_old = vec![Entry::test_dir(PathBuf::from("removed"))];
+        let mut all_old = vec![old.clone()];
 
         apply_detailed_changes_with_policy(
             &base,
@@ -4746,6 +4749,106 @@ mod tests {
 
         assert!(!base.join("removed").exists());
         assert!(all_old.is_empty());
+    }
+
+    #[test]
+    fn apply_does_not_prune_ignored_blocker_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+        fs::write(base.join("removed/__pycache__/cache.pyc"), b"cache").unwrap();
+        let old = synced_existing_dir_entry(&base, "removed");
+        let actions = vec![Action::Local(Change::Removed(old.clone()))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            vec!["__pycache__".to_string()],
+        );
+        let mut all_old = vec![old.clone()];
+
+        let error = apply_detailed_changes_with_policy(
+            &base,
+            &actions,
+            &Vec::new(),
+            &mut all_old,
+            None,
+            Some(&policy),
+            ApplyOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("ignored child"), "{}", error);
+        assert!(error.contains("--prune-ignored"), "{}", error);
+        assert!(base.join("removed/__pycache__/cache.pyc").exists());
+        assert!(base.join("removed").exists());
+        assert_eq!(all_old, vec![old]);
+    }
+
+    #[test]
+    fn apply_prunes_profile_prune_blocker_without_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+        fs::write(base.join("removed/__pycache__/cache.pyc"), b"cache").unwrap();
+        let old = synced_existing_dir_entry(&base, "removed");
+        let actions = vec![Action::Local(Change::Removed(old.clone()))];
+        let policy = ScanPolicy::with_prune(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            Vec::new(),
+            vec!["__pycache__".to_string()],
+        );
+        let mut all_old = vec![old];
+
+        apply_detailed_changes_with_policy(
+            &base,
+            &actions,
+            &Vec::new(),
+            &mut all_old,
+            None,
+            Some(&policy),
+            ApplyOptions::default(),
+        )
+        .unwrap();
+
+        assert!(!base.join("removed").exists());
+        assert!(all_old.is_empty());
+    }
+
+    #[test]
+    fn streaming_apply_prunes_profile_prune_blocker_before_directory_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+        fs::write(base.join("removed/__pycache__/cache.pyc"), b"cache").unwrap();
+        let old = synced_existing_dir_entry(&base, "removed");
+        let actions = vec![Action::Local(Change::Removed(old.clone()))];
+        let policy = ScanPolicy::with_prune(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            Vec::new(),
+            vec!["__pycache__".to_string()],
+        );
+        let applier = DetailApplier::new_with_attempt_and_policy(
+            base.clone(),
+            actions,
+            vec![old],
+            None,
+            Some(policy),
+            ApplyOptions::default(),
+        );
+
+        let new_entries = applier.finish().unwrap();
+
+        assert!(!base.join("removed").exists());
+        assert!(new_entries.is_empty());
     }
 
     #[test]
