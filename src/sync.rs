@@ -4408,7 +4408,44 @@ mod tests {
         .unwrap();
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].kind, RemovalBlockerType::Ignored);
+        assert_eq!(report.blockers[0].pattern.as_deref(), Some("__pycache__"));
         assert!(!report.blockers[0].prunable);
+        assert!(report.has_ignored_blockers());
+        assert!(report.has_unprunable_blockers());
+    }
+
+    #[test]
+    fn preflight_report_marks_ignored_blocker_prunable_with_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            vec!["__pycache__".to_string()],
+        );
+
+        let report = preflight_apply_report(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.blockers.len(), 1);
+        assert_eq!(report.blockers[0].kind, RemovalBlockerType::Ignored);
+        assert_eq!(report.blockers[0].pattern.as_deref(), Some("__pycache__"));
+        assert!(report.blockers[0].prunable);
+        assert!(report.has_ignored_blockers());
+        assert!(!report.has_unprunable_blockers());
     }
 
     #[test]
@@ -4437,7 +4474,10 @@ mod tests {
         .unwrap();
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].kind, RemovalBlockerType::Prune);
+        assert_eq!(report.blockers[0].pattern.as_deref(), Some("__pycache__"));
         assert!(report.blockers[0].prunable);
+        assert!(!report.has_ignored_blockers());
+        assert!(!report.has_unprunable_blockers());
         preflight_apply_with_policy(&base, &actions, Some(&policy), ApplyOptions::default())
             .unwrap();
     }
@@ -4470,6 +4510,49 @@ mod tests {
 
         assert!(error.contains("excluded child"), "{}", error);
         assert!(error.contains("outside the sync selection"), "{}", error);
+
+        let report = preflight_apply_report(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.blockers.len(), 1);
+        assert_eq!(report.blockers[0].kind, RemovalBlockerType::Excluded);
+        assert!(!report.blockers[0].prunable);
+        assert!(report.has_unprunable_blockers());
+    }
+
+    #[test]
+    fn preflight_report_is_clear_without_directory_blockers() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let actions = vec![Action::Local(Change::Added(Entry::test_file(
+            PathBuf::from("new.txt"),
+            0,
+        )))];
+
+        let report = preflight_apply_report(&base, &actions, None, ApplyOptions::default())
+            .unwrap();
+
+        assert!(report.is_clear());
+        assert!(!report.has_ignored_blockers());
+        assert!(!report.has_unprunable_blockers());
+    }
+
+    #[test]
+    fn preflight_report_rejects_invalid_prune_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let actions = Vec::new();
+        let policy = ScanPolicy::with_prune(Vec::new(), Vec::new(), vec!["[".to_string()]);
+
+        let error = preflight_apply_report(&base, &actions, Some(&policy), ApplyOptions::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid prune pattern"), "{}", error);
     }
 
     #[test]

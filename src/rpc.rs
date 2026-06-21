@@ -847,6 +847,7 @@ pub async fn server() -> Result<()> {
 mod tests {
     use super::*;
     use crate::actions::Action;
+    use crate::scan::location::Location;
     use crate::scan::{self, Change};
     use essrpc::RPCClient;
     use std::sync::{Arc, Mutex};
@@ -1156,6 +1157,42 @@ mod tests {
         assert!(server.set_actions(actions).is_err());
         assert!(server.actions.is_empty());
         assert!(!server.actions_ready);
+    }
+
+    #[test]
+    fn preflight_report_uses_remote_prune_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+
+        let mut server = DuetServerImpl::new().unwrap();
+        server.base = base;
+        server.remote_id = "remote-peer".to_string();
+        server.remote_state_dir = dir.path().join("state");
+        server.changes_ready = true;
+        server.scan_policy = Some(sync::ScanPolicy::with_prune(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            Vec::new(),
+            Vec::new(),
+        ));
+        server
+            .set_prune_patterns(vec!["__pycache__".to_string()])
+            .unwrap();
+
+        let actions = vec![Action::Local(Change::Removed(
+            scan::DirEntryWithMeta::test_dir(PathBuf::from("removed")),
+        ))];
+        let report = server
+            .preflight_apply_report(actions, sync::ApplyOptions::default())
+            .unwrap();
+
+        assert_eq!(report.blockers.len(), 1);
+        assert_eq!(report.blockers[0].kind, sync::RemovalBlockerType::Prune);
+        assert_eq!(report.blockers[0].pattern.as_deref(), Some("__pycache__"));
+        assert!(report.blockers[0].prunable);
     }
 
     #[test]
