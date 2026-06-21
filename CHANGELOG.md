@@ -12,6 +12,7 @@
 ### Fixed
 - Report ignored and excluded children separately when they block destination directory removal, instead of presenting all blockers as unexpected children.
 - Checked remote `preflight-report-v1` support before starting `duet preflight` scans so older remotes fail fast.
+- Ignored symlink permission bits when rechecking remove/replace targets, matching Duet's existing symlink metadata behavior.
 
 ## 0.8.8 - 2026-06-20
 
