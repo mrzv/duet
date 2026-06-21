@@ -46,6 +46,11 @@ pub enum Command {
         clear: bool,
         yes: bool,
     },
+    Preflight {
+        profile: ProfileSource,
+        path: Option<PathBuf>,
+        options: SyncOptions,
+    },
     Sync {
         profile: ProfileSource,
         path: Option<PathBuf>,
@@ -108,6 +113,15 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         if path_is_recover {
             return Err(eyre!("recover is a subcommand, not a profile-file path"));
         }
+        if path.as_deref() == Some(std::path::Path::new("preflight")) {
+            let path = pargs.opt_free_from_os_str(parse_path)?;
+            ensure_no_args(pargs)?;
+            return Ok(Command::Preflight {
+                profile: ProfileSource::File(profile_file),
+                path,
+                options,
+            });
+        }
         ensure_no_args(pargs)?;
         return Ok(Command::Sync {
             profile: ProfileSource::File(profile_file),
@@ -166,6 +180,11 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
                 yes: options.yes,
             }
         }
+        "preflight" => Command::Preflight {
+            profile: ProfileSource::Named(pargs.free_from_str()?),
+            path: pargs.opt_free_from_os_str(parse_path)?,
+            options,
+        },
         _ => Command::Sync {
             profile: ProfileSource::Named(profile),
             path: pargs.opt_free_from_os_str(parse_path)?,
@@ -245,6 +264,21 @@ mod tests {
         ))
         .unwrap_err()
         .to_string()
+    }
+
+    fn default_options() -> SyncOptions {
+        SyncOptions {
+            interactive: false,
+            yes: false,
+            dry_run: false,
+            batch: false,
+            force: false,
+            verbose: false,
+            debug_info: false,
+            prune_ignored: false,
+            profile_performance: false,
+            profile_performance_json: None,
+        }
     }
 
     #[test]
@@ -369,6 +403,29 @@ mod tests {
                     profile_performance: false,
                     profile_performance_json: None,
                 },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_preflight_command() {
+        let mut options = default_options();
+        options.prune_ignored = true;
+        assert_eq!(
+            parse_args(&["--prune-ignored", "preflight", "work", "docs"]),
+            Command::Preflight {
+                profile: ProfileSource::Named("work".to_string()),
+                path: Some(PathBuf::from("docs")),
+                options,
+            }
+        );
+
+        assert_eq!(
+            parse_args(&["--profile-file", "profile.prf", "preflight", "docs"]),
+            Command::Preflight {
+                profile: ProfileSource::File(PathBuf::from("profile.prf")),
+                path: Some(PathBuf::from("docs")),
+                options: default_options(),
             }
         );
     }

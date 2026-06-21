@@ -46,6 +46,11 @@ pub async fn main() -> Result<()> {
             clear,
             yes,
         } => return commands::recover(statefile, clear, yes),
+        Command::Preflight {
+            profile,
+            path,
+            options,
+        } => return orchestrator::preflight(profile, path, options).await,
         Command::Sync {
             profile,
             path,

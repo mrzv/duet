@@ -19,6 +19,8 @@ bi-directional synchronization
 USAGE:
     duet [FLAGS] <profile> [path]
     duet [FLAGS] --profile-file <file> [path]
+    duet [FLAGS] preflight <profile> [path]
+    duet [FLAGS] --profile-file <file> preflight [path]
     duet recover [--clear] [--yes] <statefile>
 
 FLAGS:
@@ -57,6 +59,10 @@ RECOVERY:
 ARGS:
     <profile>    profile to synchronize
     <path>       path to synchronize
+
+PREFLIGHT:
+    preflight checks what a sync would do, reports directory removal blockers on
+    both sides, and exits without applying changes or saving state.
 ",
         built_info::PKG_VERSION
     );
@@ -95,9 +101,10 @@ pub(crate) async fn snapshot(name: String, statefile: Option<PathBuf>) -> Result
     println!("Using profile: {}", name.cyan());
 
     let local_base = full(&prf.local)?;
+    let scan_ignore = prf.scan_ignore();
 
     let current_entries =
-        state::scan_entries(&local_base, &PathBuf::from(""), &prf.locations, &prf.ignore).await?;
+        state::scan_entries(&local_base, &PathBuf::from(""), &prf.locations, &scan_ignore).await?;
 
     let statefile = match statefile {
         Some(statefile) => statefile,
@@ -113,6 +120,7 @@ pub(crate) async fn changes(name: String, statefile: Option<PathBuf>) -> Result<
     println!("Using profile: {}", name.cyan());
 
     let local_base = full(&prf.local)?;
+    let scan_ignore = prf.scan_ignore();
 
     let statefile = match statefile {
         Some(statefile) => statefile,
@@ -123,7 +131,7 @@ pub(crate) async fn changes(name: String, statefile: Option<PathBuf>) -> Result<
         &local_base,
         &PathBuf::from(""),
         &prf.locations,
-        &prf.ignore,
+        &scan_ignore,
         Some(&statefile),
     )
     .await?;

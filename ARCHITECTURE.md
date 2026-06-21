@@ -58,6 +58,8 @@ User-facing commands:
   a path under the local base.
 - `duet --profile-file <file> [path]`: synchronize a profile file and keep state
   next to that file.
+- `duet preflight <profile> [path]`: scan both sides, resolve actions, and
+  report apply blockers without applying filesystem changes or saving state.
 - `duet recover <statefile>`: print any unfinished apply-attempt marker for a
   state file and optionally clear it after manual inspection.
 - `duet --server`: run the RPC server used by another Duet process.
@@ -83,6 +85,7 @@ Profiles are parsed by `src/profile.rs`. A profile contains:
 - remote endpoint
 - include/exclude location rules
 - optional ignore glob patterns under `[ignore]`
+- optional disposable prune glob patterns under `[prune]`
 
 Duet supports two profile sources:
 

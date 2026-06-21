@@ -8,6 +8,7 @@ use shellexpand;
 use crate::scan::location::{Location, Locations};
 
 pub type Ignore = Vec<String>;
+pub type Prune = Vec<String>;
 
 #[derive(Debug)]
 pub struct Profile {
@@ -15,6 +16,15 @@ pub struct Profile {
     pub remote: String,
     pub locations: Locations,
     pub ignore: Ignore,
+    pub prune: Prune,
+}
+
+impl Profile {
+    pub fn scan_ignore(&self) -> Ignore {
+        let mut ignore = self.ignore.clone();
+        ignore.extend(self.prune.iter().cloned());
+        ignore
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,9 +223,11 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
         remote: String::new(),
         locations: vec![Location::Exclude(PathBuf::from("."))], // implicitly exclude .
         ignore: Vec::new(),
+        prune: Vec::new(),
     };
 
     let mut locations = 0;
+    let mut section = ProfileSection::Locations;
     for line in reader.lines() {
         let line = line?;
         let trimmed = line.trim();
@@ -233,25 +245,40 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
             continue;
         }
 
-        // includes/excludes
-        if locations == 2 {
+        if trimmed == "[ignore]" {
+            section = ProfileSection::Ignore;
+            continue;
+        }
+        if trimmed == "[prune]" {
+            section = ProfileSection::Prune;
+            continue;
+        }
+
+        match section {
+            ProfileSection::Locations => {
             if let Some(path) = trimmed.strip_prefix('+') {
                 p.locations
                     .push(Location::Include(PathBuf::from(path.trim())));
             } else if let Some(path) = trimmed.strip_prefix('-') {
                 p.locations
                     .push(Location::Exclude(PathBuf::from(path.trim())));
-            } else if trimmed == "[ignore]" {
-                locations += 1;
             } else {
                 return parse_error(&line);
             }
-        } else {
-            p.ignore.push(line);
+            }
+            ProfileSection::Ignore => p.ignore.push(line),
+            ProfileSection::Prune => p.prune.push(line),
         }
     }
 
     Ok(p)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileSection {
+    Locations,
+    Ignore,
+    Prune,
 }
 
 fn parse_error(line: &str) -> Result<Profile, io::Error> {
@@ -286,6 +313,8 @@ mod tests {
         writeln!(file, "  -target").unwrap();
         writeln!(file, "  [ignore]").unwrap();
         writeln!(file, "*.tmp").unwrap();
+        writeln!(file, "  [prune]").unwrap();
+        writeln!(file, "__pycache__").unwrap();
 
         let profile = parse_file(file.path()).unwrap();
 
@@ -298,6 +327,11 @@ mod tests {
             Location::Exclude(path) if path == &PathBuf::from("target")
         ));
         assert_eq!(profile.ignore, vec!["*.tmp".to_string()]);
+        assert_eq!(profile.prune, vec!["__pycache__".to_string()]);
+        assert_eq!(
+            profile.scan_ignore(),
+            vec!["*.tmp".to_string(), "__pycache__".to_string()]
+        );
     }
 
     #[test]

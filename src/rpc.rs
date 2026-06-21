@@ -34,6 +34,8 @@ pub(crate) const CAPABILITY_STREAM_PERFORMANCE: &str = "stream-performance-v1";
 pub(crate) const CAPABILITY_FILE_BYTE_CHUNKS: &str = "file-byte-chunks-v1";
 pub(crate) const CAPABILITY_REMOTE_STATE_ID_SELECTION: &str = "remote-state-id-selection-v1";
 pub(crate) const CAPABILITY_APPLY_OPTIONS: &str = "apply-options-v1";
+pub(crate) const CAPABILITY_PRUNE_PATTERNS: &str = "prune-patterns-v1";
+pub(crate) const CAPABILITY_PREFLIGHT_REPORT: &str = "preflight-report-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -46,6 +48,8 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_FILE_BYTE_CHUNKS,
     CAPABILITY_REMOTE_STATE_ID_SELECTION,
     CAPABILITY_APPLY_OPTIONS,
+    CAPABILITY_PRUNE_PATTERNS,
+    CAPABILITY_PREFLIGHT_REPORT,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -131,6 +135,12 @@ pub trait DuetServer {
         legacy_id: Option<String>,
     ) -> Result<String, RPCError>;
     fn set_apply_options(&mut self, options: sync::ApplyOptions) -> Result<(), RPCError>;
+    fn set_prune_patterns(&mut self, prune: profile::Prune) -> Result<(), RPCError>;
+    fn preflight_apply_report(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<sync::ApplyPreflightReport, RPCError>;
 }
 
 struct DuetServerImpl {
@@ -142,6 +152,7 @@ struct DuetServerImpl {
     all_old: Entries,
     actions: Actions,
     scan_policy: Option<sync::ScanPolicy>,
+    prune: profile::Prune,
     apply_options: sync::ApplyOptions,
     apply_attempt_id: Option<String>,
     detail_streams: HashMap<DetailStreamId, DetailProducer>,
@@ -162,6 +173,7 @@ impl DuetServerImpl {
             all_old: Vec::new(),
             actions: Vec::new(),
             scan_policy: None,
+            prune: Vec::new(),
             apply_options: sync::ApplyOptions::default(),
             apply_attempt_id: None,
             detail_streams: HashMap::new(),
@@ -331,7 +343,11 @@ impl DuetServer for DuetServerImpl {
         match result {
             Ok((all_old, changes)) => {
                 self.all_old = all_old;
-                self.scan_policy = Some(sync::ScanPolicy::new(locations, ignore));
+                self.scan_policy = Some(sync::ScanPolicy::with_prune(
+                    locations,
+                    ignore,
+                    self.prune.clone(),
+                ));
                 self.changes_ready = true;
                 Ok(changes)
             }
@@ -732,6 +748,28 @@ impl DuetServer for DuetServerImpl {
         self.apply_options = options;
         Ok(())
     }
+
+    fn set_prune_patterns(&mut self, prune: profile::Prune) -> Result<(), RPCError> {
+        self.prune = prune;
+        if let Some(scan_policy) = &mut self.scan_policy {
+            scan_policy.prune = self.prune.clone();
+        }
+        Ok(())
+    }
+
+    fn preflight_apply_report(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<sync::ApplyPreflightReport, RPCError> {
+        let remote_state = self.initialized_remote_state("preflight report")?;
+        sync::preflight_state_save(&remote_state)
+            .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
+        sync::validate_actions(&actions)
+            .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
+        sync::preflight_apply_report(&self.base, &actions, self.scan_policy.as_ref(), options)
+            .map_err(|e| rpc_report_error("preflight report", Some(&self.base), e))
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -881,6 +919,10 @@ mod tests {
         assert!(client
             .set_apply_options(sync::ApplyOptions::default())
             .is_err());
+        assert!(client.set_prune_patterns(Vec::new()).is_err());
+        assert!(client
+            .preflight_apply_report(Vec::new(), sync::ApplyOptions::default())
+            .is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -892,6 +934,8 @@ mod tests {
                 ("apply_file_byte_chunk", 21),
                 ("select_remote_state_id", 22),
                 ("set_apply_options", 23),
+                ("set_prune_patterns", 24),
+                ("preflight_apply_report", 25),
             ]
         );
     }
@@ -922,7 +966,9 @@ mod tests {
                 CAPABILITY_STREAM_PERFORMANCE.to_string(),
                 CAPABILITY_FILE_BYTE_CHUNKS.to_string(),
                 CAPABILITY_REMOTE_STATE_ID_SELECTION.to_string(),
-                CAPABILITY_APPLY_OPTIONS.to_string()
+                CAPABILITY_APPLY_OPTIONS.to_string(),
+                CAPABILITY_PRUNE_PATTERNS.to_string(),
+                CAPABILITY_PREFLIGHT_REPORT.to_string()
             ]
         );
     }

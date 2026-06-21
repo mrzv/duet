@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::actions::Action;
-use crate::profile::Ignore;
+use crate::profile::{Ignore, Prune};
 use crate::scan::location::{Location, Locations};
 
 use crate::rustsync::{compare, compare_stream, restore_seek, signature, DeltaOp};
@@ -41,15 +41,85 @@ pub struct ApplyOptions {
     pub prune_ignored: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ApplyPreflightReport {
+    pub blockers: Vec<RemovalBlocker>,
+}
+
+impl ApplyPreflightReport {
+    pub fn is_clear(&self) -> bool {
+        self.blockers.is_empty()
+    }
+
+    pub fn has_ignored_blockers(&self) -> bool {
+        self.blockers
+            .iter()
+            .any(|blocker| blocker.kind == RemovalBlockerType::Ignored)
+    }
+
+    pub fn has_unprunable_blockers(&self) -> bool {
+        self.blockers.iter().any(|blocker| !blocker.prunable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalBlocker {
+    pub parent: PathBuf,
+    pub child: PathBuf,
+    pub kind: RemovalBlockerType,
+    pub pattern: Option<String>,
+    pub prunable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemovalBlockerType {
+    Ignored,
+    Prune,
+    Excluded,
+    Unexpected,
+}
+
+impl RemovalBlocker {
+    fn to_error(&self, prune_ignored: bool) -> color_eyre::eyre::Report {
+        removal_blocker_error(
+            &self.parent,
+            &self.child,
+            self.kind.to_internal(self.pattern.as_deref()),
+            prune_ignored,
+        )
+    }
+}
+
+impl RemovalBlockerType {
+    fn to_internal<'a>(self, pattern: Option<&'a str>) -> RemovalBlockerKind<'a> {
+        match self {
+            RemovalBlockerType::Ignored => RemovalBlockerKind::Ignored(pattern.unwrap_or("")),
+            RemovalBlockerType::Prune => RemovalBlockerKind::Prune(pattern.unwrap_or("")),
+            RemovalBlockerType::Excluded => RemovalBlockerKind::Excluded,
+            RemovalBlockerType::Unexpected => RemovalBlockerKind::Unexpected,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScanPolicy {
     pub locations: Locations,
     pub ignore: Ignore,
+    pub prune: Prune,
 }
 
 impl ScanPolicy {
+    #[allow(dead_code)]
     pub fn new(locations: Locations, ignore: Ignore) -> Self {
-        Self { locations, ignore }
+        Self::with_prune(locations, ignore, Vec::new())
+    }
+
+    pub fn with_prune(locations: Locations, ignore: Ignore, prune: Prune) -> Self {
+        Self {
+            locations,
+            ignore,
+            prune,
+        }
     }
 }
 
@@ -506,6 +576,10 @@ pub fn preflight_apply_with_policy(
     validate_actions(actions)?;
     preflight_source_reads(base, actions)?;
     let removal_policy = RemovalBlockerPolicy::new(scan_policy, apply_options)?;
+    let report = removal_blocker_report(base, actions, &removal_policy)?;
+    if let Some(blocker) = report.blockers.iter().find(|blocker| !blocker.prunable) {
+        return Err(blocker.to_error(apply_options.prune_ignored));
+    }
     preflight_removed_directories(base, actions, &removal_policy)?;
 
     let readonly_metadata_changes = readonly_directory_metadata_changes(actions);
@@ -572,6 +646,17 @@ pub fn preflight_apply_with_policy(
         }
     }
     Ok(())
+}
+
+pub fn preflight_apply_report(
+    base: &PathBuf,
+    actions: &Vec<Action>,
+    scan_policy: Option<&ScanPolicy>,
+    apply_options: ApplyOptions,
+) -> Result<ApplyPreflightReport> {
+    validate_actions(actions)?;
+    let removal_policy = RemovalBlockerPolicy::new(scan_policy, apply_options)?;
+    removal_blocker_report(base, actions, &removal_policy)
 }
 
 pub fn preflight_state_save(state_path: &Path) -> Result<()> {
@@ -1299,13 +1384,35 @@ fn apply_parent_mutations(actions: &Vec<Action>) -> Vec<ParentMutation> {
 struct RemovalBlockerPolicy {
     locations: Locations,
     ignore: Vec<(String, regex::Regex)>,
+    prune: Vec<(String, regex::Regex)>,
     prune_ignored: bool,
 }
 
 enum RemovalBlockerKind<'a> {
     Ignored(&'a str),
+    Prune(&'a str),
     Excluded,
     Unexpected,
+}
+
+impl<'a> RemovalBlockerKind<'a> {
+    fn blocker_type(&self) -> RemovalBlockerType {
+        match self {
+            RemovalBlockerKind::Ignored(_) => RemovalBlockerType::Ignored,
+            RemovalBlockerKind::Prune(_) => RemovalBlockerType::Prune,
+            RemovalBlockerKind::Excluded => RemovalBlockerType::Excluded,
+            RemovalBlockerKind::Unexpected => RemovalBlockerType::Unexpected,
+        }
+    }
+
+    fn pattern(&self) -> Option<&'a str> {
+        match self {
+            RemovalBlockerKind::Ignored(pattern) | RemovalBlockerKind::Prune(pattern) => {
+                Some(pattern)
+            }
+            RemovalBlockerKind::Excluded | RemovalBlockerKind::Unexpected => None,
+        }
+    }
 }
 
 impl RemovalBlockerPolicy {
@@ -1314,24 +1421,32 @@ impl RemovalBlockerPolicy {
             return Ok(Self {
                 locations: Vec::new(),
                 ignore: Vec::new(),
+                prune: Vec::new(),
                 prune_ignored: apply_options.prune_ignored,
             });
         };
 
         use fnmatch_regex::glob_to_regex;
-        let mut ignore = Vec::new();
-        for pattern in &scan_policy.ignore {
-            ignore.push((
-                pattern.clone(),
-                glob_to_regex(pattern).wrap_err_with(|| format!("invalid ignore pattern {pattern}"))?,
-            ));
-        }
+        let compile_patterns = |patterns: &[String], kind: &str| -> Result<Vec<(String, regex::Regex)>> {
+            let mut compiled = Vec::new();
+            for pattern in patterns {
+                compiled.push((
+                    pattern.clone(),
+                    glob_to_regex(pattern)
+                        .wrap_err_with(|| format!("invalid {kind} pattern {pattern}"))?,
+                ));
+            }
+            Ok(compiled)
+        };
+        let ignore = compile_patterns(&scan_policy.ignore, "ignore")?;
+        let prune = compile_patterns(&scan_policy.prune, "prune")?;
 
         let mut locations = scan_policy.locations.clone();
         locations.sort();
         Ok(Self {
             locations,
             ignore,
+            prune,
             prune_ignored: apply_options.prune_ignored,
         })
     }
@@ -1340,15 +1455,34 @@ impl RemovalBlockerPolicy {
         if self.is_excluded(relative_path) {
             return RemovalBlockerKind::Excluded;
         }
+        if let Some(pattern) = self.matching_prune_pattern(relative_path) {
+            return RemovalBlockerKind::Prune(pattern);
+        }
         if let Some(pattern) = self.matching_ignore_pattern(relative_path) {
             return RemovalBlockerKind::Ignored(pattern);
         }
         RemovalBlockerKind::Unexpected
     }
 
+    fn should_prune(&self, kind: &RemovalBlockerKind<'_>) -> bool {
+        matches!(kind, RemovalBlockerKind::Prune(_))
+            || (matches!(kind, RemovalBlockerKind::Ignored(_)) && self.prune_ignored)
+    }
+
+    fn matching_prune_pattern(&self, relative_path: &Path) -> Option<&str> {
+        Self::matching_pattern(&self.prune, relative_path)
+    }
+
     fn matching_ignore_pattern(&self, relative_path: &Path) -> Option<&str> {
+        Self::matching_pattern(&self.ignore, relative_path)
+    }
+
+    fn matching_pattern<'a>(
+        patterns: &'a [(String, regex::Regex)],
+        relative_path: &Path,
+    ) -> Option<&'a str> {
         let filename = relative_path.file_name()?.to_str()?;
-        self.ignore
+        patterns
             .iter()
             .find(|(_, regex)| regex.is_match(filename))
             .map(|(pattern, _)| pattern.as_str())
@@ -1410,6 +1544,12 @@ fn removal_blocker_error(
                 action
             )
         }
+        RemovalBlockerKind::Prune(pattern) => eyre!(
+            "destination directory {} is not empty; prunable child {} matched pattern {:?} and would prevent removal. Duet will prune this disposable content before removing the synced parent",
+            dirname.display(),
+            child.display(),
+            pattern
+        ),
         RemovalBlockerKind::Excluded => eyre!(
             "destination directory {} is not empty; excluded child {} would prevent removal. Excluded content is outside the sync selection and is not deleted automatically",
             dirname.display(),
@@ -1455,6 +1595,84 @@ fn removed_destination_paths(actions: &Vec<Action>) -> HashSet<PathBuf> {
         .collect()
 }
 
+fn removal_blocker_report(
+    base: &Path,
+    actions: &Vec<Action>,
+    policy: &RemovalBlockerPolicy,
+) -> Result<ApplyPreflightReport> {
+    let removed_paths = removed_destination_paths(actions);
+    let mut report = ApplyPreflightReport::default();
+    for path in removed_paths.iter() {
+        let dirname = safe_join(base, path)?;
+        if dirname.is_dir() {
+            collect_removed_directory_blockers(
+                base,
+                &dirname,
+                &removed_paths,
+                policy,
+                &mut report,
+            )?;
+        }
+    }
+    Ok(report)
+}
+
+fn collect_removed_directory_blockers(
+    base: &Path,
+    dirname: &Path,
+    removed_paths: &HashSet<PathBuf>,
+    policy: &RemovalBlockerPolicy,
+    report: &mut ApplyPreflightReport,
+) -> Result<()> {
+    for entry in fs::read_dir(dirname)
+        .wrap_err_with(|| format!("unable to preflight directory removal {}", dirname.display()))?
+    {
+        let entry = entry.wrap_err_with(|| {
+            format!(
+                "unable to preflight directory removal entry in {}",
+                dirname.display()
+            )
+        })?;
+        let path = entry.path();
+        let relative_path = path.strip_prefix(base).wrap_err_with(|| {
+            format!(
+                "unable to preflight directory removal path {}",
+                path.display()
+            )
+        })?;
+        if !removed_paths.contains(relative_path) {
+            let kind = policy.classify(relative_path);
+            if policy.should_prune(&kind) {
+                let file_type = entry.file_type().wrap_err_with(|| {
+                    format!("unable to preflight directory entry {}", path.display())
+                })?;
+                let base_dev = fs::symlink_metadata(base)
+                    .wrap_err_with(|| {
+                        format!("failed to read sync base metadata for {}", base.display())
+                    })?
+                    .dev();
+                preflight_prunable_ignored_path(base, &path, file_type.is_dir(), base_dev, policy)?;
+            }
+            report.blockers.push(RemovalBlocker {
+                parent: dirname.to_path_buf(),
+                child: path.clone(),
+                kind: kind.blocker_type(),
+                pattern: kind.pattern().map(str::to_string),
+                prunable: policy.should_prune(&kind),
+            });
+            continue;
+        }
+        if entry
+            .file_type()
+            .wrap_err_with(|| format!("unable to preflight directory entry {}", path.display()))?
+            .is_dir()
+        {
+            collect_removed_directory_blockers(base, &path, removed_paths, policy, report)?;
+        }
+    }
+    Ok(())
+}
+
 fn preflight_removed_directory_contents(
     base: &Path,
     dirname: &Path,
@@ -1479,7 +1697,7 @@ fn preflight_removed_directory_contents(
         })?;
         if !removed_paths.contains(relative_path) {
             let kind = policy.classify(relative_path);
-            if matches!(kind, RemovalBlockerKind::Ignored(_)) && policy.prune_ignored {
+            if policy.should_prune(&kind) {
                 let file_type = entry.file_type().wrap_err_with(|| {
                     format!("unable to preflight directory entry {}", path.display())
                 })?;
@@ -1542,11 +1760,11 @@ fn prune_ignored_removal_blockers(
             continue;
         }
 
-        match policy.classify(relative_path) {
-            RemovalBlockerKind::Ignored(_) if policy.prune_ignored => {
+        let kind = policy.classify(relative_path);
+        if policy.should_prune(&kind) {
                 record_committed_step(
                     attempt_state,
-                    "prune-ignored",
+                    "prune-blocker",
                     &relative_path.to_path_buf(),
                 )?;
                 if file_type.is_dir() {
@@ -1567,18 +1785,16 @@ fn prune_ignored_removal_blockers(
                         })?;
                 } else {
                     fs::remove_file(&path).wrap_err_with(|| {
-                        format!("failed to prune ignored file {}", path.display())
+                        format!("failed to prune file {}", path.display())
                     })?;
                 }
-            }
-            kind => {
-                return Err(removal_blocker_error(
-                    dirname,
-                    &path,
-                    kind,
-                    policy.prune_ignored,
-                ));
-            }
+        } else {
+            return Err(removal_blocker_error(
+                dirname,
+                &path,
+                kind,
+                policy.prune_ignored,
+            ));
         }
     }
     Ok(())
@@ -4182,6 +4398,48 @@ mod tests {
         assert!(error.contains("ignored child"), "{}", error);
         assert!(error.contains("__pycache__"), "{}", error);
         assert!(error.contains("--prune-ignored"), "{}", error);
+
+        let report = preflight_apply_report(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.blockers.len(), 1);
+        assert_eq!(report.blockers[0].kind, RemovalBlockerType::Ignored);
+        assert!(!report.blockers[0].prunable);
+    }
+
+    #[test]
+    fn preflight_prunes_profile_prune_blocker_without_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::with_prune(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            Vec::new(),
+            vec!["__pycache__".to_string()],
+        );
+
+        let report = preflight_apply_report(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.blockers.len(), 1);
+        assert_eq!(report.blockers[0].kind, RemovalBlockerType::Prune);
+        assert!(report.blockers[0].prunable);
+        preflight_apply_with_policy(&base, &actions, Some(&policy), ApplyOptions::default())
+            .unwrap();
     }
 
     #[test]

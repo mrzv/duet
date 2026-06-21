@@ -4,6 +4,9 @@
 
 ### Added
 - Added `--prune-ignored` to explicitly delete ignored files or directories that block removal of a synced parent directory.
+- Added `[prune]` profile patterns for disposable ignored content that may be pruned automatically when blocking synced parent directory removal.
+- Added `duet preflight` to inspect sync actions and directory removal blockers without applying changes.
+- Added structured local/remote preflight blocker reports so interactive syncs can ask before pruning ignored blockers.
 
 ### Fixed
 - Report ignored and excluded children separately when they block destination directory removal, instead of presenting all blockers as unexpected children.

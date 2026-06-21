@@ -10,6 +10,8 @@ changes from that state.
 USAGE:
     duet [FLAGS] <profile> [path]
     duet [FLAGS] --profile-file <file> [path]
+    duet [FLAGS] preflight <profile> [path]
+    duet [FLAGS] --profile-file <file> preflight [path]
     duet recover [--clear] [--yes] <statefile>
 
 FLAGS:
@@ -49,6 +51,10 @@ ARGS:
     <profile>    profile to synchronize
     <path>       path to synchronize
 
+PREFLIGHT:
+    preflight checks what a sync would do, reports directory removal blockers on
+    both sides, and exits without applying changes or saving state.
+
 ```
 
 ## Profiles
@@ -68,6 +74,10 @@ ssh my_server duet ~
 [ignore]
 glob1*
 glob2*
+
+[prune]
+__pycache__
+target
 ```
 The first two lines specify the directories to synchronize. Either both are
 local, or the second one can have the form `ssh server-name path/to/duet
@@ -83,6 +93,11 @@ Ignored paths are not synchronized or tracked. They are also not deleted by
 default if they physically block removal of a synced parent directory. Use
 `--prune-ignored` only for disposable ignored content, such as generated caches,
 when those ignored children should be deleted to allow the parent removal.
+
+Use `[prune]` for generated, disposable basename globs that should be ignored and
+automatically deleted when they are the only reason a synced parent directory
+cannot be removed. Excluded paths (`-path`) are never pruned automatically.
+Run `duet preflight <profile> [path]` to inspect blockers before applying a sync.
 
 Subsequently, `duet my_profile` will synchronize the two directories.
 
