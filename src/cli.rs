@@ -64,7 +64,7 @@ pub fn parse_from_env() -> Result<Command> {
 
 fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
     if pargs.contains(["-h", "--help"]) {
-        ensure_no_args(pargs)?;
+        ensure_help_args(pargs)?;
         return Ok(Command::Help);
     }
 
@@ -180,11 +180,22 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
                 yes: options.yes,
             }
         }
-        "preflight" => Command::Preflight {
-            profile: ProfileSource::Named(pargs.free_from_str()?),
-            path: pargs.opt_free_from_os_str(parse_path)?,
-            options,
-        },
+        "preflight" => {
+            let profile = match pargs.free_from_str::<String>() {
+                Ok(profile) => profile,
+                Err(pico_args::Error::MissingArgument) => {
+                    return Err(eyre!(
+                        "preflight requires a profile: duet preflight <profile> [path]"
+                    ));
+                }
+                Err(err) => return Err(err.into()),
+            };
+            Command::Preflight {
+                profile: ProfileSource::Named(profile),
+                path: pargs.opt_free_from_os_str(parse_path)?,
+                options,
+            }
+        }
         _ => Command::Sync {
             profile: ProfileSource::Named(profile),
             path: pargs.opt_free_from_os_str(parse_path)?,
@@ -240,6 +251,25 @@ fn ensure_no_args(pargs: pico_args::Arguments) -> Result<()> {
     } else {
         Err(eyre!("unexpected argument: {}", remaining[0].to_string_lossy()))
     }
+}
+
+fn ensure_help_args(pargs: pico_args::Arguments) -> Result<()> {
+    let remaining = pargs.finish();
+    if remaining.is_empty() {
+        return Ok(());
+    }
+
+    if remaining.len() == 1 {
+        let arg = remaining[0].to_string_lossy();
+        if matches!(arg.as_ref(), "preflight" | "recover" | "_recover") {
+            return Ok(());
+        }
+    }
+
+    Err(eyre!(
+        "unexpected argument: {}",
+        remaining[0].to_string_lossy()
+    ))
 }
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<PathBuf, &'static str> {
@@ -298,6 +328,8 @@ mod tests {
         );
         assert_eq!(parse_args(&["--license"]), Command::License);
         assert_eq!(parse_args(&["--server"]), Command::Server);
+        assert_eq!(parse_args(&["preflight", "-h"]), Command::Help);
+        assert_eq!(parse_args(&["recover", "-h"]), Command::Help);
     }
 
     #[test]
@@ -511,5 +543,6 @@ mod tests {
             .contains("recover is a subcommand"));
         assert!(parse_args_error(&["--profile-file", "profile.prf", "_recover"])
             .contains("recover is a subcommand"));
+        assert!(parse_args_error(&["preflight"]).contains("preflight requires a profile"));
     }
 }
