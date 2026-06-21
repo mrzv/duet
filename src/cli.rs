@@ -328,7 +328,9 @@ mod tests {
         );
         assert_eq!(parse_args(&["--license"]), Command::License);
         assert_eq!(parse_args(&["--server"]), Command::Server);
+        assert_eq!(parse_args(&["-h", "preflight"]), Command::Help);
         assert_eq!(parse_args(&["preflight", "-h"]), Command::Help);
+        assert_eq!(parse_args(&["--help", "recover"]), Command::Help);
         assert_eq!(parse_args(&["recover", "-h"]), Command::Help);
     }
 
@@ -544,5 +546,7 @@ mod tests {
         assert!(parse_args_error(&["--profile-file", "profile.prf", "_recover"])
             .contains("recover is a subcommand"));
         assert!(parse_args_error(&["preflight"]).contains("preflight requires a profile"));
+        assert!(parse_args_error(&["preflight", "work", "path1", "path2"])
+            .contains("unexpected argument"));
     }
 }
