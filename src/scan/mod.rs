@@ -94,12 +94,27 @@ impl DirEntryWithMeta {
 
     #[cfg(test)]
     pub(crate) fn test_symlink(path: PathBuf, target: PathBuf) -> Self {
+        Self::test_symlink_with_mode(path, target, 0o120777)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_symlink_with_mode(path: PathBuf, target: PathBuf, mode: u32) -> Self {
+        Self::test_symlink_with_mode_and_mtime(path, target, mode, 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_symlink_with_mode_and_mtime(
+        path: PathBuf,
+        target: PathBuf,
+        mode: u32,
+        mtime: i64,
+    ) -> Self {
         Self {
             path,
             size: 0,
-            mtime: 0,
+            mtime,
             ino: 0,
-            mode: 0o120777,
+            mode,
             target: Some(target),
             is_dir: false,
             checksum: 0,

@@ -3739,7 +3739,7 @@ fn verify_current_matches_entry(filename: &Path, entry: &Entry, description: &st
         return Err(eyre!("unsupported entry for {}", entry.path().display()));
     }
 
-    if synced_mode(meta.mode()) != synced_mode(entry.mode()) {
+    if !entry.is_symlink() && synced_mode(meta.mode()) != synced_mode(entry.mode()) {
         return Err(eyre!(
             "{} {} mode mismatch: expected {:o}, got {:o}",
             description,
@@ -3964,6 +3964,35 @@ mod tests {
 
         assert!(error.contains("remove target"), "{}", error);
         assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"bad");
+    }
+
+    #[test]
+    fn apply_ignores_symlink_mode_when_rechecking_removed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        std::os::unix::fs::symlink("target", base.join("link")).unwrap();
+        let meta = fs::symlink_metadata(base.join("link")).unwrap();
+        let mismatched_mode = meta.mode() ^ 0o022;
+        let old = Entry::test_symlink_with_mode_and_mtime(
+            PathBuf::from("link"),
+            PathBuf::from("target"),
+            mismatched_mode,
+            meta.mtime(),
+        );
+        let actions = vec![Action::Local(Change::Removed(old.clone()))];
+        let mut all_old = vec![old];
+
+        apply_detailed_changes(
+            &base,
+            &actions,
+            &Vec::new(),
+            &mut all_old,
+            None,
+        )
+        .unwrap();
+
+        assert!(fs::symlink_metadata(base.join("link")).is_err());
+        assert!(all_old.is_empty());
     }
 
     #[test]
