@@ -42,7 +42,8 @@ pub enum Command {
         path: PathBuf,
     },
     Recover {
-        statefile: PathBuf,
+        target: PathBuf,
+        remote: bool,
         clear: bool,
         yes: bool,
     },
@@ -173,9 +174,11 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         }
         "recover" | "_recover" => {
             let clear = pargs.contains("--clear");
+            let remote = pargs.contains("--remote");
             reject_recover_options(&options, clear)?;
             Command::Recover {
-                statefile: pargs.free_from_os_str(parse_path)?,
+                target: pargs.free_from_os_str(parse_path)?,
+                remote,
                 clear,
                 yes: options.yes,
             }
@@ -501,7 +504,8 @@ mod tests {
         assert_eq!(
             parse_args(&["_recover", "state.bin"]),
             Command::Recover {
-                statefile: PathBuf::from("state.bin"),
+                target: PathBuf::from("state.bin"),
+                remote: false,
                 clear: false,
                 yes: false,
             }
@@ -509,7 +513,8 @@ mod tests {
         assert_eq!(
             parse_args(&["recover", "state.bin"]),
             Command::Recover {
-                statefile: PathBuf::from("state.bin"),
+                target: PathBuf::from("state.bin"),
+                remote: false,
                 clear: false,
                 yes: false,
             }
@@ -517,9 +522,19 @@ mod tests {
         assert_eq!(
             parse_args(&["recover", "--clear", "--yes", "state.bin"]),
             Command::Recover {
-                statefile: PathBuf::from("state.bin"),
+                target: PathBuf::from("state.bin"),
+                remote: false,
                 clear: true,
                 yes: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&["recover", "--remote", "cole"]),
+            Command::Recover {
+                target: PathBuf::from("cole"),
+                remote: true,
+                clear: false,
+                yes: false,
             }
         );
     }

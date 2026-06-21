@@ -610,6 +610,83 @@ pub async fn preflight(
     Ok(())
 }
 
+pub async fn recover_remote(target: PathBuf, clear: bool, yes: bool) -> Result<()> {
+    env_logger::init();
+    let profile_name = remote_recovery_profile_name(&target)?;
+    let context = prepare_context(ProfileSource::Named(profile_name.to_string()), None)?;
+
+    let SyncContext {
+        local_id,
+        legacy_local_id,
+        remote_server,
+        remote_cmd,
+        remote_state_dir,
+        server_log,
+        ..
+    } = context;
+
+    let remote_session = open_remote_session(remote_server).await;
+    let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
+        .await
+        .unwrap_or_else(|e| {
+            let diagnostic =
+                sync_error::render_report("setup", "launch server", Some(server_log.clone()), e);
+            eprintln!("{}", diagnostic.cyan());
+            quit::with_code(SERVER_ERROR_CODE);
+        });
+    let remote = remote::get_remote(&mut server)?;
+    let remote_info = remote.server_info().await.map_err(server_info_error)?;
+    require_remote_capability(&remote_info, rpc::CAPABILITY_RECOVERY)?;
+    if let Some(remote_state_dir) = remote_state_dir {
+        require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
+        remote
+            .set_remote_state_dir(remote_state_dir)
+            .await
+            .map_err(remote_state_dir_error)?;
+    }
+    let remote_id = select_remote_state_id(&remote, &remote_info, local_id, legacy_local_id).await?;
+
+    match remote
+        .describe_apply_attempt(remote_id.clone())
+        .await
+        .map_err(|e| remote_rpc_error("Failed to inspect remote recovery marker", e))?
+    {
+        Some(description) => {
+            println!("{}", description);
+            if clear && crate::commands::confirm_clear_recovery_marker(yes)? {
+                remote
+                    .clear_apply_attempt(remote_id)
+                    .await
+                    .map_err(|e| remote_rpc_error("Failed to clear remote recovery marker", e))?;
+                println!("Removed remote recovery marker for profile {}", profile_name);
+            }
+        }
+        None => println!(
+            "No unfinished remote Duet apply attempt for profile {}",
+            profile_name
+        ),
+    }
+
+    Ok(())
+}
+
+fn remote_recovery_profile_name(target: &Path) -> Result<&str> {
+    if target.components().count() != 1 {
+        return Err(eyre!(
+            "--remote recovery requires a named profile, for example `duet recover --remote cole`"
+        ));
+    }
+    let name = target.to_str().ok_or_else(|| {
+        eyre!("--remote recovery requires a UTF-8 named profile, for example `duet recover --remote cole`")
+    })?;
+    if name.is_empty() || name == "." || name == ".." || name.contains('\\') {
+        return Err(eyre!(
+            "--remote recovery requires a named profile, for example `duet recover --remote cole`"
+        ));
+    }
+    Ok(name)
+}
+
 async fn prepare_remote_apply_attempt<R>(
     remote: &R,
     supported: bool,
@@ -1584,6 +1661,18 @@ mod tests {
             normalize_path(&base, &PathBuf::from("sub/path")).unwrap();
 
         assert_eq!(normalized, PathBuf::from("sub/path"));
+    }
+
+    #[test]
+    fn remote_recovery_requires_plain_profile_name() {
+        assert_eq!(
+            remote_recovery_profile_name(Path::new("cole")).unwrap(),
+            "cole"
+        );
+        assert!(remote_recovery_profile_name(Path::new("./cole")).is_err());
+        assert!(remote_recovery_profile_name(Path::new("/tmp/cole.snp")).is_err());
+        assert!(remote_recovery_profile_name(Path::new("work\\old")).is_err());
+        assert!(remote_recovery_profile_name(Path::new(".")).is_err());
     }
 
     #[test]

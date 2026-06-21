@@ -21,7 +21,7 @@ USAGE:
     duet [FLAGS] --profile-file <file> [path]
     duet [FLAGS] preflight <profile> [path]
     duet [FLAGS] --profile-file <file> preflight [path]
-    duet recover [--clear] [--yes] <statefile>
+    duet recover [--clear] [--yes] [--remote] <profile-or-statefile>
 
 FLAGS:
     -i, --interactive   interactive conflict resolution
@@ -45,16 +45,19 @@ FLAGS:
     -h, --help          prints help information
 
 RECOVERY:
-    recover <statefile>
-        inspect an unfinished apply marker for a state file
-    recover --clear <statefile>
+    recover <profile-or-statefile>
+        inspect an unfinished local apply marker for a profile or state file
+    recover --remote <profile>
+        inspect an unfinished remote apply marker for a named profile
+    recover --clear <profile-or-statefile>
         inspect and then interactively remove the marker after manual recovery
-    recover --clear --yes <statefile>
+    recover --clear --yes <profile-or-statefile>
         remove the marker without prompting after manual recovery
 
-    Recovery commands operate on the filesystem where they are run. To inspect or
-    clear a remote-side marker, run the command on the remote host with the
-    remote state file path shown in the marker.
+    Local recovery accepts a profile name, such as `duet recover cole`, and falls
+    back to treating the argument as an explicit state file path when no named
+    profile exists. Remote recovery uses the profile's remote server and selected
+    remote state id.
 
 ARGS:
     <profile>    profile to synchronize
@@ -165,7 +168,8 @@ pub(crate) async fn walk(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn recover(statefile: PathBuf, clear: bool, yes: bool) -> Result<()> {
+pub(crate) fn recover(target: PathBuf, clear: bool, yes: bool) -> Result<()> {
+    let statefile = recovery_statefile(&target)?;
     match sync::describe_apply_attempt(&statefile)? {
         Some(description) => {
             println!("{}", description);
@@ -182,7 +186,26 @@ pub(crate) fn recover(statefile: PathBuf, clear: bool, yes: bool) -> Result<()> 
     Ok(())
 }
 
-fn confirm_clear_recovery_marker(yes: bool) -> Result<bool> {
+fn recovery_statefile(target: &PathBuf) -> Result<PathBuf> {
+    if let Some(name) = profile_name_recovery_target(target) {
+        if profile::location(name)?.try_exists()? {
+            return Ok(profile::local_state(name)?);
+        }
+    }
+
+    Ok(target.clone())
+}
+
+fn profile_name_recovery_target(target: &PathBuf) -> Option<&str> {
+    if target.components().count() != 1 {
+        return None;
+    }
+    target
+        .to_str()
+        .filter(|name| !name.is_empty() && *name != "." && *name != ".." && !name.contains('\\'))
+}
+
+pub(crate) fn confirm_clear_recovery_marker(yes: bool) -> Result<bool> {
     if yes {
         return Ok(true);
     }
@@ -219,6 +242,36 @@ mod tests {
         recover(state, true, true).unwrap();
 
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn recover_treats_explicit_path_as_statefile() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker = dir.path().join(".profile.snp.duet-apply");
+        std::fs::write(
+            &marker,
+            "duet-apply-attempt-v1\nside: local\nphase: apply\npath-count: 0\noperation-count: 0\nunstaged-operation-count: 0\n",
+        )
+        .unwrap();
+
+        recover(state, true, true).unwrap();
+
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn recovery_profile_targets_must_be_plain_names() {
+        assert_eq!(
+            profile_name_recovery_target(&PathBuf::from("cole")),
+            Some("cole")
+        );
+        assert_eq!(profile_name_recovery_target(&PathBuf::from("./cole")), None);
+        assert_eq!(
+            profile_name_recovery_target(&PathBuf::from("/tmp/cole.snp")),
+            None
+        );
+        assert_eq!(profile_name_recovery_target(&PathBuf::from("work\\old")), None);
     }
 
     #[test]

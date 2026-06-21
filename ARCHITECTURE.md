@@ -60,8 +60,10 @@ User-facing commands:
   next to that file.
 - `duet preflight <profile> [path]`: scan both sides, resolve actions, and
   report apply blockers without applying filesystem changes or saving state.
-- `duet recover <statefile>`: print any unfinished apply-attempt marker for a
-  state file and optionally clear it after manual inspection.
+- `duet recover <profile-or-statefile>`: print any unfinished local
+  apply-attempt marker and optionally clear it after manual inspection.
+- `duet recover --remote <profile>`: inspect or clear a remote-side marker using
+  the profile's remote endpoint and selected remote state id.
 - `duet --server`: run the RPC server used by another Duet process.
 - `duet --version`, `--license`, `--help`: informational commands.
 
@@ -72,7 +74,7 @@ Hidden maintenance commands:
 - `_changes <profile> [statefile]`: print local changes against a snapshot.
 - `_info <profile>`: print the profile file location.
 - `_walk <path>`: print paths discovered by the scanner.
-- `_recover <statefile>`: hidden alias for `recover`.
+- `_recover <profile-or-statefile>`: hidden alias for `recover`.
 
 `src/commands.rs` implements the informational and maintenance commands. Normal
 synchronization is implemented in `src/orchestrator.rs`.
