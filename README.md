@@ -12,7 +12,7 @@ USAGE:
     duet [FLAGS] --profile-file <file> [path]
     duet [FLAGS] preflight <profile> [path]
     duet [FLAGS] --profile-file <file> preflight [path]
-    duet recover [--clear] [--yes] <statefile>
+    duet recover [--clear] [--yes] [--remote] <profile-or-statefile>
 
 FLAGS:
     -i, --interactive   interactive conflict resolution
@@ -36,16 +36,19 @@ FLAGS:
     -h, --help          prints help information
 
 RECOVERY:
-    recover <statefile>
-        inspect an unfinished apply marker for a state file
-    recover --clear <statefile>
+    recover <profile-or-statefile>
+        inspect an unfinished local apply marker for a profile or state file
+    recover --remote <profile>
+        inspect an unfinished remote apply marker for a named profile
+    recover --clear <profile-or-statefile>
         inspect and then interactively remove the marker after manual recovery
-    recover --clear --yes <statefile>
+    recover --clear --yes <profile-or-statefile>
         remove the marker without prompting after manual recovery
 
-    Recovery commands operate on the filesystem where they are run. To inspect or
-    clear a remote-side marker, run the command on the remote host with the
-    remote state file path shown in the marker.
+    Local recovery accepts a profile name, such as `duet recover cole`, and falls
+    back to treating the argument as an explicit state file path when no named
+    profile exists. Remote recovery uses the profile's remote server and selected
+    remote state id.
 
 ARGS:
     <profile>    profile to synchronize
@@ -120,14 +123,13 @@ problem and rerun the sync.
 
 If Duet stops after applying filesystem changes but before saving state, it
 leaves an apply recovery marker next to the affected state file and blocks the
-next sync. Run `duet recover <statefile>` to inspect the marker, including the
-side, phase, affected paths, staged temporary files, and committed operations.
-After you have inspected both sides and reconciled any partial changes, run
-`duet recover --clear <statefile>` to remove the marker and allow syncs to
-resume. Recovery commands operate on the filesystem where they are run: to
-inspect or clear a remote-side marker, run `duet recover` on the remote host with
-the remote state file path shown in the marker. Use `--yes` with `--clear` only
-for non-interactive cleanup after that manual inspection.
+next sync. Run `duet recover <profile>` or `duet recover <statefile>` to inspect
+the local marker, including the side, phase, affected paths, staged temporary
+files, and committed operations. Run `duet recover --remote <profile>` to inspect
+the remote-side marker for a named profile. After you have inspected both sides
+and reconciled any partial changes, add `--clear` to remove the marker and allow
+syncs to resume. Use `--yes` with `--clear` only for non-interactive cleanup after
+that manual inspection.
 
 ## Caveat
 

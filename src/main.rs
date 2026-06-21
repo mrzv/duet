@@ -42,10 +42,16 @@ pub async fn main() -> Result<()> {
         Command::Info { profile } => return commands::info(profile),
         Command::Walk { path } => return commands::walk(path).await,
         Command::Recover {
-            statefile,
+            target,
+            remote,
             clear,
             yes,
-        } => return commands::recover(statefile, clear, yes),
+        } => {
+            if remote {
+                return orchestrator::recover_remote(target, clear, yes).await;
+            }
+            return commands::recover(target, clear, yes);
+        }
         Command::Preflight {
             profile,
             path,

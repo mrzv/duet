@@ -36,6 +36,7 @@ pub(crate) const CAPABILITY_REMOTE_STATE_ID_SELECTION: &str = "remote-state-id-s
 pub(crate) const CAPABILITY_APPLY_OPTIONS: &str = "apply-options-v1";
 pub(crate) const CAPABILITY_PRUNE_PATTERNS: &str = "prune-patterns-v1";
 pub(crate) const CAPABILITY_PREFLIGHT_REPORT: &str = "preflight-report-v1";
+pub(crate) const CAPABILITY_RECOVERY: &str = "recovery-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -50,6 +51,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_APPLY_OPTIONS,
     CAPABILITY_PRUNE_PATTERNS,
     CAPABILITY_PREFLIGHT_REPORT,
+    CAPABILITY_RECOVERY,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -141,6 +143,8 @@ pub trait DuetServer {
         actions: Actions,
         options: sync::ApplyOptions,
     ) -> Result<sync::ApplyPreflightReport, RPCError>;
+    fn describe_apply_attempt(&self, remote_id: String) -> Result<Option<String>, RPCError>;
+    fn clear_apply_attempt(&self, remote_id: String) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -231,6 +235,12 @@ impl DuetServerImpl {
             &self.remote_state_dir,
             &self.remote_id,
         ))
+    }
+
+    fn remote_state_for_id(&self, remote_id: &str) -> Result<PathBuf, RPCError> {
+        profile::validate_remote_state_id(remote_id)
+            .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
+        Ok(profile::remote_state_in(&self.remote_state_dir, remote_id))
     }
 
     fn accepted_actions(&self, operation: &str) -> Result<(), RPCError> {
@@ -770,6 +780,18 @@ impl DuetServer for DuetServerImpl {
         sync::preflight_apply_report(&self.base, &actions, self.scan_policy.as_ref(), options)
             .map_err(|e| rpc_report_error("preflight report", Some(&self.base), e))
     }
+
+    fn describe_apply_attempt(&self, remote_id: String) -> Result<Option<String>, RPCError> {
+        let remote_state = self.remote_state_for_id(&remote_id)?;
+        sync::describe_apply_attempt(&remote_state)
+            .map_err(|e| rpc_report_error("describe recovery marker", Some(&remote_state), e))
+    }
+
+    fn clear_apply_attempt(&self, remote_id: String) -> Result<(), RPCError> {
+        let remote_state = self.remote_state_for_id(&remote_id)?;
+        sync::clear_apply_attempt(&remote_state)
+            .map_err(|e| rpc_report_error("clear recovery marker", Some(&remote_state), e))
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -924,6 +946,8 @@ mod tests {
         assert!(client
             .preflight_apply_report(Vec::new(), sync::ApplyOptions::default())
             .is_err());
+        assert!(client.describe_apply_attempt("remote".to_string()).is_err());
+        assert!(client.clear_apply_attempt("remote".to_string()).is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -937,6 +961,8 @@ mod tests {
                 ("set_apply_options", 23),
                 ("set_prune_patterns", 24),
                 ("preflight_apply_report", 25),
+                ("describe_apply_attempt", 26),
+                ("clear_apply_attempt", 27),
             ]
         );
     }
@@ -969,9 +995,37 @@ mod tests {
                 CAPABILITY_REMOTE_STATE_ID_SELECTION.to_string(),
                 CAPABILITY_APPLY_OPTIONS.to_string(),
                 CAPABILITY_PRUNE_PATTERNS.to_string(),
-                CAPABILITY_PREFLIGHT_REPORT.to_string()
+                CAPABILITY_PREFLIGHT_REPORT.to_string(),
+                CAPABILITY_RECOVERY.to_string()
             ]
         );
+    }
+
+    #[test]
+    fn remote_recovery_methods_use_selected_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = {
+            let mut server = DuetServerImpl::new().unwrap();
+            server.remote_state_dir = dir.path().to_path_buf();
+            server
+        };
+        let state = dir.path().join("remote-peer");
+        let marker = dir.path().join(".remote-peer.duet-apply");
+        std::fs::write(
+            &marker,
+            "duet-apply-attempt-v1\nside: remote\nphase: apply\npath-count: 0\noperation-count: 0\nunstaged-operation-count: 0\n",
+        )
+        .unwrap();
+
+        let description = server
+            .describe_apply_attempt("remote-peer".to_string())
+            .unwrap()
+            .unwrap();
+        assert!(description.contains(&state.display().to_string()), "{}", description);
+
+        server.clear_apply_attempt("remote-peer".to_string()).unwrap();
+
+        assert!(!marker.exists());
     }
 
     #[test]
