@@ -89,6 +89,10 @@ pub async fn sync(
         server_log,
     } = context;
     let apply_attempt_id = new_apply_attempt_id(&local_id);
+    let scan_policy = sync_ops::ScanPolicy::new(prf.locations.clone(), prf.ignore.clone());
+    let apply_options = sync_ops::ApplyOptions {
+        prune_ignored: options.prune_ignored,
+    };
 
     let local_fut = async {
         let start = Instant::now();
@@ -194,7 +198,12 @@ pub async fn sync(
 
     let preflight_start = Instant::now();
     sync_ops::preflight_state_save(&local_state)?;
-    sync_ops::preflight_apply(&local_base, actions.as_ref())?;
+    sync_ops::preflight_apply_with_policy(
+        &local_base,
+        actions.as_ref(),
+        Some(&scan_policy),
+        apply_options,
+    )?;
     let remote_actions: Actions = reverse(&actions);
     let can_stream_details =
         has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAIL_BATCHES)
@@ -209,6 +218,13 @@ pub async fn sync(
         has_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_ATTEMPT_ID);
     if actions_require_creatable_added_parents(&remote_actions) {
         require_remote_capability(&remote_info, rpc::CAPABILITY_CREATABLE_ADDED_PARENTS)?;
+    }
+    if apply_options.prune_ignored {
+        require_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_OPTIONS)?;
+        remote
+            .set_apply_options(apply_options)
+            .await
+            .map_err(|e| remote_rpc_error("Failed to set remote apply options", e))?;
     }
     remote
         .set_actions(remote_actions)
@@ -275,6 +291,8 @@ pub async fn sync(
             local_signatures,
             remote_signatures,
             tuning,
+            Some(scan_policy.clone()),
+            apply_options,
             remote_stream_performance_enabled(profiling_enabled, &remote_info),
             has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
         )
@@ -340,14 +358,17 @@ pub async fn sync(
             let local_base = local_base.clone();
             let local_state = local_state.clone();
             let actions = actions.clone();
+            let scan_policy = scan_policy.clone();
             tokio::task::spawn_blocking(move || {
                 let start = Instant::now();
-                sync_ops::apply_detailed_changes(
+                sync_ops::apply_detailed_changes_with_policy(
                     &local_base,
                     &actions,
                     &remote_detailed_changes,
                     &mut local_all_old,
                     Some(&local_state),
+                    Some(&scan_policy),
+                    apply_options,
                 )?;
                 Ok::<_, color_eyre::eyre::Report>((local_all_old, start.elapsed()))
             })
@@ -630,6 +651,8 @@ async fn stream_detailed_changes<R>(
     local_signatures: Vec<sync_ops::SignatureWithPath>,
     remote_signatures: Vec<sync_ops::SignatureWithPath>,
     tuning: sync_ops::SyncTuning,
+    scan_policy: Option<sync_ops::ScanPolicy>,
+    apply_options: sync_ops::ApplyOptions,
     remote_stream_performance: bool,
     file_byte_chunks: bool,
 ) -> Result<StreamDetailedChangesResult>
@@ -646,11 +669,13 @@ where
         remote_signatures,
         tuning.detail_chunk_bytes(),
     );
-    let mut local_applier = sync_ops::DetailApplier::new_with_attempt(
+    let mut local_applier = sync_ops::DetailApplier::new_with_attempt_and_policy(
         local_base.clone(),
         actions.clone(),
         local_all_old,
         Some(local_state.to_path_buf()),
+        scan_policy,
+        apply_options,
     );
 
     let remote_detail_stream = remote
@@ -1077,6 +1102,7 @@ fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllRes
         force,
         verbose,
         debug_info: _,
+        prune_ignored: _,
         profile_performance: _,
         profile_performance_json: _,
     } = options;

@@ -33,6 +33,7 @@ pub(crate) const CAPABILITY_SYNC_TUNING: &str = "sync-tuning-v1";
 pub(crate) const CAPABILITY_STREAM_PERFORMANCE: &str = "stream-performance-v1";
 pub(crate) const CAPABILITY_FILE_BYTE_CHUNKS: &str = "file-byte-chunks-v1";
 pub(crate) const CAPABILITY_REMOTE_STATE_ID_SELECTION: &str = "remote-state-id-selection-v1";
+pub(crate) const CAPABILITY_APPLY_OPTIONS: &str = "apply-options-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -44,6 +45,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_STREAM_PERFORMANCE,
     CAPABILITY_FILE_BYTE_CHUNKS,
     CAPABILITY_REMOTE_STATE_ID_SELECTION,
+    CAPABILITY_APPLY_OPTIONS,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -128,6 +130,7 @@ pub trait DuetServer {
         stable_id: String,
         legacy_id: Option<String>,
     ) -> Result<String, RPCError>;
+    fn set_apply_options(&mut self, options: sync::ApplyOptions) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -138,6 +141,8 @@ struct DuetServerImpl {
     remote_state_dir: PathBuf,
     all_old: Entries,
     actions: Actions,
+    scan_policy: Option<sync::ScanPolicy>,
+    apply_options: sync::ApplyOptions,
     apply_attempt_id: Option<String>,
     detail_streams: HashMap<DetailStreamId, DetailProducer>,
     apply_streams: HashMap<ApplyStreamId, sync::DetailApplier>,
@@ -156,6 +161,8 @@ impl DuetServerImpl {
             remote_state_dir: profile::remote_state_dir()?,
             all_old: Vec::new(),
             actions: Vec::new(),
+            scan_policy: None,
+            apply_options: sync::ApplyOptions::default(),
             apply_attempt_id: None,
             detail_streams: HashMap::new(),
             apply_streams: HashMap::new(),
@@ -184,6 +191,8 @@ impl DuetServerImpl {
     fn reset_changes_context(&mut self) {
         self.changes_ready = false;
         self.all_old.clear();
+        self.scan_policy = None;
+        self.apply_options = sync::ApplyOptions::default();
         self.reset_actions_context();
     }
 
@@ -274,7 +283,12 @@ impl DuetServer for DuetServerImpl {
         let remote_state = self.initialized_remote_state("set actions")?;
         sync::preflight_state_save(&remote_state)
             .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
-        sync::preflight_apply(&self.base, &actions)
+        sync::preflight_apply_with_policy(
+            &self.base,
+            &actions,
+            self.scan_policy.as_ref(),
+            self.apply_options,
+        )
             .map_err(|e| rpc_report_error("preflight apply", Some(&self.base), e))?;
         self.actions = actions;
         self.actions_ready = true;
@@ -317,6 +331,7 @@ impl DuetServer for DuetServerImpl {
         match result {
             Ok((all_old, changes)) => {
                 self.all_old = all_old;
+                self.scan_policy = Some(sync::ScanPolicy::new(locations, ignore));
                 self.changes_ready = true;
                 Ok(changes)
             }
@@ -364,7 +379,12 @@ impl DuetServer for DuetServerImpl {
         log::debug!("Appling detailed changes, with {} details", details.len());
         let remote_state = self.initialized_remote_state("apply details")?;
         self.accepted_actions("apply details")?;
-        sync::preflight_apply(&self.base, &self.actions)
+        sync::preflight_apply_with_policy(
+            &self.base,
+            &self.actions,
+            self.scan_policy.as_ref(),
+            self.apply_options,
+        )
             .map_err(|e| rpc_report_error("preflight apply details", Some(&self.base), e))?;
         sync::start_apply_attempt(
             "remote",
@@ -374,12 +394,14 @@ impl DuetServer for DuetServerImpl {
             self.apply_attempt_id(),
         )
         .map_err(|e| rpc_report_error("start apply recovery", Some(&remote_state), e))?;
-        let result = sync::apply_detailed_changes(
+        let result = sync::apply_detailed_changes_with_policy(
             &self.base,
             &self.actions,
             &details,
             &mut self.all_old,
             Some(&remote_state),
+            self.scan_policy.as_ref(),
+            self.apply_options,
         );
         match result {
             Ok(()) => {
@@ -502,7 +524,12 @@ impl DuetServer for DuetServerImpl {
     fn begin_apply_stream(&mut self) -> Result<ApplyStreamId, RPCError> {
         let remote_state = self.initialized_remote_state("begin apply stream")?;
         self.accepted_actions("begin apply stream")?;
-        sync::preflight_apply(&self.base, &self.actions)
+        sync::preflight_apply_with_policy(
+            &self.base,
+            &self.actions,
+            self.scan_policy.as_ref(),
+            self.apply_options,
+        )
             .map_err(|e| rpc_report_error("preflight apply stream", Some(&self.base), e))?;
         sync::start_apply_attempt(
             "remote",
@@ -513,11 +540,13 @@ impl DuetServer for DuetServerImpl {
         )
         .map_err(|e| rpc_report_error("start apply recovery", Some(&remote_state), e))?;
         let id = self.next_apply_stream_id();
-        let applier = sync::DetailApplier::new_with_attempt(
+        let applier = sync::DetailApplier::new_with_attempt_and_policy(
             self.base.clone(),
             self.actions.clone(),
             self.all_old.clone(),
             Some(remote_state.clone()),
+            self.scan_policy.clone(),
+            self.apply_options,
         );
         self.apply_streams.insert(id, applier);
         Ok(id)
@@ -698,6 +727,11 @@ impl DuetServer for DuetServerImpl {
         }
         Ok(stable_id)
     }
+
+    fn set_apply_options(&mut self, options: sync::ApplyOptions) -> Result<(), RPCError> {
+        self.apply_options = options;
+        Ok(())
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -844,6 +878,9 @@ mod tests {
         assert!(client
             .select_remote_state_id("stable".to_string(), Some("legacy".to_string()))
             .is_err());
+        assert!(client
+            .set_apply_options(sync::ApplyOptions::default())
+            .is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -854,6 +891,7 @@ mod tests {
                 ("stream_performance", 20),
                 ("apply_file_byte_chunk", 21),
                 ("select_remote_state_id", 22),
+                ("set_apply_options", 23),
             ]
         );
     }
@@ -883,7 +921,8 @@ mod tests {
                 CAPABILITY_SYNC_TUNING.to_string(),
                 CAPABILITY_STREAM_PERFORMANCE.to_string(),
                 CAPABILITY_FILE_BYTE_CHUNKS.to_string(),
-                CAPABILITY_REMOTE_STATE_ID_SELECTION.to_string()
+                CAPABILITY_REMOTE_STATE_ID_SELECTION.to_string(),
+                CAPABILITY_APPLY_OPTIONS.to_string()
             ]
         );
     }

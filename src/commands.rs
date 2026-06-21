@@ -29,6 +29,7 @@ FLAGS:
     -v, --verbose       verbose output
     -n, --dry-run       don't apply changes
         --debug-info    print protocol and capability negotiation details
+        --prune-ignored delete ignored files/directories that block removing a synced parent
         --profile-performance
                          print sync phase timings and transfer counters
         --profile-performance-json <file>

@@ -13,6 +13,7 @@ pub struct SyncOptions {
     pub force: bool,
     pub verbose: bool,
     pub debug_info: bool,
+    pub prune_ignored: bool,
     pub profile_performance: bool,
     pub profile_performance_json: Option<PathBuf>,
 }
@@ -90,6 +91,7 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         force: pargs.contains(["-f", "--force"]),
         verbose: pargs.contains(["-v", "--verbose"]),
         debug_info: pargs.contains("--debug-info"),
+        prune_ignored: pargs.contains("--prune-ignored"),
         profile_performance: pargs.contains("--profile-performance"),
         profile_performance_json,
     };
@@ -182,6 +184,7 @@ fn reject_sync_options(options: &SyncOptions) -> Result<()> {
         || options.force
         || options.verbose
         || options.debug_info
+        || options.prune_ignored
         || options.profile_performance
         || options.profile_performance_json.is_some()
     {
@@ -198,6 +201,7 @@ fn reject_recover_options(options: &SyncOptions, clear: bool) -> Result<()> {
         || options.force
         || options.verbose
         || options.debug_info
+        || options.prune_ignored
         || options.profile_performance
         || options.profile_performance_json.is_some()
         || (options.yes && !clear)
@@ -272,6 +276,7 @@ mod tests {
                 "-b",
                 "-f",
                 "-v",
+                "--prune-ignored",
                 "work",
                 "docs",
             ]),
@@ -286,6 +291,7 @@ mod tests {
                     force: true,
                     verbose: true,
                     debug_info: false,
+                    prune_ignored: true,
                     profile_performance: false,
                     profile_performance_json: None,
                 },
@@ -308,6 +314,7 @@ mod tests {
                     force: false,
                     verbose: false,
                     debug_info: true,
+                    prune_ignored: false,
                     profile_performance: false,
                     profile_performance_json: None,
                 },
@@ -335,6 +342,7 @@ mod tests {
                     force: false,
                     verbose: false,
                     debug_info: false,
+                    prune_ignored: false,
                     profile_performance: true,
                     profile_performance_json: Some(PathBuf::from("profile.json")),
                 },
@@ -357,6 +365,7 @@ mod tests {
                     force: false,
                     verbose: false,
                     debug_info: false,
+                    prune_ignored: false,
                     profile_performance: false,
                     profile_performance_json: None,
                 },

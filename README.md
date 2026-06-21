@@ -20,6 +20,7 @@ FLAGS:
     -v, --verbose       verbose output
     -n, --dry-run       don't apply changes
         --debug-info    print protocol and capability negotiation details
+        --prune-ignored delete ignored files/directories that block removing a synced parent
         --profile-performance
                          print sync phase timings and transfer counters
         --profile-performance-json <file>
@@ -77,6 +78,11 @@ paths containing spaces are not supported in remote profile entries. An optional
 `[ignore]` section specifies glob patterns to ignore. Ignore globs match entry
 basenames, not full relative paths, so `*.tmp` matches `dir/file.tmp` but
 `dir/*.tmp` does not.
+
+Ignored paths are not synchronized or tracked. They are also not deleted by
+default if they physically block removal of a synced parent directory. Use
+`--prune-ignored` only for disposable ignored content, such as generated caches,
+when those ignored children should be deleted to allow the parent removal.
 
 Subsequently, `duet my_profile` will synchronize the two directories.
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+- Added `--prune-ignored` to explicitly delete ignored files or directories that block removal of a synced parent directory.
+
+### Fixed
+- Report ignored and excluded children separately when they block destination directory removal, instead of presenting all blockers as unexpected children.
+
 ## 0.8.8 - 2026-06-20
 
 ### Fixed

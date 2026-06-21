@@ -13,6 +13,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::actions::Action;
+use crate::profile::Ignore;
+use crate::scan::location::{Location, Locations};
 
 use crate::rustsync::{compare, compare_stream, restore_seek, signature, DeltaOp};
 pub use crate::rustsync::{Delta, Signature};
@@ -33,6 +35,23 @@ const MAX_DETAIL_BATCH_PAYLOAD_BYTES: u32 = 64 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 128 * 1024;
 const SYNCED_MODE_MASK: u32 = 0o7777;
 static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ApplyOptions {
+    pub prune_ignored: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScanPolicy {
+    pub locations: Locations,
+    pub ignore: Ignore,
+}
+
+impl ScanPolicy {
+    pub fn new(locations: Locations, ignore: Ignore) -> Self {
+        Self { locations, ignore }
+    }
+}
 
 const ENV_SIGNATURE_WINDOW_MIN: &str = "DUET_SYNC_SIGNATURE_WINDOW_MIN";
 const ENV_SIGNATURE_WINDOW_MAX: &str = "DUET_SYNC_SIGNATURE_WINDOW_MAX";
@@ -473,10 +492,21 @@ pub fn can_stream_details(actions: &[Action]) -> bool {
     })
 }
 
+#[allow(dead_code)]
 pub fn preflight_apply(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
+    preflight_apply_with_policy(base, actions, None, ApplyOptions::default())
+}
+
+pub fn preflight_apply_with_policy(
+    base: &PathBuf,
+    actions: &Vec<Action>,
+    scan_policy: Option<&ScanPolicy>,
+    apply_options: ApplyOptions,
+) -> Result<()> {
     validate_actions(actions)?;
     preflight_source_reads(base, actions)?;
-    preflight_removed_directories(base, actions)?;
+    let removal_policy = RemovalBlockerPolicy::new(scan_policy, apply_options)?;
+    preflight_removed_directories(base, actions, &removal_policy)?;
 
     let readonly_metadata_changes = readonly_directory_metadata_changes(actions);
     let planned_directories = planned_destination_directories(actions);
@@ -1266,12 +1296,143 @@ fn apply_parent_mutations(actions: &Vec<Action>) -> Vec<ParentMutation> {
     mutations
 }
 
-fn preflight_removed_directories(base: &Path, actions: &Vec<Action>) -> Result<()> {
+struct RemovalBlockerPolicy {
+    locations: Locations,
+    ignore: Vec<(String, regex::Regex)>,
+    prune_ignored: bool,
+}
+
+enum RemovalBlockerKind<'a> {
+    Ignored(&'a str),
+    Excluded,
+    Unexpected,
+}
+
+impl RemovalBlockerPolicy {
+    fn new(scan_policy: Option<&ScanPolicy>, apply_options: ApplyOptions) -> Result<Self> {
+        let Some(scan_policy) = scan_policy else {
+            return Ok(Self {
+                locations: Vec::new(),
+                ignore: Vec::new(),
+                prune_ignored: apply_options.prune_ignored,
+            });
+        };
+
+        use fnmatch_regex::glob_to_regex;
+        let mut ignore = Vec::new();
+        for pattern in &scan_policy.ignore {
+            ignore.push((
+                pattern.clone(),
+                glob_to_regex(pattern).wrap_err_with(|| format!("invalid ignore pattern {pattern}"))?,
+            ));
+        }
+
+        let mut locations = scan_policy.locations.clone();
+        locations.sort();
+        Ok(Self {
+            locations,
+            ignore,
+            prune_ignored: apply_options.prune_ignored,
+        })
+    }
+
+    fn classify<'a>(&'a self, relative_path: &Path) -> RemovalBlockerKind<'a> {
+        if self.is_excluded(relative_path) {
+            return RemovalBlockerKind::Excluded;
+        }
+        if let Some(pattern) = self.matching_ignore_pattern(relative_path) {
+            return RemovalBlockerKind::Ignored(pattern);
+        }
+        RemovalBlockerKind::Unexpected
+    }
+
+    fn matching_ignore_pattern(&self, relative_path: &Path) -> Option<&str> {
+        let filename = relative_path.file_name()?.to_str()?;
+        self.ignore
+            .iter()
+            .find(|(_, regex)| regex.is_match(filename))
+            .map(|(pattern, _)| pattern.as_str())
+    }
+
+    fn is_excluded(&self, relative_path: &Path) -> bool {
+        let mut best: Option<&Location> = None;
+        for location in &self.locations {
+            if location_applies(location.path(), relative_path) {
+                let location_specificity = path_specificity(location.path());
+                let replace = best
+                    .map(|best| {
+                        let best_specificity = path_specificity(best.path());
+                        location_specificity > best_specificity
+                            || (location_specificity == best_specificity
+                                && best.is_exclude()
+                                && location.is_include())
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    best = Some(location);
+                }
+            }
+        }
+        best.map(Location::is_exclude).unwrap_or(false)
+    }
+}
+
+fn location_applies(location: &Path, relative_path: &Path) -> bool {
+    location == Path::new(".") || relative_path == location || relative_path.starts_with(location)
+}
+
+fn path_specificity(path: &Path) -> usize {
+    if path == Path::new(".") {
+        0
+    } else {
+        path.components().count()
+    }
+}
+
+fn removal_blocker_error(
+    dirname: &Path,
+    child: &Path,
+    kind: RemovalBlockerKind<'_>,
+    prune_ignored: bool,
+) -> color_eyre::eyre::Report {
+    match kind {
+        RemovalBlockerKind::Ignored(pattern) => {
+            let action = if prune_ignored {
+                "the ignored child appeared after pruning was checked; rerun sync to recheck and prune it"
+            } else {
+                "ignored content is not deleted by default; remove it manually or rerun with --prune-ignored if it is disposable"
+            };
+            eyre!(
+                "destination directory {} is not empty; ignored child {} matched pattern {:?} and would prevent removal. {}",
+                dirname.display(),
+                child.display(),
+                pattern,
+                action
+            )
+        }
+        RemovalBlockerKind::Excluded => eyre!(
+            "destination directory {} is not empty; excluded child {} would prevent removal. Excluded content is outside the sync selection and is not deleted automatically",
+            dirname.display(),
+            child.display()
+        ),
+        RemovalBlockerKind::Unexpected => eyre!(
+            "destination directory {} is not empty; unexpected child {} would prevent removal",
+            dirname.display(),
+            child.display()
+        ),
+    }
+}
+
+fn preflight_removed_directories(
+    base: &Path,
+    actions: &Vec<Action>,
+    policy: &RemovalBlockerPolicy,
+) -> Result<()> {
     let removed_paths = removed_destination_paths(actions);
     for path in removed_paths.iter() {
         let dirname = safe_join(base, path)?;
         if dirname.is_dir() {
-            preflight_removed_directory_contents(base, &dirname, &removed_paths)?;
+            preflight_removed_directory_contents(base, &dirname, &removed_paths, policy)?;
         }
     }
     Ok(())
@@ -1298,6 +1459,7 @@ fn preflight_removed_directory_contents(
     base: &Path,
     dirname: &Path,
     removed_paths: &HashSet<PathBuf>,
+    policy: &RemovalBlockerPolicy,
 ) -> Result<()> {
     for entry in fs::read_dir(dirname)
         .wrap_err_with(|| format!("unable to preflight directory removal {}", dirname.display()))?
@@ -1316,10 +1478,24 @@ fn preflight_removed_directory_contents(
             )
         })?;
         if !removed_paths.contains(relative_path) {
-            return Err(eyre!(
-                "destination directory {} is not empty; unexpected child {} would prevent removal",
-                dirname.display(),
-                path.display()
+            let kind = policy.classify(relative_path);
+            if matches!(kind, RemovalBlockerKind::Ignored(_)) && policy.prune_ignored {
+                let file_type = entry.file_type().wrap_err_with(|| {
+                    format!("unable to preflight directory entry {}", path.display())
+                })?;
+                let base_dev = fs::symlink_metadata(base)
+                    .wrap_err_with(|| {
+                        format!("failed to read sync base metadata for {}", base.display())
+                    })?
+                    .dev();
+                preflight_prunable_ignored_path(base, &path, file_type.is_dir(), base_dev, policy)?;
+                continue;
+            }
+            return Err(removal_blocker_error(
+                dirname,
+                &path,
+                kind,
+                policy.prune_ignored,
             ));
         }
         if entry
@@ -1327,9 +1503,270 @@ fn preflight_removed_directory_contents(
             .wrap_err_with(|| format!("unable to preflight directory entry {}", path.display()))?
             .is_dir()
         {
-            preflight_removed_directory_contents(base, &path, removed_paths)?;
+            preflight_removed_directory_contents(base, &path, removed_paths, policy)?;
         }
     }
+    Ok(())
+}
+
+fn prune_ignored_removal_blockers(
+    base: &Path,
+    dirname: &Path,
+    removed_paths: &HashSet<PathBuf>,
+    policy: &RemovalBlockerPolicy,
+    attempt_state: Option<&Path>,
+) -> Result<()> {
+    for entry in fs::read_dir(dirname)
+        .wrap_err_with(|| format!("unable to preflight directory removal {}", dirname.display()))?
+    {
+        let entry = entry.wrap_err_with(|| {
+            format!(
+                "unable to preflight directory removal entry in {}",
+                dirname.display()
+            )
+        })?;
+        let path = entry.path();
+        let relative_path = path.strip_prefix(base).wrap_err_with(|| {
+            format!(
+                "unable to preflight directory removal path {}",
+                path.display()
+            )
+        })?;
+        let file_type = entry
+            .file_type()
+            .wrap_err_with(|| format!("unable to preflight directory entry {}", path.display()))?;
+        if removed_paths.contains(relative_path) {
+            if file_type.is_dir() {
+                prune_ignored_removal_blockers(base, &path, removed_paths, policy, attempt_state)?;
+            }
+            continue;
+        }
+
+        match policy.classify(relative_path) {
+            RemovalBlockerKind::Ignored(_) if policy.prune_ignored => {
+                record_committed_step(
+                    attempt_state,
+                    "prune-ignored",
+                    &relative_path.to_path_buf(),
+                )?;
+                if file_type.is_dir() {
+                    let base_dev = fs::symlink_metadata(base)
+                        .wrap_err_with(|| {
+                            format!("failed to read sync base metadata for {}", base.display())
+                        })?
+                        .dev();
+                    remove_ignored_dir_all_same_device(
+                        base,
+                        &path,
+                        base_dev,
+                        policy,
+                        attempt_state,
+                    )
+                        .wrap_err_with(|| {
+                            format!("failed to prune ignored directory {}", path.display())
+                        })?;
+                } else {
+                    fs::remove_file(&path).wrap_err_with(|| {
+                        format!("failed to prune ignored file {}", path.display())
+                    })?;
+                }
+            }
+            kind => {
+                return Err(removal_blocker_error(
+                    dirname,
+                    &path,
+                    kind,
+                    policy.prune_ignored,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn preflight_prunable_ignored_path(
+    base: &Path,
+    path: &Path,
+    is_dir: bool,
+    base_dev: u64,
+    policy: &RemovalBlockerPolicy,
+) -> Result<()> {
+    preflight_prune_unlink_parent(path)?;
+    if is_dir {
+        preflight_prunable_ignored_dir(base, path, base_dev, policy)?;
+    }
+    Ok(())
+}
+
+fn preflight_prune_unlink_parent(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        eyre!(
+            "ignored path {} has no parent directory for pruning",
+            path.display()
+        )
+    })?;
+    let meta = fs::symlink_metadata(parent).wrap_err_with(|| {
+        format!(
+            "unable to preflight ignored prune parent {}",
+            parent.display()
+        )
+    })?;
+    if !owner_write_execute(meta.permissions().mode()) {
+        return Err(eyre!(
+            "ignored prune parent {} is not writable",
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_prunable_ignored_dir(
+    base: &Path,
+    path: &Path,
+    base_dev: u64,
+    policy: &RemovalBlockerPolicy,
+) -> Result<()> {
+    let meta = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to read ignored directory {}", path.display()))?;
+    if meta.dev() != base_dev {
+        return Err(eyre!(
+            "ignored directory {} is on another filesystem; refusing to prune it",
+            path.display()
+        ));
+    }
+    if !owner_write_execute(meta.permissions().mode()) {
+        return Err(eyre!(
+            "ignored directory {} is not writable for pruning",
+            path.display()
+        ));
+    }
+
+    for entry in fs::read_dir(path)
+        .wrap_err_with(|| format!("unable to preflight ignored directory {}", path.display()))?
+    {
+        let entry = entry.wrap_err_with(|| {
+            format!(
+                "unable to preflight ignored directory entry in {}",
+                path.display()
+            )
+        })?;
+        let child = entry.path();
+        let relative_child = child.strip_prefix(base).wrap_err_with(|| {
+            format!(
+                "unable to preflight ignored directory path {}",
+                child.display()
+            )
+        })?;
+        if policy.is_excluded(relative_child) {
+            return Err(removal_blocker_error(
+                path,
+                &child,
+                RemovalBlockerKind::Excluded,
+                policy.prune_ignored,
+            ));
+        }
+        let child_meta = fs::symlink_metadata(&child)
+            .wrap_err_with(|| format!("unable to preflight ignored path {}", child.display()))?;
+        if child_meta.is_dir() {
+            preflight_prunable_ignored_dir(base, &child, base_dev, policy)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_ignored_dir_all_same_device(
+    base: &Path,
+    path: &Path,
+    base_dev: u64,
+    policy: &RemovalBlockerPolicy,
+    attempt_state: Option<&Path>,
+) -> Result<()> {
+    preflight_prunable_ignored_dir(base, path, base_dev, policy)?;
+
+    let temp_path = ignored_prune_temp_path(path)?;
+    record_staged_file(attempt_state, &temp_path)?;
+    fs::rename(path, &temp_path).wrap_err_with(|| {
+        format!(
+            "failed to move ignored directory {} aside for pruning",
+            path.display()
+        )
+    })?;
+    remove_quarantined_ignored_path(&temp_path, base_dev)
+}
+
+fn ignored_prune_temp_path(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        eyre!(
+            "ignored path {} has no parent directory for pruning",
+            path.display()
+        )
+    })?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| eyre!("ignored path {} has no file name", path.display()))?
+        .to_string_lossy();
+    for _ in 0..100 {
+        let counter = TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".duet-prune-{}-{}-{}",
+            std::process::id(),
+            counter,
+            filename
+        ));
+        if !temp_path.try_exists().wrap_err_with(|| {
+            format!(
+                "failed to check ignored prune path {}",
+                temp_path.display()
+            )
+        })? {
+            return Ok(temp_path);
+        }
+    }
+
+    Err(eyre!(
+        "failed to choose temporary prune path for {}",
+        path.display()
+    ))
+}
+
+fn remove_quarantined_ignored_path(path: &Path, base_dev: u64) -> Result<()> {
+    let meta = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to read ignored path {}", path.display()))?;
+    if !meta.is_dir() {
+        fs::remove_file(path)
+            .wrap_err_with(|| format!("failed to prune ignored file {}", path.display()))?;
+        return Ok(());
+    }
+    if meta.dev() != base_dev {
+        return Err(eyre!(
+            "ignored directory {} is on another filesystem; refusing to prune it",
+            path.display()
+        ));
+    }
+
+    for entry in fs::read_dir(path)
+        .wrap_err_with(|| format!("failed to read ignored directory {}", path.display()))?
+    {
+        let entry = entry.wrap_err_with(|| {
+            format!(
+                "failed to read ignored directory entry in {}",
+                path.display()
+            )
+        })?;
+        let child = entry.path();
+        let child_meta = fs::symlink_metadata(&child)
+            .wrap_err_with(|| format!("failed to read ignored path {}", child.display()))?;
+        if child_meta.is_dir() {
+            remove_quarantined_ignored_path(&child, base_dev)?;
+        } else {
+            fs::remove_file(&child)
+                .wrap_err_with(|| format!("failed to prune ignored file {}", child.display()))?;
+        }
+    }
+
+    fs::remove_dir(path)
+        .wrap_err_with(|| format!("failed to prune ignored directory {}", path.display()))?;
     Ok(())
 }
 
@@ -2018,6 +2455,8 @@ pub struct DetailApplier {
     all_old: Vec<Entry>,
     attempt_state: Option<PathBuf>,
     recorder: ApplyRecorder,
+    scan_policy: Option<ScanPolicy>,
+    apply_options: ApplyOptions,
     old_index: usize,
     action_index: usize,
     new_entries: Vec<Entry>,
@@ -2025,11 +2464,30 @@ pub struct DetailApplier {
 }
 
 impl DetailApplier {
+    #[allow(dead_code)]
     pub fn new_with_attempt(
         base: PathBuf,
         actions: Vec<Action>,
         all_old: Vec<Entry>,
         attempt_state: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_attempt_and_policy(
+            base,
+            actions,
+            all_old,
+            attempt_state,
+            None,
+            ApplyOptions::default(),
+        )
+    }
+
+    pub fn new_with_attempt_and_policy(
+        base: PathBuf,
+        actions: Vec<Action>,
+        all_old: Vec<Entry>,
+        attempt_state: Option<PathBuf>,
+        scan_policy: Option<ScanPolicy>,
+        apply_options: ApplyOptions,
     ) -> Self {
         DetailApplier {
             base,
@@ -2037,6 +2495,8 @@ impl DetailApplier {
             all_old,
             recorder: ApplyRecorder::new(attempt_state.clone()),
             attempt_state,
+            scan_policy,
+            apply_options,
             old_index: 0,
             action_index: 0,
             new_entries: Vec::new(),
@@ -2435,6 +2895,8 @@ impl DetailApplier {
     }
 
     fn apply_directory_second_pass(&mut self) -> Result<()> {
+        let removal_policy = RemovalBlockerPolicy::new(self.scan_policy.as_ref(), self.apply_options)?;
+        let removed_paths = removed_destination_paths(&self.actions);
         for action in self.actions.iter().rev() {
             match action {
                 Action::Local(change) | Action::ResolvedLocal((_, _), change) => {
@@ -2445,6 +2907,13 @@ impl DetailApplier {
                         Change::Removed(e) => {
                             let dirname = safe_join(&self.base, e.path())?;
                             verify_current_matches_entry(&dirname, e, "remove target")?;
+                            prune_ignored_removal_blockers(
+                                &self.base,
+                                &dirname,
+                                &removed_paths,
+                                &removal_policy,
+                                self.attempt_state.as_deref(),
+                            )?;
                             fs::remove_dir(&dirname)?;
                             record_committed_step(
                                 self.attempt_state.as_deref(),
@@ -2563,6 +3032,7 @@ fn copy_from_source(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn apply_detailed_changes(
     base: &PathBuf,
     actions: &Vec<Action>,
@@ -2570,7 +3040,28 @@ pub fn apply_detailed_changes(
     all_old: &mut Vec<Entry>,
     attempt_state: Option<&Path>,
 ) -> Result<()> {
+    apply_detailed_changes_with_policy(
+        base,
+        actions,
+        details,
+        all_old,
+        attempt_state,
+        None,
+        ApplyOptions::default(),
+    )
+}
+
+pub fn apply_detailed_changes_with_policy(
+    base: &PathBuf,
+    actions: &Vec<Action>,
+    details: &Vec<ChangeDetails>,
+    all_old: &mut Vec<Entry>,
+    attempt_state: Option<&Path>,
+    scan_policy: Option<&ScanPolicy>,
+    apply_options: ApplyOptions,
+) -> Result<()> {
     validate_actions(actions)?;
+    let removal_policy = RemovalBlockerPolicy::new(scan_policy, apply_options)?;
     log::debug!("details.len() = {}", details.len());
     let mut details_iter = details.iter();
     let mut new_entries: Vec<Entry> = Vec::new();
@@ -2809,10 +3300,9 @@ pub fn apply_detailed_changes(
         return Err(eyre!("unexpected extra file detail"));
     }
 
-    // TODO: think how directory removal interacts with "ignore", if we ever implement it
-
     // second pass, in reverse order, to remove directories and update their metadata
     let mut details_iter = leftover_details.iter().rev();
+    let removed_paths = removed_destination_paths(actions);
     for action in actions.iter().rev() {
         match action {
             Action::Local(change) | Action::ResolvedLocal((_, _), change) => {
@@ -2823,6 +3313,13 @@ pub fn apply_detailed_changes(
                     Change::Removed(e) => {
                         let dirname = safe_join(base, e.path())?;
                         verify_current_matches_entry(&dirname, e, "remove target")?;
+                        prune_ignored_removal_blockers(
+                            base,
+                            &dirname,
+                            &removed_paths,
+                            &removal_policy,
+                            attempt_state,
+                        )?;
                         fs::remove_dir(&dirname).wrap_err_with(|| {
                             format!("failed to remove directory {}", dirname.display())
                         })?;
@@ -2837,6 +3334,13 @@ pub fn apply_detailed_changes(
                         let dirname = safe_join(base, e2.path())?;
                         if e1.is_dir() && !e2.is_dir() {
                             verify_current_matches_entry(&dirname, e1, "replace target")?;
+                            prune_ignored_removal_blockers(
+                                base,
+                                &dirname,
+                                &removed_paths,
+                                &removal_policy,
+                                attempt_state,
+                            )?;
                             fs::remove_dir(&dirname).wrap_err_with(|| {
                                 format!("failed to remove directory {}", dirname.display())
                             })?;
@@ -3647,6 +4151,298 @@ mod tests {
         assert!(error.contains("destination directory"), "{}", error);
         assert!(error.contains("unexpected child"), "{}", error);
         assert!(error.contains("untracked.txt"), "{}", error);
+    }
+
+    #[test]
+    fn preflight_classifies_ignored_removed_directory_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir(base.join("removed")).unwrap();
+        fs::create_dir(base.join("removed/__pycache__")).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            vec!["__pycache__".to_string()],
+        );
+
+        let error = preflight_apply_with_policy(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("ignored child"), "{}", error);
+        assert!(error.contains("__pycache__"), "{}", error);
+        assert!(error.contains("--prune-ignored"), "{}", error);
+    }
+
+    #[test]
+    fn preflight_classifies_excluded_removed_directory_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/excluded")).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+                Location::Exclude(PathBuf::from("removed/excluded")),
+            ],
+            Vec::new(),
+        );
+
+        let error = preflight_apply_with_policy(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("excluded child"), "{}", error);
+        assert!(error.contains("outside the sync selection"), "{}", error);
+    }
+
+    #[test]
+    fn preflight_allows_ignored_blocker_with_prune_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            vec!["__pycache__".to_string()],
+        );
+
+        preflight_apply_with_policy(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn preflight_treats_root_include_as_selected_for_ignored_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from(".")),
+            ],
+            vec!["__pycache__".to_string()],
+        );
+
+        preflight_apply_with_policy(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn preflight_does_not_prune_explicitly_excluded_ignored_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+                Location::Exclude(PathBuf::from("removed/__pycache__")),
+            ],
+            vec!["__pycache__".to_string()],
+        );
+
+        let error = preflight_apply_with_policy(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("excluded child"), "{}", error);
+        assert!(base.join("removed/__pycache__").exists());
+    }
+
+    #[test]
+    fn preflight_does_not_prune_excluded_descendant_in_ignored_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/cache")).unwrap();
+        fs::write(base.join("removed/cache/keep.db"), b"keep").unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+                Location::Exclude(PathBuf::from("removed/cache/keep.db")),
+            ],
+            vec!["cache".to_string()],
+        );
+
+        let error = preflight_apply_with_policy(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("excluded child"), "{}", error);
+        assert!(base.join("removed/cache/keep.db").exists());
+    }
+
+    #[test]
+    fn preflight_rejects_ignored_prune_without_unlink_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let removed = base.join("removed");
+        fs::create_dir_all(removed.join("__pycache__")).unwrap();
+        fs::write(removed.join("__pycache__/cache.pyc"), b"cache").unwrap();
+        let mut perms = fs::metadata(&removed).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&removed, perms).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            vec!["__pycache__".to_string()],
+        );
+
+        let error = preflight_apply_with_policy(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        let mut perms = fs::metadata(&removed).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&removed, perms).unwrap();
+        assert!(error.contains("ignored prune parent"), "{}", error);
+        assert!(error.contains("not writable"), "{}", error);
+    }
+
+    #[test]
+    fn apply_prunes_ignored_blocker_before_directory_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/__pycache__")).unwrap();
+        fs::write(base.join("removed/__pycache__/cache.pyc"), b"cache").unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            vec!["__pycache__".to_string()],
+        );
+        let mut all_old = vec![Entry::test_dir(PathBuf::from("removed"))];
+
+        apply_detailed_changes_with_policy(
+            &base,
+            &actions,
+            &Vec::new(),
+            &mut all_old,
+            None,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!base.join("removed").exists());
+        assert!(all_old.is_empty());
+    }
+
+    #[test]
+    fn apply_prunes_ignored_symlink_without_following_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(base.join("removed")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("removed/__pycache__")).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::from("removed")),
+            ],
+            vec!["__pycache__".to_string()],
+        );
+        let mut all_old = vec![Entry::test_dir(PathBuf::from("removed"))];
+
+        apply_detailed_changes_with_policy(
+            &base,
+            &actions,
+            &Vec::new(),
+            &mut all_old,
+            None,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!base.join("removed").exists());
+        assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
     }
 
     #[test]
