@@ -510,14 +510,6 @@ pub async fn preflight(
         prune_ignored: options.prune_ignored,
     };
 
-    let local_fut = state::old_and_changes(
-        &local_base,
-        &path,
-        &prf.locations,
-        &scan_ignore,
-        Some(&local_state),
-    );
-
     let remote_session = open_remote_session(remote_server).await;
     let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
         .await
@@ -532,12 +524,22 @@ pub async fn preflight(
     let remote_locations = prf.locations.clone();
     let remote_ignore = scan_ignore.clone();
     let remote_prune = prf.prune.clone();
+    let remote_info = remote.server_info().await.map_err(server_info_error)?;
+    require_remote_capability(&remote_info, rpc::CAPABILITY_PREFLIGHT_REPORT)?;
+
+    let local_fut = state::old_and_changes(
+        &local_base,
+        &path,
+        &prf.locations,
+        &scan_ignore,
+        Some(&local_state),
+    );
+
     let remote_fut = async {
         remote
             .set_base(remote_base)
             .await
             .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
-        let remote_info = remote.server_info().await.map_err(server_info_error)?;
         if !remote_prune.is_empty() {
             require_remote_capability(&remote_info, rpc::CAPABILITY_PRUNE_PATTERNS)?;
             remote
@@ -554,17 +556,15 @@ pub async fn preflight(
         }
         let remote_id = select_remote_state_id(&remote, &remote_info, local_id, legacy_local_id)
             .await?;
-        let changes = remote
+        remote
             .changes(remote_path, remote_locations, remote_ignore, remote_id)
             .await
-            .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))?;
-        Ok::<_, color_eyre::eyre::Report>((changes, remote_info))
+            .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))
     };
 
     let (local_result, remote_result) = tokio::join!(local_fut, remote_fut);
     let (_, local_changes) = local_result?;
-    let (remote_changes, remote_info) = remote_result?;
-    require_remote_capability(&remote_info, rpc::CAPABILITY_PREFLIGHT_REPORT)?;
+    let remote_changes = remote_result?;
     remote
         .preflight_apply_report(Vec::new(), apply_options)
         .await
