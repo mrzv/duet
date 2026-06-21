@@ -6,11 +6,12 @@
 - Added `--prune-ignored` to explicitly delete ignored files or directories that block removal of a synced parent directory.
 - Added `[prune]` profile patterns for disposable ignored content that may be pruned automatically when blocking synced parent directory removal.
 - Added `duet preflight` to inspect sync actions and directory removal blockers without applying changes.
-- Added structured local/remote preflight blocker reports so interactive syncs can ask before pruning ignored blockers.
+- Added structured local/remote preflight blocker reports for directory removal blockers.
 - Added profile-aware `duet recover <profile>` and `duet recover --remote <profile>` recovery marker inspection and clearing.
 
 ### Fixed
 - Report ignored and excluded children separately when they block destination directory removal, instead of presenting all blockers as unexpected children.
+- Kept ignored directory removal blockers blocking unless `--prune-ignored` is explicitly supplied or the pattern is listed in `[prune]`.
 - Checked remote `preflight-report-v1` support before starting `duet preflight` scans so older remotes fail fast.
 - Ignored symlink permission bits when rechecking remove/replace targets, matching Duet's existing symlink metadata behavior.
 

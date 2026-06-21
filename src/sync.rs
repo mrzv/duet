@@ -51,12 +51,6 @@ impl ApplyPreflightReport {
         self.blockers.is_empty()
     }
 
-    pub fn has_ignored_blockers(&self) -> bool {
-        self.blockers
-            .iter()
-            .any(|blocker| blocker.kind == RemovalBlockerType::Ignored)
-    }
-
     pub fn has_unprunable_blockers(&self) -> bool {
         self.blockers.iter().any(|blocker| !blocker.prunable)
     }
@@ -4443,7 +4437,6 @@ mod tests {
         assert_eq!(report.blockers[0].kind, RemovalBlockerType::Ignored);
         assert_eq!(report.blockers[0].pattern.as_deref(), Some("__pycache__"));
         assert!(!report.blockers[0].prunable);
-        assert!(report.has_ignored_blockers());
         assert!(report.has_unprunable_blockers());
     }
 
@@ -4477,7 +4470,6 @@ mod tests {
         assert_eq!(report.blockers[0].kind, RemovalBlockerType::Ignored);
         assert_eq!(report.blockers[0].pattern.as_deref(), Some("__pycache__"));
         assert!(report.blockers[0].prunable);
-        assert!(report.has_ignored_blockers());
         assert!(!report.has_unprunable_blockers());
     }
 
@@ -4509,7 +4501,6 @@ mod tests {
         assert_eq!(report.blockers[0].kind, RemovalBlockerType::Prune);
         assert_eq!(report.blockers[0].pattern.as_deref(), Some("__pycache__"));
         assert!(report.blockers[0].prunable);
-        assert!(!report.has_ignored_blockers());
         assert!(!report.has_unprunable_blockers());
         preflight_apply_with_policy(&base, &actions, Some(&policy), ApplyOptions::default())
             .unwrap();
@@ -4570,7 +4561,6 @@ mod tests {
             .unwrap();
 
         assert!(report.is_clear());
-        assert!(!report.has_ignored_blockers());
         assert!(!report.has_unprunable_blockers());
     }
 

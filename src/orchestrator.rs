@@ -7,7 +7,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use colored::*;
-use dialoguer::Confirm;
 use essrpc::{RPCError, RPCErrorKind};
 use openssh::{KnownHosts, Session, SessionBuilder};
 
@@ -221,7 +220,6 @@ pub async fn sync(
         &remote_actions,
         &scan_policy,
         apply_options,
-        &options,
     )
     .await?;
     sync_ops::preflight_apply_with_policy(
@@ -591,7 +589,6 @@ pub async fn preflight(
         &remote_actions,
         &scan_policy,
         apply_options,
-        &options,
     )
     .await?;
     sync_ops::preflight_apply_with_policy(&local_base, &actions, Some(&scan_policy), apply_options)?;
@@ -768,33 +765,18 @@ async fn resolve_removal_blockers<R>(
     local_actions: &Actions,
     remote_actions: &Actions,
     scan_policy: &sync_ops::ScanPolicy,
-    mut apply_options: sync_ops::ApplyOptions,
-    options: &SyncOptions,
+    apply_options: sync_ops::ApplyOptions,
 ) -> Result<sync_ops::ApplyOptions>
 where
     R: DuetServerAsync,
 {
-    let mut local_report = sync_ops::preflight_apply_report(
+    let local_report = sync_ops::preflight_apply_report(
         local_base,
         local_actions,
         Some(scan_policy),
         apply_options,
     )?;
-    let mut remote_report = remote_preflight_report(remote, remote_info, remote_actions, apply_options).await?;
-
-    if !apply_options.prune_ignored
-        && (local_report.has_ignored_blockers() || remote_report.has_ignored_blockers())
-        && approve_ignored_pruning(&local_report, &remote_report, options)?
-    {
-        apply_options.prune_ignored = true;
-        local_report = sync_ops::preflight_apply_report(
-            local_base,
-            local_actions,
-            Some(scan_policy),
-            apply_options,
-        )?;
-        remote_report = remote_preflight_report(remote, remote_info, remote_actions, apply_options).await?;
-    }
+    let remote_report = remote_preflight_report(remote, remote_info, remote_actions, apply_options).await?;
 
     ensure_preflight_report_clear("local", &local_report)?;
     ensure_preflight_report_clear("remote", &remote_report)?;
@@ -817,27 +799,6 @@ where
         .preflight_apply_report(remote_actions.clone(), apply_options)
         .await
         .map_err(|e| remote_rpc_error("Failed to get remote preflight report", e))
-}
-
-fn approve_ignored_pruning(
-    local_report: &sync_ops::ApplyPreflightReport,
-    remote_report: &sync_ops::ApplyPreflightReport,
-    options: &SyncOptions,
-) -> Result<bool> {
-    if options.batch || options.dry_run {
-        return Ok(false);
-    }
-    if !options.interactive {
-        return Ok(false);
-    }
-
-    print_preflight_report("local", local_report);
-    print_preflight_report("remote", remote_report);
-    Confirm::new()
-        .with_prompt("Prune ignored blockers before removing synced parent directories?")
-        .default(false)
-        .interact()
-        .wrap_err("failed to read prune confirmation")
 }
 
 fn ensure_preflight_report_clear(side: &str, report: &sync_ops::ApplyPreflightReport) -> Result<()> {
@@ -1991,6 +1952,41 @@ mod tests {
         assert!(remote_stream_performance_enabled(true, &info));
         assert!(!remote_stream_performance_enabled(false, &info));
         assert!(!remote_stream_performance_enabled(true, &without_capability));
+    }
+
+    #[test]
+    fn ignored_removal_blockers_remain_blocking_without_explicit_prune() {
+        let report = sync_ops::ApplyPreflightReport {
+            blockers: vec![sync_ops::RemovalBlocker {
+                parent: PathBuf::from("removed"),
+                child: PathBuf::from("removed/__pycache__"),
+                kind: sync_ops::RemovalBlockerType::Ignored,
+                pattern: Some("__pycache__".to_string()),
+                prunable: false,
+            }],
+        };
+
+        let error = ensure_preflight_report_clear("local", &report)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("directory removal blockers"), "{}", error);
+        assert!(error.contains("--prune-ignored"), "{}", error);
+    }
+
+    #[test]
+    fn prunable_removal_blockers_do_not_block_preflight_report() {
+        let report = sync_ops::ApplyPreflightReport {
+            blockers: vec![sync_ops::RemovalBlocker {
+                parent: PathBuf::from("removed"),
+                child: PathBuf::from("removed/__pycache__"),
+                kind: sync_ops::RemovalBlockerType::Prune,
+                pattern: Some("__pycache__".to_string()),
+                prunable: true,
+            }],
+        };
+
+        ensure_preflight_report_clear("local", &report).unwrap();
     }
 
     #[test]
