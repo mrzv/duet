@@ -87,10 +87,15 @@ local, or the second one can have the form `ssh server-name path/to/duet
 directory-to-synchronize`. After a blank line, there is a list of
 inclusion-exclusion of paths under `directory-to-synchronize` (by default
 nothing is included). Remote commands and base paths are split on whitespace;
-paths containing spaces are not supported in remote profile entries. An optional
-`[ignore]` section specifies glob patterns to ignore. Ignore globs match entry
-basenames, not full relative paths, so `*.tmp` matches `dir/file.tmp` but
-`dir/*.tmp` does not.
+paths containing spaces are not supported in remote profile entries.
+
+Subsequently, `duet my_profile` will synchronize the two directories.
+
+## Ignore and Prune
+
+An optional `[ignore]` section specifies glob patterns to ignore. Ignore globs
+match entry basenames, not full relative paths, so `*.tmp` matches
+`dir/file.tmp` but `dir/*.tmp` does not.
 
 Ignored paths are not synchronized or tracked. They are also not deleted by
 default if they physically block removal of a synced parent directory. Use
@@ -101,8 +106,6 @@ Use `[prune]` for generated, disposable basename globs that should be ignored an
 automatically deleted when they are the only reason a synced parent directory
 cannot be removed. Excluded paths (`-path`) are never pruned automatically.
 Run `duet preflight <profile> [path]` to inspect blockers before applying a sync.
-
-Subsequently, `duet my_profile` will synchronize the two directories.
 
 ## Metadata And Permissions
 
@@ -118,18 +121,6 @@ Permission failures are treated as sync errors. Duet fails fast rather than
 silently skipping unreadable or unwritable paths, because skipping a path can be
 mistaken for a deletion or a legitimate update. Fix the reported permission
 problem and rerun the sync.
-
-## Recovery
-
-If Duet stops after applying filesystem changes but before saving state, it
-leaves an apply recovery marker next to the affected state file and blocks the
-next sync. Run `duet recover <profile>` or `duet recover <statefile>` to inspect
-the local marker, including the side, phase, affected paths, staged temporary
-files, and committed operations. Run `duet recover --remote <profile>` to inspect
-the remote-side marker for a named profile. After you have inspected both sides
-and reconciled any partial changes, add `--clear` to remove the marker and allow
-syncs to resume. Use `--yes` with `--clear` only for non-interactive cleanup after
-that manual inspection.
 
 ## Caveat
 
@@ -167,3 +158,15 @@ duet my_profile ~/Path1/...
 
 duet my_profile .
 ```
+
+## Recovery
+
+If Duet stops after applying filesystem changes but before saving state, it
+leaves an apply recovery marker next to the affected state file and blocks the
+next sync. Run `duet recover <profile>` or `duet recover <statefile>` to inspect
+the local marker, including the side, phase, affected paths, staged temporary
+files, and committed operations. Run `duet recover --remote <profile>` to inspect
+the remote-side marker for a named profile. After you have inspected both sides
+and reconciled any partial changes, add `--clear` to remove the marker and allow
+syncs to resume. Use `--yes` with `--clear` only for non-interactive cleanup after
+that manual inspection.
