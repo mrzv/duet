@@ -1,20 +1,19 @@
 use std::collections::HashMap;
-use std::io::{self, BufWriter};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::{eyre, Report, Result, WrapErr};
 use essrpc::essrpc;
 use essrpc::transports::{BincodeTransport, ReadWrite};
 use essrpc::{RPCError, RPCErrorKind, RPCServer};
 use serde::{Deserialize, Serialize};
 
-use crate::actions::Actions;
+use crate::actions::{self, Actions, LegacyActions};
 use crate::performance::{duration_ms, RemoteStreamProfile};
 use crate::profile;
 use crate::scan::location::Locations;
-use crate::state::{Changes, Entries};
+use crate::state::{ChangesV2, Entries, LegacyChanges, SnapshotFormat};
 use crate::sync::{
     self, ApplyStreamId, ChangeDetails, DetailFrame, DetailProducer, DetailStreamId,
     SignatureWithPath,
@@ -39,6 +38,7 @@ pub(crate) const CAPABILITY_PREFLIGHT_REPORT: &str = "preflight-report-v1";
 pub(crate) const CAPABILITY_RECOVERY: &str = "recovery-v1";
 pub(crate) const CAPABILITY_PREFLIGHT_APPLY: &str = "preflight-apply-v1";
 pub(crate) const CAPABILITY_REMOVAL_BLOCKER_REPORT: &str = "removal-blocker-report-v1";
+pub(crate) const CAPABILITY_CONTENT_DIGEST_BLAKE2B256: &str = "content-digest-blake2b256-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -56,6 +56,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_RECOVERY,
     CAPABILITY_PREFLIGHT_APPLY,
     CAPABILITY_REMOVAL_BLOCKER_REPORT,
+    CAPABILITY_CONTENT_DIGEST_BLAKE2B256,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -78,14 +79,14 @@ pub trait DuetServer {
     // This trait is the wire protocol. To preserve compatibility with older
     // servers, only append methods; never reorder, remove, or change signatures.
     fn set_base(&mut self, base: String) -> Result<(), RPCError>;
-    fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError>;
+    fn set_actions(&mut self, actions: LegacyActions) -> Result<(), RPCError>;
     fn changes(
         &mut self,
         path: PathBuf,
         locations: Locations,
         ignore: profile::Ignore,
         remote_id: String,
-    ) -> Result<Changes, RPCError>;
+    ) -> Result<LegacyChanges, RPCError>;
     fn get_signatures(&self) -> Result<Vec<SignatureWithPath>, RPCError>;
     fn get_detailed_changes(
         &self,
@@ -144,21 +145,46 @@ pub trait DuetServer {
     fn set_prune_patterns(&mut self, prune: profile::Prune) -> Result<(), RPCError>;
     fn preflight_apply_report(
         &self,
-        actions: Actions,
+        actions: LegacyActions,
         options: sync::ApplyOptions,
     ) -> Result<sync::ApplyPreflightReport, RPCError>;
     fn describe_apply_attempt(&self, remote_id: String) -> Result<Option<String>, RPCError>;
     fn clear_apply_attempt(&self, remote_id: String) -> Result<(), RPCError>;
     fn preflight_apply(
         &self,
-        actions: Actions,
+        actions: LegacyActions,
         options: sync::ApplyOptions,
     ) -> Result<(), RPCError>;
     fn removal_blocker_report(
         &self,
+        actions: LegacyActions,
+        options: sync::ApplyOptions,
+    ) -> Result<sync::ApplyPreflightReport, RPCError>;
+    fn changes_v2(
+        &mut self,
+        path: PathBuf,
+        locations: Locations,
+        ignore: profile::Ignore,
+        remote_id: String,
+    ) -> Result<ChangesV2, RPCError>;
+    fn set_actions_v2(&mut self, actions: Actions) -> Result<(), RPCError>;
+    fn preflight_apply_report_v2(
+        &self,
         actions: Actions,
         options: sync::ApplyOptions,
     ) -> Result<sync::ApplyPreflightReport, RPCError>;
+    fn preflight_apply_v2(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<(), RPCError>;
+    fn removal_blocker_report_v2(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<sync::ApplyPreflightReport, RPCError>;
+    fn save_state_v2(&self) -> Result<(), RPCError>;
+    fn prepare_migration_v2(&mut self) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -178,6 +204,8 @@ struct DuetServerImpl {
     next_stream_id: u64,
     tuning: sync::SyncTuning,
     stream_performance: RemoteStreamProfile,
+    current_scan: Entries,
+    restrict: PathBuf,
 }
 
 impl DuetServerImpl {
@@ -199,6 +227,8 @@ impl DuetServerImpl {
             next_stream_id: 1,
             tuning: sync::SyncTuning::legacy(),
             stream_performance: RemoteStreamProfile::default(),
+            current_scan: Vec::new(),
+            restrict: PathBuf::new(),
         })
     }
 
@@ -222,6 +252,8 @@ impl DuetServerImpl {
         self.changes_ready = false;
         self.all_old.clear();
         self.scan_policy = None;
+        self.current_scan.clear();
+        self.restrict.clear();
         self.apply_options = sync::ApplyOptions::default();
         self.reset_actions_context();
     }
@@ -267,6 +299,78 @@ impl DuetServerImpl {
         }
         Ok(())
     }
+
+    fn scan_changes(
+        &mut self,
+        path: PathBuf,
+        locations: Locations,
+        ignore: profile::Ignore,
+        remote_id: String,
+        strong: bool,
+    ) -> Result<ChangesV2, RPCError> {
+        sync::validate_scan_path(&path)
+            .map_err(|e| rpc_report_error("validate scan path", Some(&path), e))?;
+        validate_locations(&locations)
+            .map_err(|e| rpc_report_error("validate scan locations", Some(&path), e))?;
+        profile::validate_remote_state_id(&remote_id)
+            .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
+        self.remote_id = remote_id;
+        self.reset_changes_context();
+        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
+        sync::check_apply_attempt_clear(&remote_state)
+            .map_err(|e| rpc_report_error("check apply recovery", Some(&remote_state), e))?;
+        let result = tokio::runtime::Handle::current().block_on(crate::state::old_and_changes(
+            &self.base,
+            &path,
+            &locations,
+            &ignore,
+            Some(&remote_state),
+            strong,
+        ));
+        match result {
+            Ok(context) => {
+                self.all_old = context.all_old;
+                if context.migration_needed {
+                    crate::state::replace_scope(&mut self.all_old, &path, &context.current);
+                }
+                self.scan_policy = Some(sync::ScanPolicy::with_prune(locations, ignore, self.prune.clone()));
+                self.current_scan = context.current.clone();
+                self.restrict = path.clone();
+                self.changes_ready = true;
+                Ok(ChangesV2 {
+                    changes: context.changes,
+                    current: context.current,
+                    migration_needed: context.migration_needed,
+                })
+            }
+            Err(e) => Err(rpc_report_error("scan changes", Some(&self.base.join(path)), e)),
+        }
+    }
+
+    fn set_actions_internal(&mut self, actions: Actions) -> Result<(), RPCError> {
+        log::debug!("Setting {} actions", actions.len());
+        self.reset_actions_context();
+        sync::validate_actions(&actions)
+            .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
+        let remote_state = self.initialized_remote_state("set actions")?;
+        sync::preflight_state_save(&remote_state)
+            .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
+        sync::preflight_apply_with_policy(&self.base, &actions, self.scan_policy.as_ref(), self.apply_options)
+            .map_err(|e| rpc_report_error("preflight apply", Some(&self.base), e))?;
+        self.actions = actions;
+        self.actions_ready = true;
+        self.stream_performance = RemoteStreamProfile::default();
+        Ok(())
+    }
+
+    fn save_state_as(&self, format: SnapshotFormat) -> Result<(), RPCError> {
+        let remote_state = self.initialized_remote_state("save state")?;
+        self.accepted_actions("save state")?;
+        crate::state::save_entries_as(&remote_state, &self.all_old, format)
+            .map_err(|e| rpc_report_error("save remote state", Some(&remote_state), e))?;
+        sync::finish_apply_attempt(&remote_state)
+            .map_err(|e| rpc_report_error("finish apply recovery", Some(&remote_state), e))
+    }
 }
 
 fn rpc_error(operation: &str, path: Option<&Path>, error: impl std::fmt::Debug) -> RPCError {
@@ -311,25 +415,8 @@ impl DuetServer for DuetServerImpl {
         Ok(())
     }
 
-    fn set_actions(&mut self, actions: Actions) -> Result<(), RPCError> {
-        log::debug!("Setting {} actions", actions.len());
-        self.reset_actions_context();
-        sync::validate_actions(&actions)
-            .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
-        let remote_state = self.initialized_remote_state("set actions")?;
-        sync::preflight_state_save(&remote_state)
-            .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
-        sync::preflight_apply_with_policy(
-            &self.base,
-            &actions,
-            self.scan_policy.as_ref(),
-            self.apply_options,
-        )
-            .map_err(|e| rpc_report_error("preflight apply", Some(&self.base), e))?;
-        self.actions = actions;
-        self.actions_ready = true;
-        self.stream_performance = RemoteStreamProfile::default();
-        Ok(())
+    fn set_actions(&mut self, actions: LegacyActions) -> Result<(), RPCError> {
+        self.set_actions_internal(actions::from_legacy(actions))
     }
 
     fn changes(
@@ -338,49 +425,13 @@ impl DuetServer for DuetServerImpl {
         locations: Locations,
         ignore: profile::Ignore,
         remote_id: String,
-    ) -> Result<Changes, RPCError> {
-        log::debug!("remote id = {}", remote_id);
-        sync::validate_scan_path(&path)
-            .map_err(|e| rpc_report_error("validate scan path", Some(&path), e))?;
-        validate_locations(&locations)
-            .map_err(|e| rpc_report_error("validate scan locations", Some(&path), e))?;
-        profile::validate_remote_state_id(&remote_id)
-            .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
-        self.remote_id = remote_id;
-        self.reset_changes_context();
-        let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
-        sync::check_apply_attempt_clear(&remote_state)
-            .map_err(|e| rpc_report_error("check apply recovery", Some(&remote_state), e))?;
-
-        let handle = tokio::runtime::Handle::current();
-        let result = handle.block_on(async {
-            crate::state::old_and_changes(
-                &self.base,
-                &path,
-                &locations,
-                &ignore,
-                Some(&remote_state),
-            )
-            .await
-        });
-
-        match result {
-            Ok((all_old, changes)) => {
-                self.all_old = all_old;
-                self.scan_policy = Some(sync::ScanPolicy::with_prune(
-                    locations,
-                    ignore,
-                    self.prune.clone(),
-                ));
-                self.changes_ready = true;
-                Ok(changes)
-            }
-            Err(e) => Err(rpc_report_error(
-                "scan changes",
-                Some(&self.base.join(path)),
-                e,
-            )),
-        }
+    ) -> Result<LegacyChanges, RPCError> {
+        Ok(self
+            .scan_changes(path, locations, ignore, remote_id, false)?
+            .changes
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     fn get_signatures(&self) -> Result<Vec<SignatureWithPath>, RPCError> {
@@ -462,42 +513,7 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn save_state(&self) -> Result<(), RPCError> {
-        log::debug!("Saving state");
-        let remote_state = self.initialized_remote_state("save state")?;
-        self.accepted_actions("save state")?;
-        sync::validate_entries("remote state", &self.all_old)
-            .map_err(|e| rpc_report_error("validate remote state", Some(&self.base), e))?;
-        std::fs::create_dir_all(&self.remote_state_dir).map_err(|e| {
-            rpc_error(
-                "create remote state directory",
-                Some(&self.remote_state_dir),
-                e,
-            )
-        })?;
-        log::info!(
-            "Saving remote state {} with {} entries",
-            remote_state.display(),
-            &self.all_old.len()
-        );
-        use atomicwrites::{AllowOverwrite, AtomicFile};
-        let af = AtomicFile::new(&remote_state, AllowOverwrite);
-        let result = af.write(|f| {
-            use std::io::{self, Write};
-            let mut f = BufWriter::new(f);
-            serialize_into(&self.all_old, &mut f, bincode::config::legacy())
-                .map_err(io::Error::other)?;
-            f.flush()?;
-            Ok::<(), io::Error>(())
-        });
-        match result {
-            Ok(_) => {
-                sync::finish_apply_attempt(&remote_state).map_err(|e| {
-                    rpc_report_error("finish apply recovery", Some(&remote_state), e)
-                })?;
-                Ok(())
-            }
-            Err(e) => Err(rpc_error("save remote state", Some(&remote_state), e)),
-        }
+        self.save_state_as(SnapshotFormat::LegacyV1)
     }
 
     fn set_remote_state_dir(&mut self, remote_state_dir: PathBuf) -> Result<(), RPCError> {
@@ -783,9 +799,10 @@ impl DuetServer for DuetServerImpl {
 
     fn preflight_apply_report(
         &self,
-        actions: Actions,
+        actions: LegacyActions,
         options: sync::ApplyOptions,
     ) -> Result<sync::ApplyPreflightReport, RPCError> {
+        let actions = actions::from_legacy(actions);
         let remote_state = self.initialized_remote_state("preflight report")?;
         sync::preflight_state_save(&remote_state)
             .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
@@ -797,9 +814,10 @@ impl DuetServer for DuetServerImpl {
 
     fn preflight_apply(
         &self,
-        actions: Actions,
+        actions: LegacyActions,
         options: sync::ApplyOptions,
     ) -> Result<(), RPCError> {
+        let actions = actions::from_legacy(actions);
         let remote_state = self.initialized_remote_state("preflight apply")?;
         sync::preflight_state_save(&remote_state)
             .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
@@ -823,14 +841,87 @@ impl DuetServer for DuetServerImpl {
 
     fn removal_blocker_report(
         &self,
-        actions: Actions,
+        actions: LegacyActions,
         options: sync::ApplyOptions,
     ) -> Result<sync::ApplyPreflightReport, RPCError> {
+        let actions = actions::from_legacy(actions);
         self.initialized_remote_state("removal blocker report")?;
         sync::validate_actions(&actions)
             .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
         sync::preflight_apply_report(&self.base, &actions, self.scan_policy.as_ref(), options)
             .map_err(|e| rpc_report_error("removal blocker report", Some(&self.base), e))
+    }
+
+    fn changes_v2(
+        &mut self,
+        path: PathBuf,
+        locations: Locations,
+        ignore: profile::Ignore,
+        remote_id: String,
+    ) -> Result<ChangesV2, RPCError> {
+        self.scan_changes(path, locations, ignore, remote_id, true)
+    }
+
+    fn set_actions_v2(&mut self, actions: Actions) -> Result<(), RPCError> {
+        sync::validate_strong_actions(&actions)
+            .map_err(|e| rpc_report_error("validate strong actions", Some(&self.base), e))?;
+        self.set_actions_internal(actions)
+    }
+
+    fn preflight_apply_report_v2(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<sync::ApplyPreflightReport, RPCError> {
+        sync::validate_strong_actions(&actions)
+            .map_err(|e| rpc_report_error("validate strong actions", Some(&self.base), e))?;
+        let remote_state = self.initialized_remote_state("preflight report")?;
+        sync::preflight_state_save(&remote_state)
+            .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
+        sync::validate_actions(&actions)
+            .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
+        sync::preflight_apply_report(&self.base, &actions, self.scan_policy.as_ref(), options)
+            .map_err(|e| rpc_report_error("preflight report", Some(&self.base), e))
+    }
+
+    fn preflight_apply_v2(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<(), RPCError> {
+        sync::validate_strong_actions(&actions)
+            .map_err(|e| rpc_report_error("validate strong actions", Some(&self.base), e))?;
+        let remote_state = self.initialized_remote_state("preflight apply")?;
+        sync::preflight_state_save(&remote_state)
+            .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
+        sync::validate_actions(&actions)
+            .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
+        sync::preflight_apply_with_policy(&self.base, &actions, self.scan_policy.as_ref(), options)
+            .map_err(|e| rpc_report_error("preflight apply", Some(&self.base), e))
+    }
+
+    fn removal_blocker_report_v2(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<sync::ApplyPreflightReport, RPCError> {
+        sync::validate_strong_actions(&actions)
+            .map_err(|e| rpc_report_error("validate strong actions", Some(&self.base), e))?;
+        self.initialized_remote_state("removal blocker report")?;
+        sync::validate_actions(&actions)
+            .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
+        sync::preflight_apply_report(&self.base, &actions, self.scan_policy.as_ref(), options)
+            .map_err(|e| rpc_report_error("removal blocker report", Some(&self.base), e))
+    }
+
+    fn save_state_v2(&self) -> Result<(), RPCError> {
+        self.save_state_as(SnapshotFormat::V2)
+    }
+
+    fn prepare_migration_v2(&mut self) -> Result<(), RPCError> {
+        self.initialized_remote_state("prepare strong digest migration")?;
+        crate::state::replace_scope(&mut self.all_old, &self.restrict, &self.current_scan);
+        Ok(())
     }
 }
 
@@ -994,6 +1085,13 @@ mod tests {
         assert!(client
             .removal_blocker_report(Vec::new(), sync::ApplyOptions::default())
             .is_err());
+        assert!(client.changes_v2(PathBuf::new(), Vec::new(), Vec::new(), "id".into()).is_err());
+        assert!(client.set_actions_v2(Vec::new()).is_err());
+        assert!(client.preflight_apply_report_v2(Vec::new(), sync::ApplyOptions::default()).is_err());
+        assert!(client.preflight_apply_v2(Vec::new(), sync::ApplyOptions::default()).is_err());
+        assert!(client.removal_blocker_report_v2(Vec::new(), sync::ApplyOptions::default()).is_err());
+        assert!(client.save_state_v2().is_err());
+        assert!(client.prepare_migration_v2().is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -1011,6 +1109,13 @@ mod tests {
                 ("clear_apply_attempt", 27),
                 ("preflight_apply", 28),
                 ("removal_blocker_report", 29),
+                ("changes_v2", 30),
+                ("set_actions_v2", 31),
+                ("preflight_apply_report_v2", 32),
+                ("preflight_apply_v2", 33),
+                ("removal_blocker_report_v2", 34),
+                ("save_state_v2", 35),
+                ("prepare_migration_v2", 36),
             ]
         );
     }
@@ -1047,6 +1152,7 @@ mod tests {
                 CAPABILITY_RECOVERY.to_string(),
                 CAPABILITY_PREFLIGHT_APPLY.to_string(),
                 CAPABILITY_REMOVAL_BLOCKER_REPORT.to_string(),
+                CAPABILITY_CONTENT_DIGEST_BLAKE2B256.to_string(),
             ]
         );
     }
@@ -1108,6 +1214,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_and_v2_save_methods_write_negotiated_snapshot_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = DuetServerImpl::new().unwrap();
+        server.remote_state_dir = dir.path().to_path_buf();
+        server.remote_id = "peer".to_string();
+        server.changes_ready = true;
+        server.actions_ready = true;
+        let mut entry = scan::DirEntryWithMeta::test_file(PathBuf::from("a"), 7);
+        entry.set_digest(Some(scan::ContentDigest([3; 32])));
+        server.all_old = vec![entry.clone()];
+        let path = dir.path().join("peer");
+
+        server.save_state().unwrap();
+        let legacy = crate::state::load_entries_with_format(&path).unwrap();
+        assert_eq!(legacy.format, SnapshotFormat::LegacyV1);
+        assert_eq!(legacy.entries[0].digest(), None);
+
+        server.save_state_v2().unwrap();
+        let v2 = crate::state::load_entries_with_format(&path).unwrap();
+        assert_eq!(v2.format, SnapshotFormat::V2);
+        assert_eq!(v2.entries[0].digest(), entry.digest());
+    }
+
+    #[test]
     fn negotiate_sync_tuning_stores_clamped_intersection() {
         let mut server = DuetServerImpl::new().unwrap();
         let request = sync::SyncTuningRequest {
@@ -1156,7 +1286,7 @@ mod tests {
         let actions = vec![Action::Local(Change::Added(
             scan::DirEntryWithMeta::test_file(PathBuf::from("a.txt"), 0),
         ))];
-        let error = server.set_actions(actions).unwrap_err().to_string();
+        let error = server.set_actions(actions::to_legacy(actions)).unwrap_err().to_string();
         assert!(error.contains("changes must be requested"), "{}", error);
         assert!(server.actions.is_empty());
 
@@ -1258,7 +1388,7 @@ mod tests {
             scan::DirEntryWithMeta::test_file(PathBuf::from("a.txt"), 0),
         ))];
 
-        assert!(server.set_actions(actions).is_err());
+        assert!(server.set_actions(actions::to_legacy(actions)).is_err());
         assert!(server.actions.is_empty());
         assert!(!server.actions_ready);
     }
@@ -1290,7 +1420,7 @@ mod tests {
             scan::DirEntryWithMeta::test_dir(PathBuf::from("removed")),
         ))];
         let report = server
-            .preflight_apply_report(actions, sync::ApplyOptions::default())
+            .preflight_apply_report(actions::to_legacy(actions), sync::ApplyOptions::default())
             .unwrap();
 
         assert_eq!(report.blockers.len(), 1);

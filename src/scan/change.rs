@@ -7,13 +7,40 @@ use serde::{Serialize,Deserialize};
 
 use crate::utils::{match_sorted,MatchSorted};
 
-use super::DirEntryWithMeta;
+use super::{DirEntryWithMeta, LegacyEntry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Change {
     Added(DirEntryWithMeta),
     Removed(DirEntryWithMeta),
     Modified(DirEntryWithMeta, DirEntryWithMeta),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LegacyChange {
+    Added(LegacyEntry),
+    Removed(LegacyEntry),
+    Modified(LegacyEntry, LegacyEntry),
+}
+
+impl From<LegacyChange> for Change {
+    fn from(change: LegacyChange) -> Self {
+        match change {
+            LegacyChange::Added(e) => Self::Added(e.into()),
+            LegacyChange::Removed(e) => Self::Removed(e.into()),
+            LegacyChange::Modified(a, b) => Self::Modified(a.into(), b.into()),
+        }
+    }
+}
+
+impl From<Change> for LegacyChange {
+    fn from(change: Change) -> Self {
+        match change {
+            Change::Added(e) => Self::Added(e.into()),
+            Change::Removed(e) => Self::Removed(e.into()),
+            Change::Modified(a, b) => Self::Modified(a.into(), b.into()),
+        }
+    }
 }
 
 impl Change {
@@ -35,6 +62,25 @@ impl Change {
 }
 
 pub fn same(x: &Change, y: &Change) -> bool {
+    same_with_file_contents(x, y, |d1, d2| {
+        match (d1.digest, d2.digest) {
+            (Some(a), Some(b)) => a == b,
+            _ => d1.checksum == d2.checksum,
+        }
+    })
+}
+
+pub fn same_strong(x: &Change, y: &Change) -> bool {
+    same_with_file_contents(x, y, |d1, d2| {
+        matches!((d1.digest, d2.digest), (Some(a), Some(b)) if a == b)
+    })
+}
+
+fn same_with_file_contents(
+    x: &Change,
+    y: &Change,
+    same_file: impl FnOnce(&DirEntryWithMeta, &DirEntryWithMeta) -> bool,
+) -> bool {
     match (x,y) {
         (Change::Removed(_), Change::Removed(_)) => true,
         (Change::Added(d1), Change::Added(d2)) | (Change::Modified(_,d1), Change::Modified(_,d2)) => {
@@ -43,7 +89,7 @@ pub fn same(x: &Change, y: &Change) -> bool {
                 && d1.target == d2.target
                 && d1.is_dir == d2.is_dir
                 && (d1.is_dir || d1.mtime == d2.mtime)
-                && (!d1.is_file() || d1.checksum == d2.checksum)
+                && (!d1.is_file() || same_file(d1, d2))
         },
         _ => false,
     }

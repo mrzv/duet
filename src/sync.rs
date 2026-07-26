@@ -1,4 +1,4 @@
-use super::scan::{Change, DirEntryWithMeta as Entry};
+use super::scan::{Change, ContentDigest, DirEntryWithMeta as Entry};
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -357,6 +357,46 @@ pub fn validate_actions(actions: &[Action]) -> Result<()> {
                 validate_change_paths(right)?;
             }
         }
+    }
+    Ok(())
+}
+
+pub fn validate_strong_actions(actions: &[Action]) -> Result<()> {
+    validate_actions(actions)?;
+    for action in actions {
+        match action {
+            Action::Local(change) | Action::Remote(change) => validate_strong_change(change)?,
+            Action::Conflict(left, right) | Action::Identical(left, right) => {
+                validate_strong_change(left)?;
+                validate_strong_change(right)?;
+            }
+            Action::ResolvedLocal((left, right), change)
+            | Action::ResolvedRemote((left, right), change) => {
+                validate_strong_change(left)?;
+                validate_strong_change(right)?;
+                validate_strong_change(change)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_strong_change(change: &Change) -> Result<()> {
+    match change {
+        Change::Added(entry) | Change::Removed(entry) => validate_strong_entry(entry),
+        Change::Modified(old, new) => {
+            validate_strong_entry(old)?;
+            validate_strong_entry(new)
+        }
+    }
+}
+
+fn validate_strong_entry(entry: &Entry) -> Result<()> {
+    if entry.is_file() && entry.digest().is_none() {
+        return Err(eyre!(
+            "strong-digest action entry {} is missing its content digest",
+            entry.path().display()
+        ));
     }
     Ok(())
 }
@@ -3748,15 +3788,17 @@ fn create_file_with_contents(
             data.len()
         ));
     }
-    let checksum = adler32::adler32(data)
-        .wrap_err_with(|| format!("failed to checksum detail for {}", entry.path().display()))?;
-    if checksum != entry.checksum() {
-        return Err(eyre!(
-            "file detail for {} checksum mismatch: expected {}, got {}",
-            entry.path().display(),
-            entry.checksum(),
-            checksum
-        ));
+    if let Some(expected) = entry.digest() {
+        let actual = content_digest(data);
+        if actual != expected {
+            return Err(eyre!("file detail for {} strong digest mismatch: expected {}, got {}", entry.path().display(), expected, actual));
+        }
+    } else {
+        let checksum = adler32::adler32(data)
+            .wrap_err_with(|| format!("failed to checksum legacy detail for {}", entry.path().display()))?;
+        if checksum != entry.checksum() {
+            return Err(eyre!("file detail for {} legacy checksum mismatch: expected {}, got {}", entry.path().display(), entry.checksum(), checksum));
+        }
     }
 
     ensure_parent_directory(filename)?;
@@ -3811,19 +3853,44 @@ fn verify_open_file_matches_entry(
 
     file.seek(SeekFrom::Start(0))
         .wrap_err_with(|| format!("failed to seek file {}", filename.display()))?;
-    let checksum = adler32::adler32(file)
-        .wrap_err_with(|| format!("failed to checksum {}", filename.display()))?;
-    if checksum != entry.checksum() {
-        return Err(eyre!(
-            "{} {} checksum mismatch: expected {}, got {}",
-            description,
-            entry.path().display(),
-            entry.checksum(),
-            checksum
-        ));
+    if let Some(expected) = entry.digest() {
+        let actual = content_digest_reader(file)
+            .wrap_err_with(|| format!("failed to hash {}", filename.display()))?;
+        if actual != expected {
+            return Err(eyre!("{} {} strong digest mismatch: expected {}, got {}", description, entry.path().display(), expected, actual));
+        }
+    } else {
+        let checksum = adler32::adler32(file)
+            .wrap_err_with(|| format!("failed to checksum legacy file {}", filename.display()))?;
+        if checksum != entry.checksum() {
+            return Err(eyre!("{} {} legacy checksum mismatch: expected {}, got {}", description, entry.path().display(), entry.checksum(), checksum));
+        }
     }
 
     Ok(())
+}
+
+pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
+    let digest = blake2_rfc::blake2b::blake2b(32, &[], data);
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(digest.as_bytes());
+    ContentDigest(bytes)
+}
+
+fn content_digest_reader(reader: &mut impl Read) -> io::Result<ContentDigest> {
+    let mut state = blake2_rfc::blake2b::Blake2b::new(32);
+    let mut buffer = [0; COPY_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        state.update(&buffer[..read]);
+    }
+    let digest = state.finalize();
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(digest.as_bytes());
+    Ok(ContentDigest(bytes))
 }
 
 fn verify_current_matches_entry(filename: &Path, entry: &Entry, description: &str) -> Result<()> {
@@ -3960,6 +4027,21 @@ mod tests {
         entry
     }
 
+    #[test]
+    fn strong_verification_rejects_adler_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = [10, 10, 10, 10];
+        let collision = [11, 9, 9, 11];
+        assert_eq!(adler32::adler32(&expected[..]).unwrap(), adler32::adler32(&collision[..]).unwrap());
+        std::fs::write(dir.path().join("file"), collision).unwrap();
+        let mut entry = test_file_entry("file", &expected);
+        entry.set_digest(Some(content_digest(&expected)));
+
+        let error = verify_file_matches_entry(&dir.path().join("file"), &entry, "target").unwrap_err();
+
+        assert!(error.to_string().contains("strong digest mismatch"), "{}", error);
+    }
+
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().mode() & SYNCED_MODE_MASK
     }
@@ -3987,6 +4069,18 @@ mod tests {
         file.read_to_end(&mut contents).unwrap();
 
         assert_eq!(contents, b"private");
+    }
+
+    #[test]
+    fn strong_actions_reject_regular_files_without_digests() {
+        let mut entry = test_file_entry("file.txt", b"contents");
+        entry.set_digest(None);
+        let actions = vec![Action::Local(Change::Added(entry.clone()))];
+        assert!(validate_strong_actions(&actions).is_err());
+
+        entry.set_digest(Some(content_digest(b"contents")));
+        let actions = vec![Action::Local(Change::Added(entry))];
+        validate_strong_actions(&actions).unwrap();
     }
 
     #[test]

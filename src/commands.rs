@@ -65,6 +65,10 @@ DRY RUN:
     --dry-run checks what sync would do, reports directory removal blockers on
     both sides, validates preflight checks, and exits without applying changes
     or saving state.
+
+COMPATIBILITY:
+    Current peers use BLAKE2b-256 content digests. If either peer is older, Duet
+    warns and intentionally uses Adler-32 compatibility mode with V1 snapshots.
 ",
         built_info::PKG_VERSION
     );
@@ -105,8 +109,9 @@ pub(crate) async fn snapshot(name: String, statefile: Option<PathBuf>) -> Result
     let local_base = full(&prf.local)?;
     let scan_ignore = prf.scan_ignore();
 
-    let current_entries =
+    let mut current_entries =
         state::scan_entries(&local_base, &PathBuf::from(""), &prf.locations, &scan_ignore).await?;
+    state::hash_manifest(&local_base, &mut current_entries).await?;
 
     let statefile = match statefile {
         Some(statefile) => statefile,
@@ -129,16 +134,17 @@ pub(crate) async fn changes(name: String, statefile: Option<PathBuf>) -> Result<
         None => profile::local_state(&name)?,
     };
 
-    let (_, changes) = state::old_and_changes(
+    let changes = state::old_and_changes(
         &local_base,
         &PathBuf::from(""),
         &prf.locations,
         &scan_ignore,
         Some(&statefile),
+        true,
     )
     .await?;
 
-    for c in changes {
+    for c in changes.changes {
         println!("{} {}", c, c.path().display());
     }
 

@@ -36,6 +36,18 @@ pub mod location;
 pub use change::{changes, Change};
 use location::{Location, Locations};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ContentDigest(pub [u8; 32]);
+
+impl std::fmt::Display for ContentDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntryWithMeta {
     path: PathBuf,
@@ -46,7 +58,58 @@ pub struct DirEntryWithMeta {
     target: Option<PathBuf>,
     is_dir: bool,
     checksum: u32,
+    digest: Option<ContentDigest>,
     // TODO: uid and gid
+}
+
+/// Exact pre-digest entry layout used by headerless V1 snapshots and legacy RPCs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyEntry {
+    path: PathBuf,
+    size: u64,
+    mtime: i64,
+    ino: u64,
+    mode: u32,
+    target: Option<PathBuf>,
+    is_dir: bool,
+    checksum: u32,
+}
+
+impl From<LegacyEntry> for DirEntryWithMeta {
+    fn from(entry: LegacyEntry) -> Self {
+        Self {
+            path: entry.path,
+            size: entry.size,
+            mtime: entry.mtime,
+            ino: entry.ino,
+            mode: entry.mode,
+            target: entry.target,
+            is_dir: entry.is_dir,
+            checksum: entry.checksum,
+            digest: None,
+        }
+    }
+}
+
+impl From<DirEntryWithMeta> for LegacyEntry {
+    fn from(entry: DirEntryWithMeta) -> Self {
+        Self {
+            path: entry.path,
+            size: entry.size,
+            mtime: entry.mtime,
+            ino: entry.ino,
+            mode: entry.mode,
+            target: entry.target,
+            is_dir: entry.is_dir,
+            checksum: entry.checksum,
+        }
+    }
+}
+
+impl From<&DirEntryWithMeta> for LegacyEntry {
+    fn from(entry: &DirEntryWithMeta) -> Self {
+        entry.clone().into()
+    }
 }
 
 impl DirEntryWithMeta {
@@ -61,6 +124,7 @@ impl DirEntryWithMeta {
             target: None,
             is_dir: false,
             checksum,
+            digest: None,
         }
     }
 
@@ -75,6 +139,7 @@ impl DirEntryWithMeta {
             target: None,
             is_dir: false,
             checksum,
+            digest: None,
         }
     }
 
@@ -89,6 +154,7 @@ impl DirEntryWithMeta {
             target: None,
             is_dir: true,
             checksum: 0,
+            digest: None,
         }
     }
 
@@ -118,6 +184,7 @@ impl DirEntryWithMeta {
             target: Some(target),
             is_dir: false,
             checksum: 0,
+            digest: None,
         }
     }
 
@@ -126,7 +193,7 @@ impl DirEntryWithMeta {
         (self.is_symlink() || self.mode == other.mode)
             && self.target == other.target
             && self.is_dir == other.is_dir
-            && (self.is_dir || self.same_contents(other))
+            && (self.is_dir || self.same_scan_identity(other))
     }
 
     pub fn starts_with<P: AsRef<Path>>(&self, path: P) -> bool {
@@ -142,6 +209,15 @@ impl DirEntryWithMeta {
     }
 
     pub fn same_contents(&self, other: &Self) -> bool {
+        if self.is_file() && other.is_file() {
+            if let (Some(left), Some(right)) = (self.digest, other.digest) {
+                return self.size == other.size && left == right;
+            }
+        }
+        self.same_scan_identity(other)
+    }
+
+    fn same_scan_identity(&self, other: &Self) -> bool {
         self.size == other.size && self.mtime == other.mtime && self.ino == other.ino
     }
 
@@ -163,6 +239,20 @@ impl DirEntryWithMeta {
 
     pub fn checksum(&self) -> u32 {
         self.checksum
+    }
+
+    pub fn digest(&self) -> Option<ContentDigest> {
+        self.digest
+    }
+
+    pub(crate) fn inherit_content_hashes(&mut self, old: &Self) {
+        self.checksum = old.checksum;
+        self.digest = old.digest;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_digest(&mut self, digest: Option<ContentDigest>) {
+        self.digest = digest;
     }
 
     pub fn set_ino(&mut self, ino: u64) {
@@ -187,7 +277,7 @@ impl DirEntryWithMeta {
         !(self.is_dir || self.is_symlink())
     }
 
-    pub async fn compute_checksum(&mut self, base: &PathBuf) -> Result<()> {
+    pub async fn compute_content_hashes(&mut self, base: &PathBuf) -> Result<()> {
         if !self.is_file() {
             return Ok(());
         }
@@ -201,6 +291,7 @@ impl DirEntryWithMeta {
             .await
             .wrap_err_with(|| format!("unable to open {} for checksum", filename.display()))?;
         let mut hash = RollingAdler32::new();
+        let mut strong = blake2_rfc::blake2b::Blake2b::new(32);
         let mut buffer = [0u8; 64 * 1024];
         loop {
             let read = file
@@ -211,8 +302,13 @@ impl DirEntryWithMeta {
                 break;
             }
             hash.update_buffer(&buffer[..read]);
+            strong.update(&buffer[..read]);
         }
         self.checksum = hash.hash();
+        let digest = strong.finalize();
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(digest.as_bytes());
+        self.digest = Some(ContentDigest(bytes));
 
         Ok(())
     }
@@ -408,6 +504,7 @@ async fn scan_dir(
                 mode: meta.mode(),
                 is_dir: meta.is_dir(),
                 checksum: 0,
+                digest: None,
             })
             .await
             .map_err(|_| eyre!("unable to send scan result for {}", path.display()))?
@@ -627,11 +724,24 @@ mod tests {
         );
 
         entry
-            .compute_checksum(&temp.path().to_path_buf())
+            .compute_content_hashes(&temp.path().to_path_buf())
             .await
             .unwrap();
 
         assert_eq!(entry.checksum(), adler32::adler32(&contents[..]).unwrap());
+        assert_eq!(entry.digest(), Some(crate::sync::content_digest(&contents)));
+    }
+
+    #[test]
+    fn blake2b_256_known_vector_and_adler_collision() {
+        assert_eq!(
+            crate::sync::content_digest(b"").to_string(),
+            "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8"
+        );
+        let a = [10, 10, 10, 10];
+        let b = [11, 9, 9, 11];
+        assert_eq!(adler32::adler32(&a[..]).unwrap(), adler32::adler32(&b[..]).unwrap());
+        assert_ne!(crate::sync::content_digest(&a), crate::sync::content_digest(&b));
     }
 
     #[test]

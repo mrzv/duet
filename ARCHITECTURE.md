@@ -111,9 +111,11 @@ Profile-file state lives next to the profile file:
 and profile identity. This lets the remote side keep separate remembered states
 for different clients and profiles.
 
-Snapshot writes use `atomicwrites` in the sync path so a failed state write does
-not leave a partially written snapshot. Maintenance snapshot writes use
-`state::save_entries()`.
+All snapshot writes use centralized atomic helpers in `state.rs`. Current V2
+snapshots have a magic/version envelope. The decoder also accepts the exact
+headerless V1 field order used by older releases. Strong-digest peers write V2;
+when either peer lacks strong-digest support, both sides deliberately use the
+legacy RPC methods and write headerless V1 snapshots.
 
 Remote endpoints are parsed by `remote::parse_remote()` and support two forms:
 
@@ -154,7 +156,7 @@ src/rpc.rs
 
 src/state.rs
   Snapshot load/save helpers, scan collection, old/current comparison, and
-  checksum computation for changed regular files.
+  dual content-hash computation for changed regular files.
 
 src/scan/mod.rs
   Async filesystem scanner and DirEntryWithMeta snapshot record.
@@ -200,7 +202,7 @@ to the synchronization base plus metadata needed to detect and reproduce state:
 - mode
 - symlink target
 - directory flag
-- checksum for changed regular files
+- legacy Adler-32 checksum and optional BLAKE2b-256 content digest for regular files
 
 Entries are ordered by relative path. This ordering is important because change
 detection and action construction are implemented as sorted merges.
@@ -278,9 +280,18 @@ sorted entries:
 - both paths present but metadata differs -> modified
 - both paths equivalent -> no change
 
-For added and modified regular files, `old_and_changes()` computes an Adler-32
-checksum. The checksum is used to decide whether two sides changed to identical
-content even when mtimes differ.
+For added and modified regular files, `old_and_changes()` computes legacy
+Adler-32 and BLAKE2b-256 in one streaming pass. Metadata/inode identity remains
+the cheap scan comparison; cross-side content equality and strong apply
+verification use BLAKE2b-256. Adler is trusted only in negotiated legacy mode.
+
+When a requested scope contains legacy or hybrid entries without digests, both
+strong-capable peers hash their complete current manifests in that scope once.
+The old metadata change streams preserve which side changed, while actions are
+built from the current strong entries. Divergent content with no metadata change
+becomes a synthetic conflict. The in-memory baseline is replaced only for the
+requested scope before apply; abort and dry-run do not save it, and a successful
+run writes V2 while preserving out-of-scope hybrid entries.
 
 ## Conflict Resolution
 
@@ -310,8 +321,11 @@ Unresolved conflicts are filtered out before the transfer/apply phase when
 ## RPC Boundary
 
 The RPC API is declared in `src/rpc.rs` as the `DuetServer` trait using
-`essrpc`. The trait is the wire protocol: methods are appended for compatibility
-and existing method order/signatures should not be changed.
+`essrpc`. The trait is append-only. Existing methods use explicit
+`LegacyEntry`/`LegacyChange`/`LegacyAction` mirror types so their V1 encodings do
+not change as internal types evolve. V2 variants of every method carrying
+changes or actions are appended and selected by the
+`content-digest-blake2b256-v1` capability.
 
 Core RPC methods:
 
@@ -355,7 +369,8 @@ Streaming RPC methods:
 `ServerInfo` currently advertises protocol version `2` and capabilities for
 profile-file remote state directories, streamed details, batched streamed detail
 frames, apply-attempt preparation and ids, creatable added parents, sync tuning,
-stream performance, file byte chunks, and remote state id selection.
+stream performance, file byte chunks, remote state id selection, and
+BLAKE2b-256 content digests.
 `orchestrator::show_debug_info()` prints client, server, and agreed capabilities
 when `--debug-info` is used.
 
@@ -416,7 +431,7 @@ directories.
 Regular streamed file output uses `TempOutput`: data is written to a bounded
 `.duet-part-<pid>-<counter>` temporary basename in the destination directory and
 renamed into place on finish. Before rename, staged file output is flushed and
-verified against the expected file entry so mismatched content is rejected before
+verified with the expected BLAKE2b-256 digest (or Adler only in legacy mode) so mismatched content is rejected before
 the synchronized snapshot is recorded. `WritableDirGuard` can temporarily add
 owner write permission to an already-synced read-only destination directory and
 restore the original mode afterward. Metadata updates use Unix permission bits

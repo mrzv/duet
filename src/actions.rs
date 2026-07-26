@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::{PathBuf,Component};
 use colored::*;
 use serde::{Serialize,Deserialize};
-use super::scan::change::{Change,same};
+use super::scan::change::{Change, LegacyChange, same, same_strong};
 use super::scan::{DirEntryWithMeta as Entry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +17,52 @@ pub enum Action {
 
 pub type Actions = Vec<Action>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LegacyAction {
+    Local(LegacyChange),
+    Remote(LegacyChange),
+    Conflict(LegacyChange, LegacyChange),
+    ResolvedLocal((LegacyChange, LegacyChange), LegacyChange),
+    ResolvedRemote((LegacyChange, LegacyChange), LegacyChange),
+    Identical(LegacyChange, LegacyChange),
+}
+
+pub type LegacyActions = Vec<LegacyAction>;
+
+impl From<LegacyAction> for Action {
+    fn from(action: LegacyAction) -> Self {
+        match action {
+            LegacyAction::Local(c) => Self::Local(c.into()),
+            LegacyAction::Remote(c) => Self::Remote(c.into()),
+            LegacyAction::Conflict(a, b) => Self::Conflict(a.into(), b.into()),
+            LegacyAction::ResolvedLocal((a, b), c) => Self::ResolvedLocal((a.into(), b.into()), c.into()),
+            LegacyAction::ResolvedRemote((a, b), c) => Self::ResolvedRemote((a.into(), b.into()), c.into()),
+            LegacyAction::Identical(a, b) => Self::Identical(a.into(), b.into()),
+        }
+    }
+}
+
+impl From<Action> for LegacyAction {
+    fn from(action: Action) -> Self {
+        match action {
+            Action::Local(c) => Self::Local(c.into()),
+            Action::Remote(c) => Self::Remote(c.into()),
+            Action::Conflict(a, b) => Self::Conflict(a.into(), b.into()),
+            Action::ResolvedLocal((a, b), c) => Self::ResolvedLocal((a.into(), b.into()), c.into()),
+            Action::ResolvedRemote((a, b), c) => Self::ResolvedRemote((a.into(), b.into()), c.into()),
+            Action::Identical(a, b) => Self::Identical(a.into(), b.into()),
+        }
+    }
+}
+
+pub fn from_legacy(actions: LegacyActions) -> Actions {
+    actions.into_iter().map(Into::into).collect()
+}
+
+pub fn to_legacy(actions: Actions) -> LegacyActions {
+    actions.into_iter().map(Into::into).collect()
+}
+
 impl Action {
     pub fn create(loc: Option<&Change>, roc: Option<&Change>) -> Option<Action> {
         match (loc,roc) {
@@ -30,6 +76,21 @@ impl Action {
                 }
             }
             (None,None) => None,
+        }
+    }
+
+    pub fn create_strong(loc: Option<&Change>, roc: Option<&Change>) -> Option<Action> {
+        match (loc, roc) {
+            (Some(lc), None) => Some(Action::Remote(lc.clone())),
+            (None, Some(rc)) => Some(Action::Local(rc.clone())),
+            (Some(lc), Some(rc)) => {
+                if same_strong(lc, rc) {
+                    Some(Action::Identical(lc.clone(), rc.clone()))
+                } else {
+                    Some(Action::Conflict(lc.clone(), rc.clone()))
+                }
+            }
+            (None, None) => None,
         }
     }
 

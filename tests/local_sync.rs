@@ -1,9 +1,39 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use tempfile::TempDir;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct LegacyEntryFixture {
+    path: PathBuf,
+    size: u64,
+    mtime: i64,
+    ino: u64,
+    mode: u32,
+    target: Option<PathBuf>,
+    is_dir: bool,
+    checksum: u32,
+}
+
+fn write_legacy_file_state(state: &Path, root: &Path, relative: &str, checksum: u32) {
+    let metadata = fs::symlink_metadata(root.join(relative)).unwrap();
+    let entries = vec![LegacyEntryFixture {
+        path: PathBuf::from(relative),
+        size: metadata.size(),
+        mtime: metadata.mtime(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        target: None,
+        is_dir: false,
+        checksum,
+    }];
+    let mut file = fs::File::create(state).unwrap();
+    bincode::serde::encode_into_std_write(&entries, &mut file, bincode::config::legacy()).unwrap();
+}
 
 struct SyncCase {
     _temp: TempDir,
@@ -106,6 +136,46 @@ fn local_added_file_copies_to_remote() {
     assert_success(case.sync());
 
     assert_eq!(read(&case.remote.join("a.txt")), "from local");
+}
+
+#[test]
+fn legacy_migration_reports_metadata_hidden_adler_collision() {
+    let case = SyncCase::new();
+    let original = [10, 10, 10, 10];
+    let collision = [11, 9, 9, 11];
+    let checksum = adler32::adler32(&original[..]).unwrap();
+    assert_eq!(checksum, adler32::adler32(&collision[..]).unwrap());
+    write_bytes(&case.local.join("a.txt"), &original);
+    assert_success(case.sync());
+
+    let local_state = case.profile.with_extension("snp");
+    let remote_state_dir = case.profile.with_extension("remotes");
+    let remote_state = fs::read_dir(&remote_state_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_file())
+        .expect("remote state file");
+    write_legacy_file_state(&local_state, &case.local, "a.txt", checksum);
+    write_legacy_file_state(&remote_state, &case.remote, "a.txt", checksum);
+    let local_state_before = fs::read(&local_state).unwrap();
+    let remote_state_before = fs::read(&remote_state).unwrap();
+
+    let metadata = fs::metadata(case.local.join("a.txt")).unwrap();
+    write_bytes(&case.local.join("a.txt"), &collision);
+    filetime::set_file_mtime(
+        case.local.join("a.txt"),
+        filetime::FileTime::from_unix_time(metadata.mtime(), 0),
+    )
+    .unwrap();
+
+    let output = case.sync();
+    let text = combined_output(&output);
+    assert!(!output.status.success(), "{}", text);
+    assert!(text.contains("conflict"), "{}", text);
+    assert_eq!(fs::read(case.local.join("a.txt")).unwrap(), collision);
+    assert_eq!(fs::read(case.remote.join("a.txt")).unwrap(), original);
+    assert_eq!(fs::read(local_state).unwrap(), local_state_before);
+    assert_eq!(fs::read(remote_state).unwrap(), remote_state_before);
 }
 
 #[test]

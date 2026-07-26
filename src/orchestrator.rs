@@ -1,10 +1,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::BufWriter;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bincode::serde::encode_into_std_write as serialize_into;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use colored::*;
 use essrpc::{RPCError, RPCErrorKind};
@@ -100,19 +98,6 @@ pub async fn sync(
         prune_ignored: options.prune_ignored,
     };
 
-    let local_fut = async {
-        let start = Instant::now();
-        let result = state::old_and_changes(
-            &local_base,
-            &path,
-            &locations,
-            &scan_ignore,
-            Some(&local_state),
-        )
-        .await;
-        (result, start.elapsed())
-    };
-
     let remote_setup_start = Instant::now();
     let remote_session = open_remote_session(remote_server).await;
     let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
@@ -124,43 +109,49 @@ pub async fn sync(
             quit::with_code(SERVER_ERROR_CODE);
         });
     let remote = remote::get_remote(&mut server)?;
+    remote
+        .set_base(remote_base)
+        .await
+        .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
+    let remote_info = remote.server_info().await.map_err(server_info_error)?;
+    if !prf.prune.is_empty() {
+        require_remote_capability(&remote_info, rpc::CAPABILITY_PRUNE_PATTERNS)?;
+        remote.set_prune_patterns(prf.prune.clone()).await
+            .map_err(|e| remote_rpc_error("Couldn't set remote prune patterns", e))?;
+    }
+    if let Some(remote_state_dir) = remote_state_dir {
+        require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
+        remote.set_remote_state_dir(remote_state_dir).await.map_err(remote_state_dir_error)?;
+    }
+    let remote_id = select_remote_state_id(&remote, &remote_info, local_id, legacy_local_id).await?;
+    let strong = has_remote_capability(&remote_info, rpc::CAPABILITY_CONTENT_DIGEST_BLAKE2B256);
+    if !strong {
+        eprintln!("Warning: peer lacks {}; Adler-32 compatibility fallback is active and snapshots will be saved as legacy V1.", rpc::CAPABILITY_CONTENT_DIGEST_BLAKE2B256);
+    }
     performance.record_phase("remote_setup", remote_setup_start.elapsed());
 
+    let local_fut = async {
+        let start = Instant::now();
+        let result = state::old_and_changes(&local_base, &path, &locations, &scan_ignore, Some(&local_state), strong).await;
+        (result, start.elapsed())
+    };
     let remote_path = path.clone();
     let remote_locations = locations.clone();
     let remote_ignore = scan_ignore.clone();
-    let remote_prune = prf.prune.clone();
     let remote_fut = async {
         let start = Instant::now();
-        let result = async {
-            remote
-                .set_base(remote_base)
-                .await
-                .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
-            let remote_info = remote.server_info().await.map_err(server_info_error)?;
-            if !remote_prune.is_empty() {
-                require_remote_capability(&remote_info, rpc::CAPABILITY_PRUNE_PATTERNS)?;
-                remote
-                    .set_prune_patterns(remote_prune)
-                    .await
-                    .map_err(|e| remote_rpc_error("Couldn't set remote prune patterns", e))?;
-            }
-            if let Some(remote_state_dir) = remote_state_dir {
-                require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
-                remote
-                    .set_remote_state_dir(remote_state_dir)
-                    .await
-                    .map_err(remote_state_dir_error)?;
-            }
-            let remote_id = select_remote_state_id(&remote, &remote_info, local_id, legacy_local_id)
-                .await?;
-            let changes = remote
-                .changes(remote_path, remote_locations, remote_ignore, remote_id)
-                .await
-                .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))?;
-            Ok::<_, color_eyre::eyre::Report>((changes, remote_info))
-        }
-        .await;
+        let result = if strong {
+            remote.changes_v2(remote_path, remote_locations, remote_ignore, remote_id).await
+                .map_err(|e| remote_rpc_error("Couldn't get remote V2 changes", e))
+        } else {
+            remote.changes(remote_path, remote_locations, remote_ignore, remote_id).await
+                .map(|changes| state::ChangesV2 {
+                    changes: changes.into_iter().map(Into::into).collect(),
+                    current: Vec::new(),
+                    migration_needed: false,
+                })
+                .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))
+        };
         (result, start.elapsed())
     };
 
@@ -169,8 +160,11 @@ pub async fn sync(
     let (remote_result, remote_scan_duration) = remote_result;
     performance.record_phase("local_scan", local_scan_duration);
     performance.record_phase("remote_scan_rpc", remote_scan_duration);
-    let (mut local_all_old, local_changes) = local_result?;
-    let (remote_changes, remote_info) = remote_result?;
+    let local_context = local_result?;
+    let remote_context = remote_result?;
+    let mut local_all_old = local_context.all_old;
+    let local_changes = local_context.changes;
+    let remote_changes = remote_context.changes;
 
     performance.counters.local_entries = local_all_old.len();
     performance.counters.local_changes = local_changes.len();
@@ -184,13 +178,29 @@ pub async fn sync(
     performance.sync_tuning = Some(tuning.normalized());
 
     let resolve_start = Instant::now();
-    let mut actions = build_actions(&local_changes, &remote_changes);
+    let migration = strong && (local_context.migration_needed || remote_context.migration_needed);
+    let mut actions = if migration {
+        state::replace_scope(&mut local_all_old, &path, &local_context.current);
+        remote.prepare_migration_v2().await
+            .map_err(|e| remote_rpc_error("Couldn't prepare remote strong-digest migration", e))?;
+        build_migration_actions(
+            &local_changes,
+            &remote_changes,
+            &local_context.current,
+            &remote_context.current,
+        )
+    } else {
+        build_actions(&local_changes, &remote_changes, strong)
+    };
     if options.debug_info {
         show_debug_info(&remote_info, tuning);
     }
     performance.counters.total_actions = actions.len();
     let resolution = if options.dry_run {
         show_dry_run_actions(&actions, options.verbose);
+        AllResolution::Proceed
+    } else if migration && actions.is_empty() {
+        println!("Migrating synchronized state to strong content digests");
         AllResolution::Proceed
     } else {
         resolve_actions(&mut actions, options.clone())?
@@ -199,9 +209,19 @@ pub async fn sync(
     performance.counters.identical_actions = num_identical(actions.iter());
     performance.record_phase("resolve_actions", resolve_start.elapsed());
 
+    if migration && performance.counters.unresolved_conflicts > 0 && !options.dry_run {
+        return Err(eyre!(
+            "strong-digest migration found divergent current files; resolve every conflict before migration can save a shared baseline"
+        ));
+    }
+
     if let AllResolution::Abort = resolution {
         println!("Aborting");
         quit::with_code(ABORT_CODE);
+    }
+
+    if strong {
+        sync_ops::validate_strong_actions(&actions)?;
     }
 
     if options.dry_run && actions.is_empty() {
@@ -290,10 +310,13 @@ pub async fn sync(
     }
     if options.dry_run {
         require_remote_capability(&remote_info, rpc::CAPABILITY_PREFLIGHT_APPLY)?;
-        remote
-            .preflight_apply(remote_actions, apply_options)
-            .await
-            .map_err(|e| remote_rpc_error("Failed to preflight remote apply", e))?;
+        if strong {
+            remote.preflight_apply_v2(remote_actions, apply_options).await
+                .map_err(|e| remote_rpc_error("Failed to preflight remote apply", e))?;
+        } else {
+            remote.preflight_apply(crate::actions::to_legacy(remote_actions), apply_options).await
+                .map_err(|e| remote_rpc_error("Failed to preflight remote apply", e))?;
+        }
         performance.record_phase("preflight_and_set_actions", preflight_start.elapsed());
         finish_dry_run(
             performance.counters.total_actions,
@@ -317,10 +340,13 @@ pub async fn sync(
             .await
             .map_err(|e| remote_rpc_error("Failed to set remote apply options", e))?;
     }
-    remote
-        .set_actions(remote_actions)
-        .await
-        .map_err(|e| remote_rpc_error("Failed to set remote actions", e))?;
+    if strong {
+        remote.set_actions_v2(remote_actions).await
+            .map_err(|e| remote_rpc_error("Failed to set remote actions", e))?;
+    } else {
+        remote.set_actions(crate::actions::to_legacy(remote_actions)).await
+            .map_err(|e| remote_rpc_error("Failed to set remote actions", e))?;
+    }
     performance.record_phase("preflight_and_set_actions", preflight_start.elapsed());
     log::debug!("set remote actions");
 
@@ -495,21 +521,13 @@ pub async fn sync(
     let (remote_result, local_result) = tokio::join!(
         async {
             let start = Instant::now();
-            let result = remote.save_state().await;
+            let result = if strong { remote.save_state_v2().await } else { remote.save_state().await };
             (result, start.elapsed())
         },
         tokio::task::spawn_blocking(move || {
             let start = Instant::now();
-            use atomicwrites::{AllowOverwrite, AtomicFile};
-            let af = AtomicFile::new(local_state_for_save, AllowOverwrite);
-            let result = af.write(|f| {
-                use std::io::{self, Write};
-                let mut f = BufWriter::new(f);
-                serialize_into(&local_all_old, &mut f, bincode::config::legacy())
-                    .map_err(io::Error::other)?;
-                f.flush()?;
-                Ok::<(), io::Error>(())
-            });
+            let format = if strong { state::SnapshotFormat::V2 } else { state::SnapshotFormat::LegacyV1 };
+            let result = state::save_entries_as(&local_state_for_save, &local_all_old, format);
             (result, start.elapsed())
         })
     );
@@ -750,18 +768,20 @@ where
     R: DuetServerAsync,
 {
     if has_remote_capability(remote_info, rpc::CAPABILITY_REMOVAL_BLOCKER_REPORT) {
-        return remote
-            .removal_blocker_report(remote_actions.clone(), apply_options)
-            .await
-            .map_err(|e| remote_rpc_error("Failed to get remote removal blocker report", e));
+        return if has_remote_capability(remote_info, rpc::CAPABILITY_CONTENT_DIGEST_BLAKE2B256) {
+            remote.removal_blocker_report_v2(remote_actions.clone(), apply_options).await
+        } else {
+            remote.removal_blocker_report(crate::actions::to_legacy(remote_actions.clone()), apply_options).await
+        }.map_err(|e| remote_rpc_error("Failed to get remote removal blocker report", e));
     }
     if !has_remote_capability(remote_info, rpc::CAPABILITY_PREFLIGHT_REPORT) {
         return Ok(sync_ops::ApplyPreflightReport::default());
     }
-    remote
-        .preflight_apply_report(remote_actions.clone(), apply_options)
-        .await
-        .map_err(|e| remote_rpc_error("Failed to get remote preflight report", e))
+    if has_remote_capability(remote_info, rpc::CAPABILITY_CONTENT_DIGEST_BLAKE2B256) {
+        remote.preflight_apply_report_v2(remote_actions.clone(), apply_options).await
+    } else {
+        remote.preflight_apply_report(crate::actions::to_legacy(remote_actions.clone()), apply_options).await
+    }.map_err(|e| remote_rpc_error("Failed to get remote preflight report", e))
 }
 
 #[cfg(test)]
@@ -1354,10 +1374,93 @@ fn ssh_permission_hint(display: &str, debug: &str) -> Option<String> {
     None
 }
 
-fn build_actions(local_changes: &state::Changes, remote_changes: &state::Changes) -> Actions {
+fn build_actions(
+    local_changes: &state::Changes,
+    remote_changes: &state::Changes,
+    strong: bool,
+) -> Actions {
     utils::match_sorted(local_changes.iter(), remote_changes.iter())
-        .filter_map(|(lc, rc)| Action::create(lc, rc))
+        .filter_map(|(lc, rc)| {
+            if strong {
+                Action::create_strong(lc, rc)
+            } else {
+                Action::create(lc, rc)
+            }
+        })
         .collect()
+}
+
+fn build_migration_actions(
+    local_changes: &state::Changes,
+    remote_changes: &state::Changes,
+    local_current: &state::Entries,
+    remote_current: &state::Entries,
+) -> Actions {
+    use std::collections::BTreeSet;
+    let mut paths = BTreeSet::new();
+    paths.extend(local_current.iter().map(|entry| entry.path().clone()));
+    paths.extend(remote_current.iter().map(|entry| entry.path().clone()));
+    paths.extend(local_changes.iter().map(|change| change.path().clone()));
+    paths.extend(remote_changes.iter().map(|change| change.path().clone()));
+
+    paths.into_iter().filter_map(|path| {
+        let local = local_current.binary_search_by(|entry| entry.path().cmp(&path)).ok().map(|i| &local_current[i]);
+        let remote = remote_current.binary_search_by(|entry| entry.path().cmp(&path)).ok().map(|i| &remote_current[i]);
+        let local_change = local_changes.binary_search_by(|change| change.path().cmp(&path)).ok().map(|i| &local_changes[i]);
+        let remote_change = remote_changes.binary_search_by(|change| change.path().cmp(&path)).ok().map(|i| &remote_changes[i]);
+        let equivalent = match (local, remote) {
+            (None, None) => true,
+            (Some(a), Some(b)) => crate::scan::change::same_strong(&Change::Added(a.clone()), &Change::Added(b.clone())),
+            _ => false,
+        };
+
+        match (local_change.is_some(), remote_change.is_some(), equivalent) {
+            (true, false, _) => migration_change(remote, local).map(Action::Remote),
+            (false, true, _) => migration_change(local, remote).map(Action::Local),
+            (true, true, true) => match (local, remote) {
+                (Some(a), Some(b)) => Some(Action::Identical(Change::Added(a.clone()), Change::Added(b.clone()))),
+                (None, None) => None,
+                _ => unreachable!(),
+            },
+            (true, true, false) | (false, false, false) => {
+                Some(migration_conflict(local, remote))
+            }
+            (false, false, true) => None,
+        }
+    }).collect()
+}
+
+fn migration_conflict(
+    local: Option<&crate::scan::DirEntryWithMeta>,
+    remote: Option<&crate::scan::DirEntryWithMeta>,
+) -> Action {
+    match (local, remote) {
+        (Some(local), Some(remote)) => Action::Conflict(
+            Change::Modified(remote.clone(), local.clone()),
+            Change::Modified(local.clone(), remote.clone()),
+        ),
+        (None, Some(remote)) => Action::Conflict(
+            Change::Removed(remote.clone()),
+            Change::Modified(remote.clone(), remote.clone()),
+        ),
+        (Some(local), None) => Action::Conflict(
+            Change::Modified(local.clone(), local.clone()),
+            Change::Removed(local.clone()),
+        ),
+        (None, None) => unreachable!("migration conflict requires a current entry"),
+    }
+}
+
+fn migration_change(
+    old: Option<&crate::scan::DirEntryWithMeta>,
+    new: Option<&crate::scan::DirEntryWithMeta>,
+) -> Option<Change> {
+    match (old, new) {
+        (None, None) => None,
+        (None, Some(new)) => Some(Change::Added(new.clone())),
+        (Some(old), None) => Some(Change::Removed(old.clone())),
+        (Some(old), Some(new)) => Some(Change::Modified(old.clone(), new.clone())),
+    }
 }
 
 fn changed_bytes(changes: &state::Changes) -> u64 {
@@ -1599,6 +1702,63 @@ fn stable_local_id(machine_id: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::scan;
+
+    fn digested_entry(path: &str, contents: &[u8]) -> scan::DirEntryWithMeta {
+        let mut entry = scan::DirEntryWithMeta::test_file_with_size(
+            PathBuf::from(path),
+            contents.len() as u64,
+            adler32::adler32(contents).unwrap(),
+        );
+        entry.set_digest(Some(sync_ops::content_digest(contents)));
+        entry
+    }
+
+    #[test]
+    fn migration_detects_hidden_adler_collision_as_synthetic_conflict() {
+        let local = digested_entry("same", &[10, 10, 10, 10]);
+        let remote = digested_entry("same", &[11, 9, 9, 11]);
+        assert_eq!(local.checksum(), remote.checksum());
+        assert!(!local.same_contents(&remote));
+
+        let actions = build_migration_actions(&Vec::new(), &Vec::new(), &vec![local], &vec![remote]);
+
+        assert!(matches!(actions.as_slice(), [Action::Conflict(_, _)]));
+    }
+
+    #[test]
+    fn migration_delete_modify_conflict_uses_resolvable_change_shapes() {
+        let old = digested_entry("file", b"old");
+        let remote = digested_entry("file", b"new");
+        let local_changes = vec![Change::Removed(old.clone())];
+        let remote_changes = vec![Change::Modified(old, remote.clone())];
+
+        let actions = build_migration_actions(
+            &local_changes,
+            &remote_changes,
+            &Vec::new(),
+            &vec![remote],
+        );
+
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Conflict(Change::Removed(_), Change::Modified(_, _))]
+        ));
+    }
+
+    #[test]
+    fn migration_preserves_one_side_change_direction_using_current_entries() {
+        let old = digested_entry("file", b"old");
+        let local = digested_entry("file", b"new");
+        let remote = old.clone();
+        let local_changes = vec![Change::Modified(old, local.clone())];
+
+        let actions = build_migration_actions(&local_changes, &Vec::new(), &vec![local.clone()], &vec![remote]);
+
+        match actions.as_slice() {
+            [Action::Remote(Change::Modified(_, new))] => assert_eq!(new.digest(), local.digest()),
+            other => panic!("unexpected migration actions: {:?}", other),
+        }
+    }
 
     #[test]
     fn outbound_locations_are_safe_for_legacy_scanners() {

@@ -3,15 +3,19 @@
 ## Unreleased
 
 ### Added
+- Added BLAKE2b-256 content identity and verification, versioned V2 snapshots, append-only V2 RPC methods, and automatic scope-aware migration from legacy state.
 - Added `--prune-ignored` to explicitly delete ignored files or directories that block removal of a synced parent directory.
 - Added `[prune]` profile patterns for disposable ignored content that may be pruned automatically when blocking synced parent directory removal.
 - Added structured local/remote preflight blocker reports for directory removal blockers.
 - Added profile-aware `duet recover <profile>` and `duet recover --remote <profile>` recovery marker inspection and clearing.
 
 ### Changed
+- Strong-capable peers now use BLAKE2b-256 for cross-side equivalence, stale file checks, and final output verification while retaining Adler-32 only for negotiated compatibility and rustsync rolling blocks.
+- Snapshot maintenance now hashes complete file contents and writes the current version atomically.
 - Expanded `--dry-run` to run the full non-mutating preflight checks, including local and remote directory removal blocker reports.
 
 ### Fixed
+- Detect Adler-32 collisions during state migration as conflicts instead of silently treating divergent files as equivalent.
 - Kept staged files and new directories private and applied final file metadata before publication.
 - Made the most-specific location rule win, with later rules winning for equivalent paths, and fixed `+.` and bare `+` root includes.
 - Report ignored and excluded children separately when they block destination directory removal, instead of presenting all blockers as unexpected children.
