@@ -47,6 +47,7 @@ ctrlc = "3.4.6"
 blake2-rfc = "0.2.18"
 serde_derive = "1.0.219"
 indicatif = "0.17.11"
+libc = "0.2"
 
 [build-dependencies]
 built = { version = "0.7.7", features = ["cargo-lock"] }

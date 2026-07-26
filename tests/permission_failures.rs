@@ -212,17 +212,22 @@ fn assert_permission_denied(result: io::Result<()>, path: &Path, operation: &str
 }
 
 #[test]
-fn local_added_file_mode_propagates_to_remote() {
-    let case = SyncCase::new(&["+a.txt"]);
-    let local_file = case.local.join("a.txt");
-    let remote_file = case.remote.join("a.txt");
-    write(&local_file, "from local");
-    chmod(&local_file, 0o600);
+fn local_added_file_modes_propagate_to_remote() {
+    let files = [("private.txt", 0o600), ("readonly.txt", 0o400), ("normal.txt", 0o644)];
+    let case = SyncCase::new(&["+private.txt", "+readonly.txt", "+normal.txt"]);
+    for (name, requested_mode) in files {
+        let local_file = case.local.join(name);
+        write(&local_file, name);
+        chmod(&local_file, requested_mode);
+    }
 
     assert_success(case.sync());
 
-    assert_eq!(read(&remote_file), "from local");
-    assert_eq!(mode(&remote_file), 0o600);
+    for (name, requested_mode) in files {
+        let remote_file = case.remote.join(name);
+        assert_eq!(read(&remote_file), name);
+        assert_eq!(mode(&remote_file), requested_mode);
+    }
 }
 
 #[test]

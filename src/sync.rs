@@ -5,8 +5,7 @@ use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc;
@@ -2396,13 +2395,90 @@ impl TempOutput {
         })
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn prepare_metadata(&mut self, entry: &Entry) -> Result<Entry> {
         self.flush()?;
         let file = self
             .file
-            .take()
+            .as_ref()
             .ok_or_else(|| eyre!("temporary output is closed"))?;
-        drop(file);
+        let meta = file.metadata().wrap_err_with(|| {
+            format!(
+                "failed to read temporary file metadata {}",
+                self.temp_path.display()
+            )
+        })?;
+        filetime::set_file_handle_times(
+            file,
+            Some(filetime::FileTime::from_unix_time(meta.atime(), 0)),
+            Some(filetime::FileTime::from_unix_time(entry.mtime(), 0)),
+        )
+        .wrap_err_with(|| {
+            format!(
+                "failed to set temporary file time {}",
+                self.temp_path.display()
+            )
+        })?;
+        file.set_permissions(fs::Permissions::from_mode(synced_mode(entry.mode())))
+            .wrap_err_with(|| {
+                format!(
+                    "failed to set temporary file permissions {}",
+                    self.temp_path.display()
+                )
+            })?;
+
+        let final_meta = file.metadata().wrap_err_with(|| {
+            format!(
+                "failed to verify temporary file metadata {}",
+                self.temp_path.display()
+            )
+        })?;
+        if synced_mode(final_meta.mode()) != synced_mode(entry.mode())
+            || final_meta.mtime() != entry.mtime()
+        {
+            return Err(eyre!(
+                "temporary file {} metadata did not match the requested mode and mtime",
+                self.temp_path.display()
+            ));
+        }
+
+        let mut final_entry = entry.clone();
+        final_entry.set_ino(final_meta.ino());
+        Ok(final_entry)
+    }
+
+    fn verify_contents(&mut self, entry: &Entry, description: &str) -> Result<()> {
+        self.flush()?;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| eyre!("temporary output is closed"))?;
+        verify_open_file_matches_entry(file, &self.temp_path, entry, description)
+    }
+
+    fn verify_path_identity(&self, path: &Path) -> Result<()> {
+        let file_meta = self
+            .file
+            .as_ref()
+            .ok_or_else(|| eyre!("temporary output is closed"))?
+            .metadata()
+            .wrap_err("failed to read open temporary file metadata")?;
+        let path_meta = fs::symlink_metadata(path)
+            .wrap_err_with(|| format!("failed to read temporary path {}", path.display()))?;
+        if !path_meta.is_file()
+            || path_meta.dev() != file_meta.dev()
+            || path_meta.ino() != file_meta.ino()
+        {
+            return Err(eyre!(
+                "temporary path {} no longer refers to the open output file",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, entry: &Entry) -> Result<Entry> {
+        let final_entry = self.prepare_metadata(entry)?;
+        self.verify_path_identity(&self.temp_path)?;
         fs::rename(&self.temp_path, &self.final_path).wrap_err_with(|| {
             format!(
                 "failed to rename temporary file {} to {}",
@@ -2410,16 +2486,13 @@ impl TempOutput {
                 self.final_path.display()
             )
         })?;
-        Ok(())
+        self.verify_path_identity(&self.final_path)?;
+        Ok(final_entry)
     }
 
-    fn finish_without_replacing(mut self, description: &str) -> Result<()> {
-        self.flush()?;
-        let file = self
-            .file
-            .take()
-            .ok_or_else(|| eyre!("temporary output is closed"))?;
-        drop(file);
+    fn finish_without_replacing(mut self, description: &str, entry: &Entry) -> Result<Entry> {
+        let final_entry = self.prepare_metadata(entry)?;
+        self.verify_path_identity(&self.temp_path)?;
         match fs::hard_link(&self.temp_path, &self.final_path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -2439,10 +2512,11 @@ impl TempOutput {
                 });
             }
         }
+        self.verify_path_identity(&self.final_path)?;
         fs::remove_file(&self.temp_path).wrap_err_with(|| {
             format!("failed to remove temporary file {}", self.temp_path.display())
         })?;
-        Ok(())
+        Ok(final_entry)
     }
 
     fn temp_path(&self) -> &Path {
@@ -2470,11 +2544,22 @@ fn create_temp_output_file(final_path: &Path) -> Result<(PathBuf, fs::File)> {
             TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
         ));
         match fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&temp_path)
         {
-            Ok(file) => return Ok((temp_path, file)),
+            Ok(file) => {
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to normalize temporary file permissions {}",
+                            temp_path.display()
+                        )
+                    })?;
+                return Ok((temp_path, file));
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
                 return Err(e).wrap_err_with(|| {
@@ -2632,14 +2717,49 @@ impl ApplyRecorder {
 
 fn ensure_parent_directory(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).wrap_err_with(|| {
+        let mut missing = Vec::new();
+        let mut current = parent;
+        while !current.try_exists().wrap_err_with(|| {
             format!(
-                "failed to create destination parent directory {}",
-                parent.display()
+                "failed to check destination parent directory {}",
+                current.display()
             )
-        })?;
+        })? {
+            missing.push(current);
+            current = current.parent().ok_or_else(|| {
+                eyre!(
+                    "destination parent directory {} has no existing ancestor",
+                    parent.display()
+                )
+            })?;
+        }
+        for directory in missing.into_iter().rev() {
+            create_private_directory(directory)?;
+        }
     }
     Ok(())
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .wrap_err_with(|| format!("failed to create directory {}", path.display()))?;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .wrap_err_with(|| format!("failed to open new directory {}", path.display()))?;
+    let meta = directory
+        .metadata()
+        .wrap_err_with(|| format!("failed to inspect new directory {}", path.display()))?;
+    if !meta.is_dir() {
+        return Err(eyre!("new directory path {} is not a directory", path.display()));
+    }
+    let private_mode = 0o700 | (meta.mode() & 0o2000);
+    directory
+        .set_permissions(fs::Permissions::from_mode(private_mode))
+        .wrap_err_with(|| format!("failed to normalize directory permissions {}", path.display()))
 }
 
 enum ApplyState {
@@ -2896,7 +3016,7 @@ impl DetailApplier {
                             e.path(),
                         )?;
                     } else if e.is_dir() {
-                        fs::create_dir(&filename)?;
+                        create_private_directory(&filename)?;
                         record_committed_step(
                             self.attempt_state.as_deref(),
                             "create-dir",
@@ -2946,7 +3066,7 @@ impl DetailApplier {
                                     e2.path(),
                                 )?;
                             } else if e2.is_dir() {
-                                fs::create_dir(&filename)?;
+                                create_private_directory(&filename)?;
                                 record_committed_step(
                                     self.attempt_state.as_deref(),
                                     "create-dir",
@@ -2984,7 +3104,7 @@ impl DetailApplier {
                                 e2.path(),
                             )?;
                         } else if e2.is_dir() {
-                            fs::create_dir(&filename)?;
+                            create_private_directory(&filename)?;
                             record_committed_step(
                                 self.attempt_state.as_deref(),
                                 "create-dir",
@@ -3080,17 +3200,16 @@ impl DetailApplier {
             _ => return Err(eyre!("file detail finished for non-file action")),
         };
         let filename = safe_join(&self.base, entry.path())?;
-        output.flush()?;
-        verify_file_matches_entry(output.temp_path(), entry, "file output")?;
-        if let Some(old_entry) = replacement_old_entry(&self.actions[action_index]) {
+        output.verify_contents(entry, "file output")?;
+        let final_entry = if let Some(old_entry) = replacement_old_entry(&self.actions[action_index]) {
             verify_current_matches_entry(&filename, old_entry, "rename target")?;
-            output.finish()?;
+            output.finish(entry)?
         } else {
-            output.finish_without_replacing("rename target")?;
-        }
+            output.finish_without_replacing("rename target", entry)?
+        };
         self.recorder
             .record_committed_step("rename-file", entry.path())?;
-        self.new_entries.push(update_meta(&filename, entry)?);
+        self.new_entries.push(final_entry);
         self.recorder
             .record_committed_step("update-metadata", entry.path())?;
         self.recorder
@@ -3331,17 +3450,14 @@ pub fn apply_detailed_changes_with_policy(
                             new_entries.push(update_meta(&filename, e)?);
                             record_committed_step(attempt_state, "update-metadata", e.path())?;
                         } else if e.is_dir() {
-                            fs::create_dir(&filename).wrap_err_with(|| {
-                                format!("failed to create directory {}", filename.display())
-                            })?;
+                            create_private_directory(&filename)?;
                             record_committed_step(attempt_state, "create-dir", e.path())?;
                             // new entry gets updated in the second pass, after all the updates in
                             // the directory are finished
                         } else {
                             log::debug!("Adding {}", e.path().display());
                             let detail = next_detail(&mut details_iter, e.path())?;
-                            create_file(&filename, detail, e, attempt_state)?;
-                            new_entries.push(update_meta(&filename, e)?);
+                            new_entries.push(create_file(&filename, detail, e, attempt_state)?);
                             record_committed_step(attempt_state, "update-metadata", e.path())?;
                         }
                     }
@@ -3352,13 +3468,15 @@ pub fn apply_detailed_changes_with_policy(
                                 if !e1.same_contents(&e2) {
                                     let detail = next_detail(&mut details_iter, e2.path())?;
                                     match detail {
-                                        ChangeDetails::Diff(delta) => update_file_with_diff(
-                                            &filename,
-                                            e1,
-                                            e2,
-                                            delta,
-                                            attempt_state,
-                                        )?,
+                                        ChangeDetails::Diff(delta) => {
+                                            new_entries.push(update_file_with_diff(
+                                                &filename,
+                                                e1,
+                                                e2,
+                                                delta,
+                                                attempt_state,
+                                            )?);
+                                        }
                                         _ => {
                                             return Err(eyre!(
                                             "mismatch when adding {}, expected Diff, but not found",
@@ -3373,7 +3491,9 @@ pub fn apply_detailed_changes_with_policy(
                                         "metadata target",
                                     )?;
                                 }
-                                new_entries.push(update_meta(&filename, e2)?);
+                                if e1.same_contents(e2) {
+                                    new_entries.push(update_meta(&filename, e2)?);
+                                }
                                 record_committed_step(
                                     attempt_state,
                                     "update-metadata",
@@ -3407,9 +3527,7 @@ pub fn apply_detailed_changes_with_policy(
                                         e2.path(),
                                     )?;
                                 } else if e2.is_dir() {
-                                    fs::create_dir(&filename).wrap_err_with(|| {
-                                        format!("failed to create directory {}", filename.display())
-                                    })?;
+                                    create_private_directory(&filename)?;
                                     record_committed_step(attempt_state, "create-dir", e2.path())?;
                                 } else {
                                     return Err(eyre!(
@@ -3427,8 +3545,12 @@ pub fn apply_detailed_changes_with_policy(
                             record_committed_step(attempt_state, "remove-symlink", e1.path())?;
                             if e2.is_file() {
                                 let detail = next_detail(&mut details_iter, e2.path())?;
-                                create_file(&filename, detail, e2, attempt_state)?;
-                                new_entries.push(update_meta(&filename, e2)?);
+                                new_entries.push(create_file(
+                                    &filename,
+                                    detail,
+                                    e2,
+                                    attempt_state,
+                                )?);
                                 record_committed_step(
                                     attempt_state,
                                     "update-metadata",
@@ -3454,9 +3576,7 @@ pub fn apply_detailed_changes_with_policy(
                                     e2.path(),
                                 )?;
                             } else if e2.is_dir() {
-                                fs::create_dir(&filename).wrap_err_with(|| {
-                                    format!("failed to create directory {}", filename.display())
-                                })?;
+                                create_private_directory(&filename)?;
                                 record_committed_step(attempt_state, "create-dir", e2.path())?;
                                 // new entry gets updated in the second pass, after all the updates in
                                 // the directory are finished
@@ -3537,6 +3657,7 @@ pub fn apply_detailed_changes_with_policy(
                     }
                     Change::Modified(e1, e2) => {
                         let dirname = safe_join(base, e2.path())?;
+                        let mut prepared_entry = None;
                         if e1.is_dir() && !e2.is_dir() {
                             verify_current_matches_entry(&dirname, e1, "replace target")?;
                             prune_ignored_removal_blockers(
@@ -3567,13 +3688,17 @@ pub fn apply_detailed_changes_with_policy(
                                 let detail = details_iter.next().ok_or_else(|| {
                                     eyre!("missing detail for {}", e2.path().display())
                                 })?;
-                                create_file(&dirname, detail, e2, attempt_state)?;
+                                prepared_entry =
+                                    Some(create_file(&dirname, detail, e2, attempt_state)?);
                             }
                         }
                         if e1.is_dir() && e2.is_dir() {
                             verify_current_matches_entry(&dirname, e1, "metadata target")?;
                         }
-                        new_entries.push(update_meta(&dirname, e2)?);
+                        new_entries.push(match prepared_entry {
+                            Some(entry) => entry,
+                            None => update_meta(&dirname, e2)?,
+                        });
                         record_committed_step(attempt_state, "update-metadata", e2.path())?;
                     }
                 }
@@ -3599,7 +3724,7 @@ fn create_file(
     detail: &ChangeDetails,
     entry: &Entry,
     attempt_state: Option<&Path>,
-) -> Result<()> {
+) -> Result<Entry> {
     match detail {
         ChangeDetails::Contents(v) => create_file_with_contents(filename, v, entry, attempt_state),
         _ => Err(eyre!(
@@ -3614,7 +3739,7 @@ fn create_file_with_contents(
     data: &[u8],
     entry: &Entry,
     attempt_state: Option<&Path>,
-) -> Result<()> {
+) -> Result<Entry> {
     if data.len() as u64 != entry.size() {
         return Err(eyre!(
             "file detail for {} size mismatch: expected {}, got {}",
@@ -3643,15 +3768,29 @@ fn create_file_with_contents(
         .ok_or_else(|| eyre!("temporary output is closed"))?
         .write_all(data)
         .wrap_err_with(|| format!("failed to write temporary file for {}", filename.display()))?;
-    output.flush()?;
-    verify_file_matches_entry(output.temp_path(), entry, "file output")?;
-    output.finish_without_replacing("rename target")?;
+    output.verify_contents(entry, "file output")?;
+    let final_entry = output.finish_without_replacing("rename target", entry)?;
     record_committed_step(attempt_state, "rename-file", filename)?;
-    Ok(())
+    Ok(final_entry)
 }
 
 fn verify_file_matches_entry(filename: &Path, entry: &Entry, description: &str) -> Result<()> {
-    let meta = fs::symlink_metadata(filename)
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(filename)
+        .wrap_err_with(|| format!("failed to open file {}", filename.display()))?;
+    verify_open_file_matches_entry(&mut file, filename, entry, description)
+}
+
+fn verify_open_file_matches_entry(
+    file: &mut fs::File,
+    filename: &Path,
+    entry: &Entry,
+    description: &str,
+) -> Result<()> {
+    let meta = file
+        .metadata()
         .wrap_err_with(|| format!("failed to read metadata for {}", filename.display()))?;
     if !meta.is_file() {
         return Err(eyre!(
@@ -3670,9 +3809,9 @@ fn verify_file_matches_entry(filename: &Path, entry: &Entry, description: &str) 
         ));
     }
 
-    let contents = fs::read(filename)
-        .wrap_err_with(|| format!("failed to read file {}", filename.display()))?;
-    let checksum = adler32::adler32(&contents[..])
+    file.seek(SeekFrom::Start(0))
+        .wrap_err_with(|| format!("failed to seek file {}", filename.display()))?;
+    let checksum = adler32::adler32(file)
         .wrap_err_with(|| format!("failed to checksum {}", filename.display()))?;
     if checksum != entry.checksum() {
         return Err(eyre!(
@@ -3756,7 +3895,7 @@ fn update_file_with_diff(
     new_entry: &Entry,
     delta: &Delta,
     attempt_state: Option<&Path>,
-) -> Result<()> {
+) -> Result<Entry> {
     validate_delta(delta)?;
     verify_file_matches_entry(filename, old_entry, "diff source")?;
     let source = fs::File::open(filename)
@@ -3769,12 +3908,11 @@ fn update_file_with_diff(
         .ok_or_else(|| eyre!("temporary output is closed"))?;
     restore_seek(output_file, source, vec![0; delta.window], delta)
         .wrap_err_with(|| format!("failed to restore diff for {}", filename.display()))?;
-    output.flush()?;
-    verify_file_matches_entry(output.temp_path(), new_entry, "diff output")?;
+    output.verify_contents(new_entry, "diff output")?;
     verify_current_matches_entry(filename, old_entry, "rename target")?;
-    output.finish()?;
+    let final_entry = output.finish(new_entry)?;
     record_committed_step(attempt_state, "rename-file", filename)?;
-    Ok(())
+    Ok(final_entry)
 }
 
 fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
@@ -3816,6 +3954,16 @@ mod tests {
         )
     }
 
+    fn test_file_entry_with_mode(path: &str, contents: &[u8], mode: u32) -> Entry {
+        let mut entry = test_file_entry(path, contents);
+        entry.set_mode(mode);
+        entry
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().mode() & SYNCED_MODE_MASK
+    }
+
     fn synced_existing_file_entry(base: &Path, path: &str, contents: &[u8]) -> Entry {
         let filename = base.join(path);
         fs::write(&filename, contents).unwrap();
@@ -3824,6 +3972,204 @@ mod tests {
 
     fn synced_existing_dir_entry(base: &Path, path: &str) -> Entry {
         update_meta(&base.join(path), &Entry::test_dir(PathBuf::from(path))).unwrap()
+    }
+
+    #[test]
+    fn temp_output_is_private_and_readable_through_its_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut output = TempOutput::new(dir.path().join("out.txt")).unwrap();
+
+        assert_eq!(mode(output.temp_path()), 0o600);
+        let file = output.file.as_mut().unwrap();
+        file.write_all(b"private").unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+
+        assert_eq!(contents, b"private");
+    }
+
+    #[test]
+    fn file_verification_rejects_symlink_to_matching_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.txt"), b"contents").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.path().join("link.txt")).unwrap();
+        let entry = test_file_entry("link.txt", b"contents");
+
+        let error = verify_file_matches_entry(
+            &dir.path().join("link.txt"),
+            &entry,
+            "verification target",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("failed to open file"));
+    }
+
+    #[test]
+    fn streamed_files_publish_requested_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let requested_modes = [0o600, 0o400, 0o000, 0o644];
+        let entries = requested_modes
+            .iter()
+            .enumerate()
+            .map(|(index, requested_mode)| {
+                test_file_entry_with_mode(
+                    &format!("file-{}.txt", index),
+                    b"contents",
+                    *requested_mode,
+                )
+            })
+            .collect::<Vec<_>>();
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        let mut applier = DetailApplier::new_with_attempt(base.clone(), actions, Vec::new(), None);
+
+        for (index, entry) in entries.iter().enumerate() {
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: index as u32,
+                    payload: DetailPayload::FileBegin,
+                })
+                .unwrap();
+            let output = match applier.state.as_ref().unwrap() {
+                ApplyState::File { output, .. } => output,
+                _ => panic!("expected streamed file state"),
+            };
+            assert_eq!(mode(output.temp_path()), 0o600);
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: index as u32,
+                    payload: DetailPayload::FileBytes(b"contents".to_vec()),
+                })
+                .unwrap();
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: index as u32,
+                    payload: DetailPayload::FileEnd,
+                })
+                .unwrap();
+            assert_eq!(mode(&base.join(entry.path())), requested_modes[index]);
+            assert_eq!(fs::metadata(base.join(entry.path())).unwrap().mtime(), entry.mtime());
+        }
+
+        let final_entries = applier.finish().unwrap();
+        assert_eq!(final_entries.len(), entries.len());
+        for final_entry in final_entries {
+            let metadata = fs::metadata(base.join(final_entry.path())).unwrap();
+            assert_eq!(final_entry.ino(), metadata.ino());
+        }
+    }
+
+    #[test]
+    fn streamed_diff_stays_private_until_final_metadata_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let old = synced_existing_file_entry(&base, "file.txt", b"old");
+        let new = test_file_entry_with_mode("file.txt", b"new!", 0o400);
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let mut applier = DetailApplier::new_with_attempt(base.clone(), actions, vec![old], None);
+
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffBegin,
+            })
+            .unwrap();
+        let output = match applier.state.as_ref().unwrap() {
+            ApplyState::Diff { output, .. } => output,
+            _ => panic!("expected streamed diff state"),
+        };
+        assert_eq!(mode(output.temp_path()), 0o600);
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffBytes(b"new!".to_vec()),
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::DiffEnd,
+            })
+            .unwrap();
+
+        assert_eq!(mode(&base.join("file.txt")), 0o400);
+        assert_eq!(fs::metadata(base.join("file.txt")).unwrap().mtime(), 0);
+    }
+
+    #[test]
+    fn fallback_contents_publish_requested_modes() {
+        let requested_modes = [0o600, 0o400, 0o000, 0o644];
+        for requested_mode in requested_modes {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().to_path_buf();
+            let entry = test_file_entry_with_mode("file.txt", b"contents", requested_mode);
+            let actions = vec![Action::Local(Change::Added(entry))];
+            let details = vec![ChangeDetails::Contents(b"contents".to_vec())];
+            let mut all_old = Vec::new();
+
+            apply_detailed_changes(&base, &actions, &details, &mut all_old, None).unwrap();
+
+            assert_eq!(mode(&base.join("file.txt")), requested_mode);
+            assert_eq!(fs::metadata(base.join("file.txt")).unwrap().mtime(), 0);
+            assert_ne!(fs::metadata(base.join("file.txt")).unwrap().ino(), 0);
+        }
+    }
+
+    #[test]
+    fn fallback_diff_and_directory_replacement_apply_metadata_before_publication() {
+        let diff_dir = tempfile::tempdir().unwrap();
+        let diff_base = diff_dir.path().to_path_buf();
+        let old = synced_existing_file_entry(&diff_base, "file.txt", b"old");
+        let new = test_file_entry_with_mode("file.txt", b"new!", 0o000);
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let details = vec![ChangeDetails::Diff(Delta {
+            blocks: vec![Block::Literal(b"new!".to_vec())],
+            window: 1,
+        })];
+        let mut all_old = vec![old];
+
+        apply_detailed_changes(&diff_base, &actions, &details, &mut all_old, None).unwrap();
+        assert_eq!(mode(&diff_base.join("file.txt")), 0o000);
+        assert_eq!(fs::metadata(diff_base.join("file.txt")).unwrap().mtime(), 0);
+
+        let replacement_dir = tempfile::tempdir().unwrap();
+        let replacement_base = replacement_dir.path().to_path_buf();
+        fs::create_dir(replacement_base.join("path")).unwrap();
+        let old = synced_existing_dir_entry(&replacement_base, "path");
+        let new = test_file_entry_with_mode("path", b"replacement", 0o400);
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let details = vec![ChangeDetails::Contents(b"replacement".to_vec())];
+        let mut all_old = vec![old];
+
+        apply_detailed_changes(
+            &replacement_base,
+            &actions,
+            &details,
+            &mut all_old,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mode(&replacement_base.join("path")), 0o400);
+        assert_eq!(fs::metadata(replacement_base.join("path")).unwrap().mtime(), 0);
+    }
+
+    #[test]
+    fn apply_parent_directories_are_created_private_without_broadening_existing_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        fs::set_permissions(base, fs::Permissions::from_mode(0o711)).unwrap();
+
+        ensure_parent_directory(&base.join("one/two/file.txt")).unwrap();
+
+        assert_eq!(mode(base), 0o711);
+        assert_eq!(mode(&base.join("one")), 0o700);
+        assert_eq!(mode(&base.join("one/two")), 0o700);
     }
 
     #[test]
@@ -4289,7 +4635,12 @@ mod tests {
         assert!(temp_name.len() < 64, "temp name was {}", temp_name);
         assert!(output.temp_path.exists());
 
-        output.finish().unwrap();
+        output
+            .finish(&test_file_entry(
+                final_path.file_name().unwrap().to_str().unwrap(),
+                b"",
+            ))
+            .unwrap();
         assert!(final_path.exists());
     }
 

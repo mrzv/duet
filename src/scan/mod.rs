@@ -169,6 +169,16 @@ impl DirEntryWithMeta {
         self.ino = ino;
     }
 
+    #[cfg(test)]
+    pub(crate) fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_mode(&mut self, mode: u32) {
+        self.mode = mode;
+    }
+
     pub fn is_dir(&self) -> bool {
         self.is_dir
     }

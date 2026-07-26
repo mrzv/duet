@@ -12,6 +12,7 @@
 - Expanded `--dry-run` to run the full non-mutating preflight checks, including local and remote directory removal blocker reports.
 
 ### Fixed
+- Kept staged files and new directories private and applied final file metadata before publication.
 - Made the most-specific location rule win, with later rules winning for equivalent paths, and fixed `+.` and bare `+` root includes.
 - Report ignored and excluded children separately when they block destination directory removal, instead of presenting all blockers as unexpected children.
 - Kept ignored directory removal blockers blocking unless `--prune-ignored` is explicitly supplied or the pattern is listed in `[prune]`.
