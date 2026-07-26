@@ -1431,8 +1431,7 @@ impl RemovalBlockerPolicy {
         let ignore = compile_patterns(&scan_policy.ignore, "ignore")?;
         let prune = compile_patterns(&scan_policy.prune, "prune")?;
 
-        let mut locations = scan_policy.locations.clone();
-        locations.sort();
+        let locations = crate::scan::location::canonicalize(&scan_policy.locations);
         Ok(Self {
             locations,
             ignore,
@@ -1487,9 +1486,6 @@ impl RemovalBlockerPolicy {
                     .map(|best| {
                         let best_specificity = path_specificity(best.path());
                         location_specificity > best_specificity
-                            || (location_specificity == best_specificity
-                                && best.is_exclude()
-                                && location.is_include())
                     })
                     .unwrap_or(true);
                 if replace {
@@ -1502,11 +1498,14 @@ impl RemovalBlockerPolicy {
 }
 
 fn location_applies(location: &Path, relative_path: &Path) -> bool {
-    location == Path::new(".") || relative_path == location || relative_path.starts_with(location)
+    location.as_os_str().is_empty()
+        || location == Path::new(".")
+        || relative_path == location
+        || relative_path.starts_with(location)
 }
 
 fn path_specificity(path: &Path) -> usize {
-    if path == Path::new(".") {
+    if path.as_os_str().is_empty() || path == Path::new(".") {
         0
     } else {
         path.components().count()
@@ -4626,6 +4625,28 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn removal_policy_uses_canonical_location_precedence() {
+        let policy = ScanPolicy::new(
+            vec![
+                Location::Exclude(PathBuf::from(".")),
+                Location::Include(PathBuf::new()),
+                Location::Include(PathBuf::from("tree")),
+                Location::Exclude(PathBuf::from("tree/./private")),
+                Location::Include(PathBuf::from("tree/private/keep")),
+                Location::Exclude(PathBuf::from("duplicate")),
+                Location::Include(PathBuf::from("./duplicate")),
+            ],
+            Vec::new(),
+        );
+        let policy = RemovalBlockerPolicy::new(Some(&policy), ApplyOptions::default()).unwrap();
+
+        assert!(!policy.is_excluded(Path::new("root.txt")));
+        assert!(policy.is_excluded(Path::new("tree/private/hidden.txt")));
+        assert!(!policy.is_excluded(Path::new("tree/private/keep/file.txt")));
+        assert!(!policy.is_excluded(Path::new("duplicate/file.txt")));
     }
 
     #[test]

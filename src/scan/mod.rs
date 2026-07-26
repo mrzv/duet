@@ -696,9 +696,8 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(
         .symlink_metadata()
         .wrap_err_with(|| format!("unable to read metadata for scan base {}", base.display()))?
         .dev();
-    let mut locations: Arc<Locations> =
-        Arc::new(locations.iter().map(|l| l.prefix(&base)).collect());
-    (*Arc::get_mut(&mut locations).unwrap()).sort();
+    let locations = location::canonicalize(locations);
+    let locations: Arc<Locations> = Arc::new(locations.iter().map(|l| l.prefix(&base)).collect());
 
     // build ignore regex
     use fnmatch_regex::glob_to_regex;

@@ -88,6 +88,10 @@ inclusion-exclusion of paths under `directory-to-synchronize` (by default
 nothing is included). Remote commands and base paths are split on whitespace;
 paths containing spaces are not supported in remote profile entries.
 
+The most-specific matching path rule wins. For equivalent paths, the later rule
+in the profile wins. `+.` and a bare `+` are equivalent ways to include the
+entire synchronization root.
+
 Subsequently, `duet my_profile` will synchronize the two directories.
 
 ## Ignore and Prune

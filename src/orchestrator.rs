@@ -89,9 +89,10 @@ pub async fn sync(
         server_log,
     } = context;
     let apply_attempt_id = new_apply_attempt_id(&local_id);
+    let locations = outbound_scan_locations(&prf.locations);
     let scan_ignore = prf.scan_ignore();
     let scan_policy = sync_ops::ScanPolicy::with_prune(
-        prf.locations.clone(),
+        locations.clone(),
         prf.ignore.clone(),
         prf.prune.clone(),
     );
@@ -104,7 +105,7 @@ pub async fn sync(
         let result = state::old_and_changes(
             &local_base,
             &path,
-            &prf.locations,
+            &locations,
             &scan_ignore,
             Some(&local_state),
         )
@@ -126,7 +127,7 @@ pub async fn sync(
     performance.record_phase("remote_setup", remote_setup_start.elapsed());
 
     let remote_path = path.clone();
-    let remote_locations = prf.locations.clone();
+    let remote_locations = locations.clone();
     let remote_ignore = scan_ignore.clone();
     let remote_prune = prf.prune.clone();
     let remote_fut = async {
@@ -538,6 +539,12 @@ pub async fn sync(
     }
 
     Ok(())
+}
+
+fn outbound_scan_locations(
+    locations: &crate::scan::location::Locations,
+) -> crate::scan::location::Locations {
+    crate::scan::location::canonicalize(locations)
 }
 
 pub async fn recover_remote(target: PathBuf, clear: bool, yes: bool) -> Result<()> {
@@ -1592,6 +1599,24 @@ fn stable_local_id(machine_id: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::scan;
+
+    #[test]
+    fn outbound_locations_are_safe_for_legacy_scanners() {
+        use crate::scan::location::Location;
+
+        let locations = outbound_scan_locations(&vec![
+            Location::Exclude(PathBuf::from(".")),
+            Location::Include(PathBuf::new()),
+            Location::Include(PathBuf::from("dir/./nested")),
+            Location::Exclude(PathBuf::from("dir/nested")),
+        ]);
+
+        assert_eq!(locations.len(), 2);
+        assert!(locations[0].is_include());
+        assert!(locations[0].path().as_os_str().is_empty());
+        assert!(locations[1].is_exclude());
+        assert_eq!(locations[1].path(), Path::new("dir/nested"));
+    }
 
     #[test]
     fn normalize_path_leaves_relative_paths_unchanged() {

@@ -109,6 +109,63 @@ fn local_added_file_copies_to_remote() {
 }
 
 #[test]
+fn dot_root_include_synchronizes_the_whole_root() {
+    let case = SyncCase::new_with_rules("+.\n");
+    fs::create_dir(case.local.join("dir")).unwrap();
+    write(&case.local.join("root.txt"), "root");
+    write(&case.local.join("dir/nested.txt"), "nested");
+
+    assert_success(case.sync());
+
+    assert_eq!(read(&case.remote.join("root.txt")), "root");
+    assert_eq!(read(&case.remote.join("dir/nested.txt")), "nested");
+}
+
+#[test]
+fn bare_root_include_synchronizes_the_whole_root() {
+    let case = SyncCase::new_with_rules("+\n");
+    fs::create_dir(case.local.join("dir")).unwrap();
+    write(&case.local.join("root.txt"), "root");
+    write(&case.local.join("dir/nested.txt"), "nested");
+
+    assert_success(case.sync());
+
+    assert_eq!(read(&case.remote.join("root.txt")), "root");
+    assert_eq!(read(&case.remote.join("dir/nested.txt")), "nested");
+}
+
+#[test]
+fn later_equivalent_location_rule_wins() {
+    let case = SyncCase::new_with_rules("+selected.txt\n-./selected.txt\n");
+    write(&case.local.join("selected.txt"), "excluded");
+
+    assert_success(case.sync());
+
+    assert!(!case.remote.join("selected.txt").exists());
+}
+
+#[test]
+fn nested_specific_location_rule_wins() {
+    let case = SyncCase::new_with_rules("+tree\n-tree/private\n+tree/private/keep\n");
+    fs::create_dir_all(case.local.join("tree/private/keep")).unwrap();
+    write(&case.local.join("tree/public.txt"), "public");
+    write(&case.local.join("tree/private/hidden.txt"), "hidden");
+    write(
+        &case.local.join("tree/private/keep/included.txt"),
+        "included",
+    );
+
+    assert_success(case.sync());
+
+    assert_eq!(read(&case.remote.join("tree/public.txt")), "public");
+    assert!(!case.remote.join("tree/private/hidden.txt").exists());
+    assert_eq!(
+        read(&case.remote.join("tree/private/keep/included.txt")),
+        "included"
+    );
+}
+
+#[test]
 fn dry_run_does_not_apply_changes() {
     let case = SyncCase::new();
     write(&case.local.join("a.txt"), "from local");

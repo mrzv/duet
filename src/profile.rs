@@ -335,6 +335,21 @@ mod tests {
     }
 
     #[test]
+    fn keeps_implicit_root_exclude_before_source_rules() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "/local").unwrap();
+        writeln!(file, "remote /remote").unwrap();
+        writeln!(file, "+.").unwrap();
+
+        let profile = parse_file(file.path()).unwrap();
+
+        assert_eq!(profile.locations.len(), 2);
+        assert!(profile.locations[0].is_exclude());
+        assert_eq!(profile.locations[0].path(), &PathBuf::from("."));
+        assert!(profile.locations[1].is_include());
+    }
+
+    #[test]
     fn formats_client_ids_as_safe_remote_state_ids() {
         let id = format_client_id(&[0, 1, 2, 10, 15, 16, 254, 255]);
 

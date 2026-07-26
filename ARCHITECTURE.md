@@ -237,9 +237,14 @@ Scanning is asynchronous and implemented in `src/scan/mod.rs`.
 - ignore globs
 - a Tokio `mpsc::Sender` for discovered entries
 
+Location rules are canonicalized before local scanning and the remote scan RPC.
+Equivalent relative paths are collapsed to their last source rule, while the
+most-specific matching path controls descendants. This also makes `.` and the
+bare root path equivalent without changing the serialized `Location` shape.
+
 The scanner:
 
-1. Prefixes location rules with the absolute base path and sorts them.
+1. Prefixes canonical, sorted, unique location rules with the absolute base path.
 2. Converts ignore globs to regexes.
 3. Walks the base directory while honoring include/exclude rules.
 4. Skips ignored entries, special files, and filesystem boundary crossings.
