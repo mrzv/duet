@@ -6,6 +6,8 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc;
@@ -905,7 +907,7 @@ fn record_staged_file(attempt_state: Option<&Path>, path: &Path) -> Result<()> {
         .and_then(|mut file| file.write_all(line.as_bytes()))
         .wrap_err_with(|| {
             format!(
-                "unable to record staged file in apply recovery marker {}",
+                "unable to record staged path in apply recovery marker {}",
                 marker_path.display()
             )
         })?;
@@ -1149,7 +1151,7 @@ struct ApplyAttemptMarker {
     phase: Option<String>,
     operations: Vec<String>,
     unstaged_operations: Vec<String>,
-    staged_files: Vec<String>,
+    staged_paths: Vec<String>,
     committed_operations: Vec<String>,
     committed_steps: Vec<String>,
 }
@@ -1164,7 +1166,7 @@ fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
         } else if let Some(operation) = line.strip_prefix("unstaged-operation: ") {
             parsed.unstaged_operations.push(operation.to_string());
         } else if let Some(path) = line.strip_prefix("staged-file: ") {
-            parsed.staged_files.push(path.to_string());
+            parsed.staged_paths.push(path.to_string());
         } else if let Some(operation) = line.strip_prefix("committed-operation: ") {
             parsed.committed_operations.push(operation.to_string());
         } else if let Some(step) = line.strip_prefix("committed-step: ") {
@@ -1197,16 +1199,70 @@ pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    fs::OpenOptions::new()
+    let access = open_directory_for_access(path)
+        .wrap_err_with(|| format!("unable to open directory for syncing {}", path.display()))?;
+    verify_path_identity(path, &access, "directory being synced")?;
+    match access.sync_all() {
+        Ok(()) => return Ok(()),
+        Err(error) if access_descriptor_needs_readable_sync(&error) => {}
+        Err(error) => {
+            return Err(error).wrap_err_with(|| format!("unable to sync directory {}", path.display()));
+        }
+    }
+
+    let original_mode = access
+        .metadata()
+        .wrap_err_with(|| format!("unable to inspect directory for syncing {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o7777;
+    verify_path_identity(path, &access, "directory being synced")?;
+    set_retained_directory_mode(&access, original_mode | 0o400, path).wrap_err_with(|| {
+        format!("unable to temporarily make directory readable for syncing {}", path.display())
+    })?;
+
+    let readable = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .wrap_err_with(|| format!("unable to open directory for syncing {}", path.display()))?
+        .open(path);
+    let readable = match readable {
+        Ok(readable) => readable,
+        Err(error) => {
+            let restore = set_retained_directory_mode(&access, original_mode, path);
+            return match restore {
+                Ok(()) => Err(error).wrap_err_with(|| {
+                    format!("unable to reopen directory for syncing {}", path.display())
+                }),
+                Err(restore) => Err(eyre!(
+                    "unable to reopen directory for syncing {}: {}; additionally failed to restore mode {:04o}: {}",
+                    path.display(),
+                    error,
+                    original_mode,
+                    restore
+                )),
+            };
+        }
+    };
+
+    // Restore immediately through the readable inode handle. If the process exits
+    // before this point, the still-durable apply marker blocks normal recovery.
+    if let Err(error) = set_retained_directory_mode(&access, original_mode, path) {
+        let _ = set_retained_directory_mode(&access, original_mode, path);
+        return Err(error).wrap_err_with(|| {
+            format!("unable to restore directory mode after opening it for syncing {}", path.display())
+        });
+    }
+    verify_same_directory_handles(&access, &readable, path, "directory being synced")?;
+    verify_path_identity(path, &readable, "directory being synced")?;
+    readable
         .sync_all()
         .wrap_err_with(|| format!("unable to sync directory {}", path.display()))
 }
 
 fn complete_apply_phase(base: &Path, actions: &[Action], attempt_state: Option<&Path>) -> Result<()> {
+    // File publication syncs each private stage directory first. Parent directory
+    // durability is intentionally batched here, before the caller saves state;
+    // until these barriers complete, the durable apply marker remains authoritative.
     let metadata_synced_directories: HashSet<_> = actions
         .iter()
         .filter_map(applied_change)
@@ -1317,22 +1373,22 @@ fn apply_attempt_recovery_advice(state_path: &Path, marker_path: &Path, marker: 
             marker.committed_steps.len()
         ));
     }
-    if !marker.staged_files.is_empty() {
-        let existing_staged_files = marker
-            .staged_files
+    if !marker.staged_paths.is_empty() {
+        let existing_staged_paths = marker
+            .staged_paths
             .iter()
             .filter(|path| Path::new(path.as_str()).exists())
             .count();
-        if existing_staged_files == 0 {
+        if existing_staged_paths == 0 {
             advice.push_str(&format!(
-                " The marker lists {} staged temporary file(s), but none still exist; they were likely renamed into place or already cleaned up.",
-                marker.staged_files.len()
+                " The marker lists {} staged temporary path(s), but none still exist; they were likely published or already cleaned up.",
+                marker.staged_paths.len()
             ));
         } else {
             advice.push_str(&format!(
-                " The marker lists {} staged temporary file(s), and {} still exist; inspect them before removing leftover temp files.",
-                marker.staged_files.len(),
-                existing_staged_files
+                " The marker lists {} staged temporary path(s), and {} still exist; inspect them before removing leftover temporary paths.",
+                marker.staged_paths.len(),
+                existing_staged_paths
             ));
         }
     }
@@ -2501,21 +2557,42 @@ fn stream_diff_frames(
 
 struct TempOutput {
     final_path: PathBuf,
+    parent_path: PathBuf,
+    stage_dir: PathBuf,
     temp_path: PathBuf,
+    final_name: std::ffi::CString,
+    stage_name: std::ffi::CString,
+    parent_directory: fs::File,
+    stage_directory: fs::File,
     file: Option<fs::File>,
     parent_guard: Option<WritableDirGuard>,
 }
 
 impl TempOutput {
     fn new(final_path: PathBuf) -> Result<Self> {
-        let parent_guard = match final_path.parent() {
-            Some(parent) => WritableDirGuard::new(parent)?,
-            None => None,
-        };
-        let (temp_path, file) = create_temp_output_file(&final_path)?;
+        let parent = final_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent_path = parent.to_path_buf();
+        let (parent_directory, parent_guard) = WritableDirGuard::new(parent)?;
+        let final_name = path_component_cstring(
+            final_path
+                .file_name()
+                .ok_or_else(|| eyre!("output path {} has no file name", final_path.display()))?,
+            "output file name",
+        )?;
+        let (stage_dir, temp_path, stage_name, stage_directory, file) =
+            create_temp_output_file(&final_path, &parent_directory)?;
         Ok(TempOutput {
             final_path,
+            parent_path,
+            stage_dir,
             temp_path,
+            final_name,
+            stage_name,
+            parent_directory,
+            stage_directory,
             file: Some(file),
             parent_guard,
         })
@@ -2581,18 +2658,23 @@ impl TempOutput {
         verify_open_file_matches_entry(file, &self.temp_path, entry, description)
     }
 
-    fn verify_path_identity(&self, path: &Path) -> Result<()> {
+    fn verify_at_identity(
+        &self,
+        directory: &fs::File,
+        name: &std::ffi::CStr,
+        path: &Path,
+    ) -> Result<()> {
         let file_meta = self
             .file
             .as_ref()
             .ok_or_else(|| eyre!("temporary output is closed"))?
             .metadata()
             .wrap_err("failed to read open temporary file metadata")?;
-        let path_meta = fs::symlink_metadata(path)
+        let path_stat = fstatat_nofollow(directory.as_raw_fd(), name)
             .wrap_err_with(|| format!("failed to read temporary path {}", path.display()))?;
-        if !path_meta.is_file()
-            || path_meta.dev() != file_meta.dev()
-            || path_meta.ino() != file_meta.ino()
+        if path_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || path_stat.st_dev as u64 != file_meta.dev()
+            || path_stat.st_ino as u64 != file_meta.ino()
         {
             return Err(eyre!(
                 "temporary path {} no longer refers to the open output file",
@@ -2605,15 +2687,30 @@ impl TempOutput {
     fn finish(mut self, entry: &Entry) -> Result<Entry> {
         let final_entry = self.prepare_metadata(entry)?;
         self.sync_all()?;
-        self.verify_path_identity(&self.temp_path)?;
-        fs::rename(&self.temp_path, &self.final_path).wrap_err_with(|| {
+        self.verify_at_identity(&self.stage_directory, output_name(), &self.temp_path)?;
+        // The stage entry must be durable before it is published. The affected
+        // parent chain is synced once at apply-phase completion.
+        self.sync_stage_directory()?;
+        self.verify_parent_path_identity()?;
+        cvt(unsafe {
+            libc::renameat(
+                self.stage_directory.as_raw_fd(),
+                output_name().as_ptr(),
+                self.parent_directory.as_raw_fd(),
+                self.final_name.as_ptr(),
+            )
+        })
+        .wrap_err_with(|| {
             format!(
                 "failed to rename temporary file {} to {}",
                 self.temp_path.display(),
                 self.final_path.display()
             )
         })?;
-        self.verify_path_identity(&self.final_path)?;
+        self.verify_parent_path_identity()?;
+        self.verify_at_identity(&self.parent_directory, &self.final_name, &self.final_path)?;
+        self.sync_stage_directory()?;
+        self.remove_stage_dir()?;
         self.restore_parent()?;
         Ok(final_entry)
     }
@@ -2621,8 +2718,20 @@ impl TempOutput {
     fn finish_without_replacing(mut self, description: &str, entry: &Entry) -> Result<Entry> {
         let final_entry = self.prepare_metadata(entry)?;
         self.sync_all()?;
-        self.verify_path_identity(&self.temp_path)?;
-        match fs::hard_link(&self.temp_path, &self.final_path) {
+        self.verify_at_identity(&self.stage_directory, output_name(), &self.temp_path)?;
+        // The stage entry must be durable before it is published. The affected
+        // parent chain is synced once at apply-phase completion.
+        self.sync_stage_directory()?;
+        self.verify_parent_path_identity()?;
+        match cvt(unsafe {
+            libc::linkat(
+                self.stage_directory.as_raw_fd(),
+                output_name().as_ptr(),
+                self.parent_directory.as_raw_fd(),
+                self.final_name.as_ptr(),
+                0,
+            )
+        }) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(eyre!(
@@ -2641,16 +2750,24 @@ impl TempOutput {
                 });
             }
         }
-        self.verify_path_identity(&self.final_path)?;
-        fs::remove_file(&self.temp_path).wrap_err_with(|| {
+        self.verify_parent_path_identity()?;
+        self.verify_at_identity(&self.parent_directory, &self.final_name, &self.final_path)?;
+        unlinkat(self.stage_directory.as_raw_fd(), output_name(), 0).wrap_err_with(|| {
             format!("failed to remove temporary file {}", self.temp_path.display())
         })?;
+        self.sync_stage_directory()?;
+        self.remove_stage_dir()?;
         self.restore_parent()?;
         Ok(final_entry)
     }
 
+    #[cfg(test)]
     fn temp_path(&self) -> &Path {
         &self.temp_path
+    }
+
+    fn stage_path(&self) -> &Path {
+        &self.stage_dir
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -2672,42 +2789,216 @@ impl TempOutput {
             ))
     }
 
+    fn sync_stage_directory(&self) -> Result<()> {
+        self.stage_directory.sync_all().wrap_err_with(|| {
+            format!(
+                "failed to sync temporary directory {}",
+                self.stage_dir.display()
+            )
+        })
+    }
+
+    fn verify_parent_path_identity(&self) -> Result<()> {
+        verify_path_identity(
+            &self.parent_path,
+            &self.parent_directory,
+            "output parent directory",
+        )
+    }
+
     fn restore_parent(&mut self) -> Result<()> {
         if let Some(guard) = self.parent_guard.take() {
             guard.restore()?;
         }
         Ok(())
     }
+
+    fn remove_stage_dir(&mut self) -> Result<()> {
+        verify_directory_at_identity(
+            &self.parent_directory,
+            &self.stage_name,
+            &self.stage_directory,
+            &self.stage_dir,
+        )?;
+        unlinkat(
+            self.parent_directory.as_raw_fd(),
+            &self.stage_name,
+            libc::AT_REMOVEDIR,
+        )
+        .wrap_err_with(|| {
+            format!(
+                "failed to remove temporary directory {}",
+                self.stage_dir.display()
+            )
+        })?;
+        self.stage_dir.clear();
+        Ok(())
+    }
 }
 
-fn create_temp_output_file(final_path: &Path) -> Result<(PathBuf, fs::File)> {
-    let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+fn create_temp_output_file(
+    final_path: &Path,
+    parent_directory: &fs::File,
+) -> Result<(PathBuf, PathBuf, std::ffi::CString, fs::File, fs::File)> {
+    let parent = final_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     for _ in 0..128 {
-        let temp_path = parent.join(format!(
-            ".duet-part-{}-{:016x}-{}",
+        let stage_component = format!(
+            ".duet-stage-{}-{:016x}-{}",
             std::process::id(),
             temp_nonce(),
             TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
-        ));
-        match fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp_path)
+        );
+        let stage_name = path_component_cstring(stage_component.as_ref(), "stage directory name")?;
+        let stage_dir = parent.join(&stage_component);
+        match cvt(unsafe {
+            libc::mkdirat(parent_directory.as_raw_fd(), stage_name.as_ptr(), 0o700)
+        }) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).wrap_err_with(|| {
+                    format!("failed to create temporary directory {}", stage_dir.display())
+                });
+            }
+        }
+        let created_stat = match fstatat_nofollow(parent_directory.as_raw_fd(), &stage_name) {
+            Ok(stat) => stat,
+            Err(error) => {
+                if let Ok(directory) = openat_file(
+                    parent_directory.as_raw_fd(),
+                    &stage_name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                ) {
+                    cleanup_stage_at(parent_directory, &stage_name, &directory);
+                }
+                return Err(error).wrap_err_with(|| {
+                    format!(
+                        "failed to inspect new temporary directory {}",
+                        stage_dir.display()
+                    )
+                });
+            }
+        };
+        if created_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || created_stat.st_uid != unsafe { libc::geteuid() }
         {
+            cleanup_unopened_stage_at(parent_directory, &stage_name, &created_stat);
+            return Err(eyre!(
+                "new temporary directory path {} was replaced before it could be opened",
+                stage_dir.display()
+            ));
+        }
+        let access_directory = match open_new_stage_for_access(
+            parent_directory,
+            &stage_name,
+            &created_stat,
+            &stage_dir,
+        ) {
+            Ok(directory) => directory,
+            Err(error) => {
+                cleanup_unopened_stage_at(parent_directory, &stage_name, &created_stat);
+                return Err(error).wrap_err_with(|| {
+                    format!("failed to retain temporary directory {}", stage_dir.display())
+                });
+            }
+        };
+        if let Err(error) = verify_retained_directory_at_identity(
+            parent_directory,
+            &stage_name,
+            &access_directory,
+            &created_stat,
+            &stage_dir,
+            "new temporary directory",
+        ) {
+            cleanup_stage_at(parent_directory, &stage_name, &access_directory);
+            return Err(error);
+        }
+        if let Err(error) = normalize_stage_directory_mode(
+            parent_directory,
+            &stage_name,
+            &access_directory,
+            &created_stat,
+            &stage_dir,
+        ) {
+            cleanup_stage_at(parent_directory, &stage_name, &access_directory);
+            return Err(error);
+        }
+        let directory = match openat_file(
+            parent_directory.as_raw_fd(),
+            &stage_name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(directory) => directory,
+            Err(e) => {
+                cleanup_unopened_stage_at(parent_directory, &stage_name, &created_stat);
+                return Err(e).wrap_err_with(|| {
+                    format!("failed to open temporary directory {}", stage_dir.display())
+                });
+            }
+        };
+        let secure_result = (|| -> Result<()> {
+            verify_directory_at_identity(
+                parent_directory,
+                &stage_name,
+                &directory,
+                &stage_dir,
+            )?;
+            let opened_meta = directory.metadata().wrap_err_with(|| {
+                format!("failed to inspect temporary directory {}", stage_dir.display())
+            })?;
+            if created_stat.st_dev as u64 != opened_meta.dev()
+                || created_stat.st_ino as u64 != opened_meta.ino()
+            {
+                return Err(eyre!(
+                    "new temporary directory path {} was replaced before it could be opened",
+                    stage_dir.display()
+                ));
+            }
+            if opened_meta.mode() & 0o7777 != 0o700 {
+                return Err(eyre!(
+                    "temporary directory {} mode was not normalized to 0700",
+                    stage_dir.display()
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = secure_result {
+            cleanup_stage_at(parent_directory, &stage_name, &directory);
+            return Err(error);
+        }
+        let temp_path = stage_dir.join("output");
+        match openat_file(
+            directory.as_raw_fd(),
+            output_name(),
+            libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC,
+            0o600,
+        ) {
             Ok(file) => {
-                file.set_permissions(fs::Permissions::from_mode(0o600))
+                if let Err(error) = file
+                    .set_permissions(fs::Permissions::from_mode(0o600))
                     .wrap_err_with(|| {
                         format!(
                             "failed to normalize temporary file permissions {}",
                             temp_path.display()
                         )
-                    })?;
-                return Ok((temp_path, file));
+                    })
+                {
+                    cleanup_stage_at(parent_directory, &stage_name, &directory);
+                    return Err(error);
+                }
+                return Ok((stage_dir, temp_path, stage_name, directory, file));
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
+                cleanup_stage_at(parent_directory, &stage_name, &directory);
                 return Err(e).wrap_err_with(|| {
                     format!("failed to create temporary file {}", temp_path.display())
                 });
@@ -2719,6 +3010,252 @@ fn create_temp_output_file(final_path: &Path) -> Result<(PathBuf, fs::File)> {
         "failed to create a unique temporary file next to {}",
         final_path.display()
     ))
+}
+
+fn path_component_cstring(
+    component: &std::ffi::OsStr,
+    description: &str,
+) -> Result<std::ffi::CString> {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.as_bytes().contains(&b'/')
+    {
+        return Err(eyre!("{} is not an exact path component", description));
+    }
+    std::ffi::CString::new(component.as_bytes())
+        .map_err(|_| eyre!("{} contains an interior NUL byte", description))
+}
+
+fn output_name() -> &'static std::ffi::CStr {
+    unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"output\0") }
+}
+
+fn cvt(result: libc::c_int) -> io::Result<()> {
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn openat_file(
+    directory: RawFd,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> io::Result<fs::File> {
+    let fd = unsafe { libc::openat(directory, name.as_ptr(), flags, mode as libc::c_uint) };
+    if fd == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
+fn fstatat_nofollow(directory: RawFd, name: &std::ffi::CStr) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::uninit();
+    cvt(unsafe {
+        libc::fstatat(
+            directory,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn normalize_stage_directory_mode(
+    parent: &fs::File,
+    name: &std::ffi::CStr,
+    retained: &fs::File,
+    created: &libc::stat,
+    path: &Path,
+) -> Result<()> {
+    verify_retained_directory_at_identity(
+        parent,
+        name,
+        retained,
+        created,
+        path,
+        "new temporary directory",
+    )?;
+    set_retained_directory_mode(retained, 0o700, path)
+        .wrap_err_with(|| format!("failed to secure temporary directory {}", path.display()))?;
+    let retained_after = retained.metadata().wrap_err_with(|| {
+        format!("failed to verify retained temporary directory {}", path.display())
+    })?;
+    let after = fstatat_nofollow(parent.as_raw_fd(), name)
+        .wrap_err_with(|| format!("failed to verify temporary directory {}", path.display()))?;
+    verify_stat_identity(created, &after, libc::S_IFDIR, path, "new temporary directory")?;
+    if retained_after.dev() != created.st_dev as u64
+        || retained_after.ino() != created.st_ino as u64
+        || !retained_after.is_dir()
+        || retained_after.mode() & 0o7777 != 0o700
+        || after.st_mode & 0o7777 != 0o700
+    {
+        return Err(eyre!(
+            "temporary directory {} mode was not normalized to 0700",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_stat_identity(
+    expected: &libc::stat,
+    actual: &libc::stat,
+    expected_type: libc::mode_t,
+    path: &Path,
+    description: &str,
+) -> Result<()> {
+    if actual.st_mode & libc::S_IFMT != expected_type
+        || actual.st_dev != expected.st_dev
+        || actual.st_ino != expected.st_ino
+    {
+        return Err(eyre!(
+            "{} path {} no longer refers to the retained object",
+            description,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_retained_directory_at_identity(
+    parent: &fs::File,
+    name: &std::ffi::CStr,
+    retained: &fs::File,
+    created: &libc::stat,
+    path: &Path,
+    description: &str,
+) -> Result<()> {
+    let retained_meta = retained
+        .metadata()
+        .wrap_err_with(|| format!("failed to inspect retained {} {}", description, path.display()))?;
+    if !retained_meta.is_dir()
+        || retained_meta.dev() != created.st_dev as u64
+        || retained_meta.ino() != created.st_ino as u64
+    {
+        return Err(eyre!(
+            "{} handle {} does not refer to the newly created directory",
+            description,
+            path.display()
+        ));
+    }
+    let current = fstatat_nofollow(parent.as_raw_fd(), name)
+        .wrap_err_with(|| format!("failed to inspect {} path {}", description, path.display()))?;
+    verify_stat_identity(created, &current, libc::S_IFDIR, path, description)
+}
+
+fn unlinkat(directory: RawFd, name: &std::ffi::CStr, flags: libc::c_int) -> io::Result<()> {
+    cvt(unsafe { libc::unlinkat(directory, name.as_ptr(), flags) })
+}
+
+fn verify_directory_at_identity(
+    parent: &fs::File,
+    name: &std::ffi::CStr,
+    directory: &fs::File,
+    path: &Path,
+) -> Result<()> {
+    let expected = directory.metadata().wrap_err_with(|| {
+        format!("failed to inspect temporary directory {}", path.display())
+    })?;
+    let actual = fstatat_nofollow(parent.as_raw_fd(), name).wrap_err_with(|| {
+        format!("failed to inspect temporary directory path {}", path.display())
+    })?;
+    if actual.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || actual.st_dev as u64 != expected.dev()
+        || actual.st_ino as u64 != expected.ino()
+    {
+        return Err(eyre!(
+            "temporary directory path {} no longer refers to the retained directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_path_identity(path: &Path, retained: &fs::File, description: &str) -> Result<()> {
+    let expected = retained
+        .metadata()
+        .wrap_err_with(|| format!("failed to inspect retained {} {}", description, path.display()))?;
+    let actual = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to inspect {} path {}", description, path.display()))?;
+    if !actual.is_dir() || actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+        return Err(eyre!(
+            "{} path {} no longer refers to the retained directory",
+            description,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_same_directory_handles(
+    expected: &fs::File,
+    actual: &fs::File,
+    path: &Path,
+    description: &str,
+) -> Result<()> {
+    let expected = expected
+        .metadata()
+        .wrap_err_with(|| format!("failed to inspect retained {} {}", description, path.display()))?;
+    let actual = actual
+        .metadata()
+        .wrap_err_with(|| format!("failed to inspect reopened {} {}", description, path.display()))?;
+    if !actual.is_dir() || actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+        return Err(eyre!(
+            "{} path {} no longer refers to the retained directory",
+            description,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_stage_at(
+    parent: &fs::File,
+    stage_name: &std::ffi::CStr,
+    directory: &fs::File,
+) {
+    if directory
+        .metadata()
+        .map(|meta| meta.uid() != unsafe { libc::geteuid() })
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let _ = unlinkat(directory.as_raw_fd(), output_name(), 0);
+    let _ = directory.sync_all();
+    if verify_directory_at_identity(
+        parent,
+        stage_name,
+        directory,
+        Path::new("stage directory"),
+    )
+    .is_err()
+    {
+        return;
+    }
+    let _ = unlinkat(parent.as_raw_fd(), stage_name, libc::AT_REMOVEDIR);
+}
+
+fn cleanup_unopened_stage_at(
+    parent: &fs::File,
+    stage_name: &std::ffi::CStr,
+    created_stat: &libc::stat,
+) {
+    let Ok(current_stat) = fstatat_nofollow(parent.as_raw_fd(), stage_name) else {
+        return;
+    };
+    if current_stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+        && current_stat.st_dev == created_stat.st_dev
+        && current_stat.st_ino == created_stat.st_ino
+    {
+        let _ = unlinkat(parent.as_raw_fd(), stage_name, libc::AT_REMOVEDIR);
+    }
 }
 
 fn temp_nonce() -> u64 {
@@ -2740,53 +3277,235 @@ fn temp_nonce() -> u64 {
 
 struct WritableDirGuard {
     path: PathBuf,
+    directory: fs::File,
     original_mode: u32,
 }
 
 impl WritableDirGuard {
-    fn new(path: &Path) -> Result<Option<Self>> {
-        let meta = fs::symlink_metadata(path).wrap_err_with(|| {
+    fn new(path: &Path) -> Result<(fs::File, Option<Self>)> {
+        let path_meta = fs::symlink_metadata(path).wrap_err_with(|| {
             format!("failed to read directory metadata for {}", path.display())
         })?;
-        let original_mode = meta.permissions().mode();
-        if owner_writable(original_mode) {
-            return Ok(None);
+        if !path_meta.is_dir() {
+            return Err(eyre!("output parent {} is not a directory", path.display()));
         }
-        let mut perms = meta.permissions();
+        let original_mode = path_meta.permissions().mode();
+        if owner_write_execute(original_mode) {
+            let directory = open_directory_for_access(path)?;
+            verify_path_identity(path, &directory, "output parent directory")?;
+            return Ok((directory, None));
+        }
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .wrap_err_with(|| format!("failed to open directory {}", path.display()))?;
+        verify_path_identity(path, &directory, "output parent directory")?;
+        let mut perms = path_meta.permissions();
         perms.set_mode(original_mode | 0o700);
-        fs::set_permissions(path, perms).wrap_err_with(|| {
+        directory.set_permissions(perms).wrap_err_with(|| {
             format!(
                 "failed to make directory writable for sync {}",
                 path.display()
             )
         })?;
-        Ok(Some(Self {
+        if let Err(error) = verify_path_identity(path, &directory, "output parent directory") {
+            let _ = directory.set_permissions(fs::Permissions::from_mode(original_mode));
+            return Err(error);
+        }
+        let guard_directory = match directory.try_clone() {
+            Ok(directory) => directory,
+            Err(error) => {
+                let _ = directory.set_permissions(fs::Permissions::from_mode(original_mode));
+                return Err(error).wrap_err_with(|| {
+                    format!("failed to retain directory handle for {}", path.display())
+                });
+            }
+        };
+        Ok((directory, Some(Self {
             path: path.to_path_buf(),
+            directory: guard_directory,
             original_mode,
-        }))
+        })))
     }
 
     fn restore(mut self) -> Result<()> {
-        fs::set_permissions(&self.path, fs::Permissions::from_mode(self.original_mode))
+        self.directory.set_permissions(fs::Permissions::from_mode(self.original_mode))
             .wrap_err_with(|| format!(
                 "failed to restore directory permissions after sync {}", self.path.display()
             ))?;
+        verify_path_identity(&self.path, &self.directory, "output parent directory")?;
         self.path.clear();
         Ok(())
     }
 }
 
+fn open_directory_for_access(path: &Path) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(directory_access_flag() | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .wrap_err_with(|| format!("failed to retain access to directory {}", path.display()))
+}
+
+fn open_directory_at_for_access(parent: &fs::File, name: &std::ffi::CStr) -> io::Result<fs::File> {
+    openat_file(
+        parent.as_raw_fd(),
+        name,
+        directory_access_flag() | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+fn open_new_stage_for_access(
+    parent: &fs::File,
+    name: &std::ffi::CStr,
+    created: &libc::stat,
+    path: &Path,
+) -> Result<fs::File> {
+    match open_directory_at_for_access(parent, name) {
+        Ok(directory) => return Ok(directory),
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let before = fstatat_nofollow(parent.as_raw_fd(), name)
+            .wrap_err_with(|| format!("failed to inspect new temporary directory {}", path.display()))?;
+        verify_stat_identity(created, &before, libc::S_IFDIR, path, "new temporary directory")?;
+        cvt(unsafe {
+            libc::fchmodat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                0o700,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+        .wrap_err_with(|| {
+            format!(
+                "failed to bootstrap search access to new temporary directory {} without following symlinks",
+                path.display()
+            )
+        })?;
+        let after = fstatat_nofollow(parent.as_raw_fd(), name)
+            .wrap_err_with(|| format!("failed to verify new temporary directory {}", path.display()))?;
+        verify_stat_identity(created, &after, libc::S_IFDIR, path, "new temporary directory")?;
+        return open_directory_at_for_access(parent, name).wrap_err_with(|| {
+            format!("failed to retain new temporary directory {} after securing it", path.display())
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unreachable!("O_PATH stage open either succeeds or returns directly")
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn directory_access_flag() -> libc::c_int {
+    libc::O_PATH
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+fn directory_access_flag() -> libc::c_int {
+    libc::O_SEARCH
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+)))]
+fn directory_access_flag() -> libc::c_int {
+    // Other Unix targets retain the portable O_RDONLY behavior; mode-0300
+    // directories are not guaranteed to be supported there.
+    libc::O_RDONLY
+}
+
+fn access_descriptor_needs_readable_sync(error: &io::Error) -> bool {
+    cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    )) && matches!(
+        error.raw_os_error(),
+        Some(libc::EBADF) | Some(libc::EINVAL) | Some(libc::ENOTSUP)
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_retained_directory_mode(directory: &fs::File, mode: u32, path: &Path) -> Result<()> {
+    match directory.set_permissions(fs::Permissions::from_mode(mode)) {
+        Ok(()) => return Ok(()),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EBADF) | Some(libc::EINVAL) | Some(libc::ENOTSUP)
+            ) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    fs::set_permissions(&proc_path, fs::Permissions::from_mode(mode)).wrap_err_with(|| {
+        format!(
+            "direct descriptor chmod is unsupported and /proc/self/fd fallback is unavailable for retained directory {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_retained_directory_mode(directory: &fs::File, mode: u32, _path: &Path) -> Result<()> {
+    directory
+        .set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(Into::into)
+}
+
 impl Drop for WritableDirGuard {
     fn drop(&mut self) {
         if !self.path.as_os_str().is_empty() {
-            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.original_mode));
+            let _ = self
+                .directory
+                .set_permissions(fs::Permissions::from_mode(self.original_mode));
         }
     }
 }
 
 impl Drop for TempOutput {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.temp_path);
+        let _ = unlinkat(self.stage_directory.as_raw_fd(), output_name(), 0);
+        let _ = self.stage_directory.sync_all();
+        if !self.stage_dir.as_os_str().is_empty() {
+            if verify_directory_at_identity(
+                &self.parent_directory,
+                &self.stage_name,
+                &self.stage_directory,
+                &self.stage_dir,
+            )
+            .is_ok()
+            {
+                let _ = unlinkat(
+                    self.parent_directory.as_raw_fd(),
+                    &self.stage_name,
+                    libc::AT_REMOVEDIR,
+                );
+            }
+        }
     }
 }
 
@@ -2807,7 +3526,7 @@ impl ApplyRecorder {
 
     fn record_staged_file(&mut self, path: &Path) -> Result<()> {
         self.write_line(
-            "record staged file",
+            "record staged path",
             format!("staged-file: {}\n", path.display()),
         )
     }
@@ -3306,7 +4025,7 @@ impl DetailApplier {
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         ensure_parent_directory(&filename)?;
         let output = TempOutput::new(filename)?;
-        self.recorder.record_staged_file(output.temp_path())?;
+        self.recorder.record_staged_file(output.stage_path())?;
         self.state = Some(ApplyState::File {
             action_index,
             output,
@@ -3325,7 +4044,7 @@ impl DetailApplier {
         verify_file_matches_entry(&filename, old_entry, "diff source")?;
         let source = fs::File::open(&filename)?;
         let output = TempOutput::new(filename)?;
-        self.recorder.record_staged_file(output.temp_path())?;
+        self.recorder.record_staged_file(output.stage_path())?;
         self.state = Some(ApplyState::Diff {
             action_index,
             source,
@@ -3923,7 +4642,7 @@ fn create_file_with_contents(
 
     ensure_parent_directory(filename)?;
     let mut output = TempOutput::new(filename.to_path_buf())?;
-    record_staged_file(attempt_state, output.temp_path())?;
+    record_staged_file(attempt_state, output.stage_path())?;
     output
         .file
         .as_mut()
@@ -4088,7 +4807,7 @@ fn update_file_with_diff(
     let source = fs::File::open(filename)
         .wrap_err_with(|| format!("failed to open file {}", filename.display()))?;
     let mut output = TempOutput::new(filename.to_path_buf())?;
-    record_staged_file(attempt_state, output.temp_path())?;
+    record_staged_file(attempt_state, output.stage_path())?;
     let output_file = output
         .file
         .as_mut()
@@ -4278,6 +4997,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut output = TempOutput::new(dir.path().join("out.txt")).unwrap();
 
+        assert_eq!(mode(output.temp_path().parent().unwrap()) & 0o777, 0o700);
         assert_eq!(mode(output.temp_path()), 0o600);
         let file = output.file.as_mut().unwrap();
         file.write_all(b"private").unwrap();
@@ -4286,6 +5006,225 @@ mod tests {
         file.read_to_end(&mut contents).unwrap();
 
         assert_eq!(contents, b"private");
+    }
+
+    #[test]
+    fn temp_output_stays_hidden_after_final_mode_is_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.txt");
+        let mut output = TempOutput::new(final_path.clone()).unwrap();
+        let stage_dir = output.temp_path().parent().unwrap().to_path_buf();
+        output.file.as_mut().unwrap().write_all(b"public").unwrap();
+        let entry = test_file_entry_with_mode("out.txt", b"public", 0o644);
+
+        output.prepare_metadata(&entry).unwrap();
+
+        assert_eq!(mode(output.temp_path()), 0o644);
+        assert_eq!(mode(&stage_dir) & 0o777, 0o700);
+        output.finish(&entry).unwrap();
+        assert_eq!(mode(&final_path), 0o644);
+        assert!(!stage_dir.exists());
+    }
+
+    #[test]
+    fn temp_output_drop_removes_stage_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage_dir = {
+            let output = TempOutput::new(dir.path().join("out.txt")).unwrap();
+            output.stage_path().to_path_buf()
+        };
+
+        assert!(!stage_dir.exists());
+    }
+
+    #[test]
+    fn temp_output_create_new_does_not_clobber_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.txt");
+        fs::write(&final_path, b"existing").unwrap();
+        let mut output = TempOutput::new(final_path.clone()).unwrap();
+        let stage_dir = output.stage_path().to_path_buf();
+        output.file.as_mut().unwrap().write_all(b"new").unwrap();
+        let entry = test_file_entry("out.txt", b"new");
+
+        let error = output
+            .finish_without_replacing("rename target", &entry)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"), "{}", error);
+        assert_eq!(fs::read(&final_path).unwrap(), b"existing");
+        assert!(!stage_dir.exists());
+    }
+
+    #[test]
+    fn temp_output_verifies_mode_zero_final_inode_relative_to_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.txt");
+        let mut output = TempOutput::new(final_path.clone()).unwrap();
+        output.file.as_mut().unwrap().write_all(b"private").unwrap();
+        let entry = test_file_entry_with_mode("out.txt", b"private", 0o000);
+
+        output.finish(&entry).unwrap();
+
+        assert_eq!(mode(&final_path), 0o000);
+    }
+
+    #[test]
+    fn temp_output_supports_writable_unreadable_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = (|| -> Result<()> {
+            let final_path = parent.join("out.txt");
+            let mut output = TempOutput::new(final_path.clone())?;
+            output.file.as_mut().unwrap().write_all(b"contents")?;
+            output.finish(&test_file_entry("out.txt", b"contents"))?;
+            assert_eq!(fs::read(final_path)?, b"contents");
+            Ok(())
+        })();
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn stage_mode_normalization_is_descriptor_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir.path())
+            .unwrap();
+        let name = std::ffi::CString::new("stage").unwrap();
+        cvt(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o000) }).unwrap();
+        let created = fstatat_nofollow(parent.as_raw_fd(), &name).unwrap();
+        let retained = open_new_stage_for_access(
+            &parent,
+            &name,
+            &created,
+            &dir.path().join("stage"),
+        )
+        .unwrap();
+
+        normalize_stage_directory_mode(
+            &parent,
+            &name,
+            &retained,
+            &created,
+            &dir.path().join("stage"),
+        )
+        .unwrap();
+
+        assert_eq!(mode(&dir.path().join("stage")) & 0o7777, 0o700);
+    }
+
+    #[test]
+    fn complete_apply_phase_syncs_existing_writable_unreadable_parent() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join("child"), b"contents").unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).unwrap();
+        let actions = vec![Action::Local(Change::Added(test_file_entry(
+            "parent/child",
+            b"contents",
+        )))];
+
+        let result = complete_apply_phase(base.path(), &actions, None);
+
+        assert_eq!(mode(&parent), 0o300);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn parent_path_swap_after_staging_cannot_report_success_and_keeps_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let parent = base.join("parent");
+        let moved_parent = base.join("moved-parent");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir_all(&parent).unwrap();
+        let entry = test_file_entry("parent/out.txt", b"contents");
+        let actions = vec![Action::Local(Change::Added(entry.clone()))];
+        start_apply_attempt("local", &state, &base, &actions, None).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(
+            base.clone(),
+            actions,
+            Vec::new(),
+            Some(state.clone()),
+        );
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBytes(b"contents".to_vec()),
+            })
+            .unwrap();
+        fs::rename(&parent, &moved_parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+
+        let error = applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileEnd,
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("output parent directory path"),
+            "{}",
+            error
+        );
+        assert!(!parent.join("out.txt").exists());
+        assert!(!moved_parent.join("out.txt").exists());
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert!(marker.contains("staged-file: "), "{}", marker);
+        assert!(!marker.contains("committed-step: rename-file"), "{}", marker);
+    }
+
+    #[test]
+    fn temp_output_does_not_follow_swapped_stage_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.txt");
+        let mut output = TempOutput::new(final_path.clone()).unwrap();
+        let stage_dir = output.stage_path().to_path_buf();
+        let moved_stage = dir.path().join("moved-stage");
+        output.file.as_mut().unwrap().write_all(b"retained").unwrap();
+        fs::rename(&stage_dir, &moved_stage).unwrap();
+        fs::create_dir(&stage_dir).unwrap();
+        fs::write(stage_dir.join("output"), b"substitute").unwrap();
+        let entry = test_file_entry("out.txt", b"retained");
+
+        let error = output.finish(&entry).unwrap_err();
+
+        assert!(
+            error.to_string().contains("no longer refers to the retained directory"),
+            "{}",
+            error
+        );
+        assert_eq!(fs::read(&final_path).unwrap(), b"retained");
+        assert_eq!(fs::read(stage_dir.join("output")).unwrap(), b"substitute");
+        fs::remove_dir(&moved_stage).unwrap();
+    }
+
+    #[test]
+    fn descriptor_component_helper_rejects_non_components() {
+        use std::ffi::OsStr;
+
+        assert!(path_component_cstring(OsStr::new("output"), "test").is_ok());
+        assert!(path_component_cstring(OsStr::new("../output"), "test").is_err());
+        assert!(path_component_cstring(OsStr::new("."), "test").is_err());
+        assert!(path_component_cstring(OsStr::from_bytes(b"bad\0name"), "test").is_err());
     }
 
     #[test]
@@ -5688,6 +6627,30 @@ mod tests {
     }
 
     #[test]
+    fn apply_attempt_recovery_detects_leftover_empty_stage_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let base = dir.path().join("base");
+        let stage_dir = base.join(".duet-stage-leftover");
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(&stage_dir).unwrap();
+        let actions = vec![Action::Local(Change::Added(Entry::test_file(
+            PathBuf::from("a.txt"),
+            0,
+        )))];
+        start_apply_attempt("local", &state, &base, &actions, None).unwrap();
+        record_staged_file(Some(&state), &stage_dir).unwrap();
+
+        let description = describe_apply_attempt(&state).unwrap().unwrap();
+
+        assert!(
+            description.contains("1 staged temporary path(s), and 1 still exist"),
+            "{}",
+            description
+        );
+    }
+
+    #[test]
     fn apply_attempt_recovery_advice_uses_operation_summaries() {
         let marker = "duet-apply-attempt-v1\nphase: apply\noperation: remove-file old.txt\noperation: modify-metadata mode.txt\noperation: modify-file contents.txt\nunstaged-operation: remove-file old.txt\nstaged-file: /tmp/.duet-part-test\ncommitted-step: rename-file contents.txt\ncommitted-operation: modify-file contents.txt\n";
 
@@ -5719,7 +6682,7 @@ mod tests {
         );
         assert!(advice.contains("committed operation(s)"), "{}", advice);
         assert!(advice.contains("committed apply step(s)"), "{}", advice);
-        assert!(advice.contains("staged temporary file(s)"), "{}", advice);
+        assert!(advice.contains("staged temporary path(s)"), "{}", advice);
         assert!(advice.contains("unstaged operation(s)"), "{}", advice);
     }
 }
