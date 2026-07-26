@@ -1,10 +1,15 @@
+use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use bincode::serde::{decode_from_slice, encode_into_std_write};
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -20,6 +25,11 @@ pub type LegacyChanges = Vec<LegacyChange>;
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"DUETSNP\0";
 const SNAPSHOT_VERSION_V2: u8 = 2;
+const HASH_BUFFER_SIZE: usize = 1024 * 1024;
+const MAX_HASH_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const MAX_HASH_WORKERS: usize = 64;
+const HASH_WORKERS_ENV: &str = "DUET_HASH_WORKERS";
+const HASH_BUFFER_BYTES_ENV: &str = "DUET_HASH_BUFFER_BYTES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotFormat {
@@ -195,24 +205,162 @@ pub async fn scan_entries(
 }
 
 pub async fn hash_manifest(base: &PathBuf, entries: &mut Entries) -> Result<()> {
-    hash_manifest_with_limit(base, entries, 8).await
+    hash_manifest_with_limit(base, entries, hash_worker_limit()).await
 }
 
-async fn run_ordered_with_limit<T, U, E, F, Fut>(
+struct BlockingCancellationState {
+    all: AtomicBool,
+    cutoff: AtomicUsize,
+}
+
+struct BlockingCancellation {
+    state: Arc<BlockingCancellationState>,
+    position: usize,
+}
+
+impl BlockingCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.state.all.load(Ordering::Relaxed)
+            || self.position > self.state.cutoff.load(Ordering::Relaxed)
+    }
+}
+
+struct CancelOnDrop(Arc<BlockingCancellationState>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.all.store(true, Ordering::Relaxed);
+    }
+}
+
+async fn run_blocking_with_limit<T, U, F>(
     items: Vec<T>,
     limit: usize,
     worker: F,
-) -> std::result::Result<Vec<U>, E>
+) -> Result<Vec<U>>
 where
-    F: FnMut(T) -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<U, E>>,
+    T: Send + 'static,
+    U: Send + 'static,
+    F: Fn(T, &BlockingCancellation) -> Result<U> + Send + Sync + 'static,
 {
     assert!(limit > 0, "concurrency limit must be nonzero");
-    stream::iter(items)
-        .map(worker)
-        .buffered(limit)
-        .try_collect()
-        .await
+    let item_count = items.len();
+    let mut pending: VecDeque<_> = items.into_iter().enumerate().collect();
+    let mut active: FuturesUnordered<
+        BoxFuture<'static, (usize, std::result::Result<Result<U>, tokio::task::JoinError>)>,
+    > = FuturesUnordered::new();
+    let mut results: Vec<Option<U>> = std::iter::repeat_with(|| None).take(item_count).collect();
+    let mut active_positions = std::collections::BTreeSet::new();
+    let mut first_error = None;
+    let worker = Arc::new(worker);
+    let cancellation = Arc::new(BlockingCancellationState {
+        all: AtomicBool::new(false),
+        cutoff: AtomicUsize::new(usize::MAX),
+    });
+    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
+
+    while !pending.is_empty() || !active.is_empty() {
+        while active.len() < limit {
+            let Some((position, item)) = pending.pop_front() else { break };
+            let worker = worker.clone();
+            let task_cancellation = BlockingCancellation {
+                state: cancellation.clone(),
+                position,
+            };
+            active_positions.insert(position);
+            active.push(
+                tokio::task::spawn_blocking(move || worker(item, &task_cancellation))
+                    .map(move |joined| (position, joined))
+                    .boxed(),
+            );
+        }
+
+        let Some((position, joined)) = active.next().await else { break };
+        active_positions.remove(&position);
+        match joined {
+            Ok(Ok(result)) => results[position] = Some(result),
+            Ok(Err(error)) => {
+                cancellation.cutoff.fetch_min(position, Ordering::Relaxed);
+                record_first_error(&mut first_error, position, error);
+            }
+            Err(error) => {
+                cancellation.cutoff.fetch_min(position, Ordering::Relaxed);
+                record_first_error(
+                    &mut first_error,
+                    position,
+                    eyre!("hash worker failed: {error}"),
+                );
+            }
+        }
+        if let Some((error_position, _)) = &first_error {
+            pending.retain(|(position, _)| position < error_position);
+            if !active_positions.iter().any(|position| position < error_position) {
+                cancellation.all.store(true, Ordering::Relaxed);
+                return Err(first_error.take().unwrap().1);
+            }
+        }
+    }
+
+    debug_assert!(first_error.is_none());
+    Ok(results
+        .into_iter()
+        .map(|result| result.expect("successful hash worker did not return a result"))
+        .collect())
+}
+
+fn record_first_error(
+    first_error: &mut Option<(usize, color_eyre::Report)>,
+    position: usize,
+    error: color_eyre::Report,
+) {
+    if first_error.as_ref().map(|(first, _)| position < *first).unwrap_or(true) {
+        *first_error = Some((position, error));
+    }
+}
+
+fn hash_worker_limit() -> usize {
+    let available = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
+    hash_worker_limit_from(std::env::var(HASH_WORKERS_ENV).ok().as_deref(), available)
+}
+
+fn hash_worker_limit_from(configured: Option<&str>, available: usize) -> usize {
+    let requested = match configured {
+        Some(value) => match value.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                log::warn!("ignoring invalid {HASH_WORKERS_ENV}={value:?}; using {available}");
+                available.max(1)
+            }
+        },
+        None => available.max(1),
+    };
+    if requested > MAX_HASH_WORKERS {
+        log::warn!("limiting content hash workers from {requested} to {MAX_HASH_WORKERS}");
+    }
+    requested.min(MAX_HASH_WORKERS)
+}
+
+fn hash_buffer_size() -> usize {
+    let requested = positive_env_usize(HASH_BUFFER_BYTES_ENV, HASH_BUFFER_SIZE);
+    if requested > MAX_HASH_BUFFER_SIZE {
+        log::warn!(
+            "limiting content hash buffer from {requested} to {MAX_HASH_BUFFER_SIZE} bytes"
+        );
+    }
+    requested.min(MAX_HASH_BUFFER_SIZE)
+}
+
+fn positive_env_usize(name: &str, default: usize) -> usize {
+    match std::env::var(name).ok().as_deref() {
+        Some(value) => match value.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                log::warn!("ignoring invalid {name}={value:?}; using {default}");
+                default
+            }
+        },
+        None => default,
+    }
 }
 
 async fn hash_work_with_limit(
@@ -223,15 +371,14 @@ async fn hash_work_with_limit(
     assert!(limit > 0, "checksum concurrency limit must be nonzero");
     work.sort_by(|(_, a), (_, b)| a.path().cmp(b.path()));
     let pb = indicatif::ProgressBar::new(work.len() as u64);
-    let base = std::sync::Arc::new(base.clone());
-    let result = run_ordered_with_limit(work, limit, |(index, mut entry)| {
+    let base = Arc::new(base.clone());
+    let buffer_size = hash_buffer_size();
+    let worker_pb = pb.clone();
+    let result = run_blocking_with_limit(work, limit, move |(index, mut entry), cancelled| {
         let base = base.clone();
-        let pb = pb.clone();
-        async move {
-            entry.compute_content_hashes(&base).await?;
-            pb.inc(1);
-            Ok((index, entry))
-        }
+        entry.compute_content_hashes(&base, buffer_size, || cancelled.is_cancelled())?;
+        worker_pb.inc(1);
+        Ok((index, entry))
     })
     .await;
     pb.finish_and_clear();
@@ -311,7 +458,7 @@ pub async fn old_and_changes(
                 _ => None,
             })
             .collect();
-        for (index, entry) in hash_work_with_limit(base, work, 8).await? {
+        for (index, entry) in hash_work_with_limit(base, work, hash_worker_limit()).await? {
             match &mut changes[index] {
                 Change::Added(new) | Change::Modified(_, new) => *new = entry,
                 Change::Removed(_) => unreachable!("removed entries are not hashed"),
@@ -335,6 +482,7 @@ pub async fn old_and_changes(
 mod tests {
     use super::*;
     use crate::scan::ContentDigest;
+    use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -377,39 +525,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_worker_is_concurrent_bounded_and_reports_first_input_error() {
+    async fn blocking_worker_is_parallel_bounded_and_reports_first_input_error() {
         let active = std::sync::Arc::new(AtomicUsize::new(0));
         let maximum = std::sync::Arc::new(AtomicUsize::new(0));
+        let threads = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
         let active_for_worker = active.clone();
         let maximum_for_worker = maximum.clone();
-        let output = run_ordered_with_limit((0..12).collect(), 3, move |item| {
+        let threads_for_worker = threads.clone();
+        let output = run_blocking_with_limit((0..12).collect(), 3, move |item, _| {
             let active = active_for_worker.clone();
             let maximum = maximum_for_worker.clone();
-            async move {
-                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                maximum.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                active.fetch_sub(1, Ordering::SeqCst);
-                Ok::<_, ()>(item)
-            }
+            threads_for_worker.lock().unwrap().insert(std::thread::current().id());
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(item)
         })
         .await
         .unwrap();
         assert_eq!(output, (0..12).collect::<Vec<_>>());
         assert!(maximum.load(Ordering::SeqCst) > 1);
         assert!(maximum.load(Ordering::SeqCst) <= 3);
+        assert!(threads.lock().unwrap().len() > 1);
 
-        let error = run_ordered_with_limit(vec![0, 1], 2, |item| async move {
+        let error = run_blocking_with_limit(vec![0, 1], 2, |item, _| {
             if item == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                Err::<(), _>("first")
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Err::<(), _>(eyre!("first"))
             } else {
-                Err::<(), _>("second")
+                Err::<(), _>(eyre!("second"))
             }
         })
         .await
         .unwrap_err();
-        assert_eq!(error, "first");
+        assert_eq!(error.to_string(), "first");
+    }
+
+    #[tokio::test]
+    async fn blocking_worker_admits_new_work_behind_slow_first_item() {
+        let first_finished = Arc::new(AtomicBool::new(false));
+        let admitted_while_first_running = Arc::new(AtomicBool::new(false));
+        let first_finished_for_worker = first_finished.clone();
+        let admitted_for_worker = admitted_while_first_running.clone();
+        run_blocking_with_limit((0..8).collect(), 3, move |item, _| {
+            if item == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                first_finished_for_worker.store(true, Ordering::SeqCst);
+            } else {
+                if item >= 3 && !first_finished_for_worker.load(Ordering::SeqCst) {
+                    admitted_for_worker.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(item)
+        })
+        .await
+        .unwrap();
+        assert!(admitted_while_first_running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn dropping_blocking_worker_run_requests_cancellation() {
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let started_for_worker = started.clone();
+        let stopped_for_worker = stopped.clone();
+        let task = tokio::spawn(run_blocking_with_limit(vec![()], 1, move |(), cancelled| {
+            started_for_worker.store(true, Ordering::SeqCst);
+            while !cancelled.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            stopped_for_worker.store(true, Ordering::SeqCst);
+            Err::<(), _>(eyre!("cancelled"))
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !stopped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn hash_worker_default_uses_available_parallelism_and_override() {
+        assert_eq!(hash_worker_limit_from(None, 12), 12);
+        assert_eq!(hash_worker_limit_from(Some("24"), 12), 24);
+        assert_eq!(hash_worker_limit_from(Some("0"), 12), 12);
+        assert_eq!(hash_worker_limit_from(Some("invalid"), 12), 12);
+        assert_eq!(hash_worker_limit_from(Some("1000"), 12), MAX_HASH_WORKERS);
+    }
+
+    #[tokio::test]
+    async fn blocking_worker_stops_admitting_paths_after_first_error() {
+        let largest_started = Arc::new(AtomicUsize::new(0));
+        let largest_started_by_worker = largest_started.clone();
+        let error = run_blocking_with_limit((0..100).collect(), 2, move |item, _| {
+            largest_started_by_worker.fetch_max(item, Ordering::SeqCst);
+            if item == 0 {
+                Err::<(), _>(eyre!("first"))
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "first");
+        assert!(largest_started.load(Ordering::SeqCst) <= 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_worker_cancels_active_paths_after_first_error() {
+        let later_stopped = Arc::new(AtomicBool::new(false));
+        let later_stopped_by_worker = later_stopped.clone();
+        let error = run_blocking_with_limit(vec![0, 1, 2], 3, move |item, cancelled| match item {
+            0 => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Ok(())
+            }
+            1 => Err(eyre!("first")),
+            2 => {
+                while !cancelled.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                later_stopped_by_worker.store(true, Ordering::SeqCst);
+                Err(eyre!("cancelled later work"))
+            }
+            _ => unreachable!(),
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "first");
+        assert!(later_stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn blocking_worker_panic_cancels_later_paths() {
+        let later_stopped = Arc::new(AtomicBool::new(false));
+        let later_stopped_by_worker = later_stopped.clone();
+        let error = run_blocking_with_limit(vec![0, 1, 2], 3, move |item, cancelled| match item {
+            0 => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Ok(())
+            }
+            1 => panic!("injected worker panic"),
+            2 => {
+                while !cancelled.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                later_stopped_by_worker.store(true, Ordering::SeqCst);
+                Err(eyre!("cancelled later work"))
+            }
+            _ => unreachable!(),
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("hash worker failed"));
+        assert!(later_stopped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -421,8 +704,8 @@ mod tests {
                 .unwrap();
         }
         let original = vec![
-            DirEntryWithMeta::test_file(PathBuf::from("b"), 0),
-            DirEntryWithMeta::test_file(PathBuf::from("a"), 0),
+            DirEntryWithMeta::test_file_from_path(PathBuf::from("b"), &dir.path().join("b")),
+            DirEntryWithMeta::test_file_from_path(PathBuf::from("a"), &dir.path().join("a")),
         ];
         let mut serial = original.clone();
         let mut parallel = original;
@@ -441,7 +724,7 @@ mod tests {
         assert_eq!(hashes(&serial), hashes(&parallel));
 
         let mut with_missing = vec![
-            DirEntryWithMeta::test_file(PathBuf::from("a"), 0),
+            DirEntryWithMeta::test_file_from_path(PathBuf::from("a"), &dir.path().join("a")),
             DirEntryWithMeta::test_file(PathBuf::from("missing"), 0),
         ];
         assert!(

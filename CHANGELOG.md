@@ -13,7 +13,7 @@
 - Strong-capable peers now use BLAKE2b-256 for cross-side equivalence, stale file checks, and final output verification while retaining Adler-32 only for negotiated compatibility and rustsync rolling blocks.
 - Snapshot maintenance now hashes complete file contents and writes the current version atomically.
 - Expanded `--dry-run` to run the full non-mutating preflight checks, including local and remote directory removal blocker reports.
-- Bounded directory scanning globally to 64 concurrent reads and content hashing separately to eight concurrent files while preserving deterministic results.
+- Bounded directory scanning globally to 64 concurrent reads and made content hashing CPU-parallel across files, defaulting to up to one whole-file worker per available CPU (maximum 64) while preserving deterministic results.
 
 ### Fixed
 - Made scan cancellation own and stop in-flight work, and prevented scan failures from exposing partial entries.

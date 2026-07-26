@@ -1,6 +1,11 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::ffi::CString;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Component, Path, PathBuf};
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
@@ -145,6 +150,22 @@ impl DirEntryWithMeta {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_file_from_path(path: PathBuf, absolute_path: &Path) -> Self {
+        let metadata = absolute_path.metadata().unwrap();
+        Self {
+            path,
+            size: metadata.size(),
+            mtime: metadata.mtime(),
+            ino: metadata.ino(),
+            mode: metadata.mode(),
+            target: None,
+            is_dir: false,
+            checksum: 0,
+            digest: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_dir(path: PathBuf) -> Self {
         Self {
             path,
@@ -278,32 +299,52 @@ impl DirEntryWithMeta {
         !(self.is_dir || self.is_symlink())
     }
 
-    pub async fn compute_content_hashes(&mut self, base: &PathBuf) -> Result<()> {
+    pub(crate) fn compute_content_hashes<F>(
+        &mut self,
+        base: &Path,
+        buffer_size: usize,
+        cancelled: F,
+    ) -> Result<()>
+    where
+        F: Fn() -> bool,
+    {
         if !self.is_file() {
             return Ok(());
         }
+        assert!(buffer_size > 0, "hash buffer size must be nonzero");
 
         let filename = base.join(&self.path);
         log::trace!("Computing checksum for {}", filename.display());
 
         use adler32::RollingAdler32;
-        use tokio::io::AsyncReadExt;
-        let mut file = tokio::fs::File::open(&filename)
-            .await
+        let mut file = open_hash_source(base, &self.path)
             .wrap_err_with(|| format!("unable to open {} for checksum", filename.display()))?;
+        let before = file
+            .metadata()
+            .wrap_err_with(|| format!("unable to read metadata for {}", filename.display()))?;
+        self.validate_hash_source(&before, &filename)?;
+
         let mut hash = RollingAdler32::new();
         let mut strong = blake2_rfc::blake2b::Blake2b::new(32);
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = vec![0; buffer_size];
         loop {
+            if cancelled() {
+                return Err(eyre!("content hashing cancelled"));
+            }
             let read = file
                 .read(&mut buffer)
-                .await
                 .wrap_err_with(|| format!("unable to read {} for checksum", filename.display()))?;
             if read == 0 {
                 break;
             }
             hash.update_buffer(&buffer[..read]);
             strong.update(&buffer[..read]);
+        }
+        let after = file
+            .metadata()
+            .wrap_err_with(|| format!("unable to re-read metadata for {}", filename.display()))?;
+        if HashSourceIdentity::from(&before) != HashSourceIdentity::from(&after) {
+            return Err(eyre!("file changed while computing checksum: {}", filename.display()));
         }
         self.checksum = hash.hash();
         let digest = strong.finalize();
@@ -312,6 +353,79 @@ impl DirEntryWithMeta {
         self.digest = Some(ContentDigest(bytes));
 
         Ok(())
+    }
+
+    fn validate_hash_source(&self, metadata: &std::fs::Metadata, filename: &Path) -> Result<()> {
+        if !metadata.is_file()
+            || metadata.ino() != self.ino
+            || metadata.size() != self.size
+            || metadata.mtime() != self.mtime
+            || metadata.mode() != self.mode
+        {
+            return Err(eyre!(
+                "file changed between scan and checksum: {}",
+                filename.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn open_hash_source(base: &Path, relative: &Path) -> Result<std::fs::File> {
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
+        .open(base)
+        .wrap_err_with(|| format!("unable to open checksum root {}", base.display()))?;
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(eyre!("invalid checksum path: {}", relative.display()));
+        };
+        let name = CString::new(name.as_bytes())?;
+        let last = components.peek().is_none();
+        let flags = libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if last { libc::O_RDONLY } else { libc::O_RDONLY | libc::O_DIRECTORY };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).wrap_err_with(|| {
+                format!("unable to open checksum path component in {}", relative.display())
+            });
+        }
+        let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+        if last {
+            return Ok(opened);
+        }
+        directory = opened;
+    }
+    Err(eyre!("invalid empty checksum path"))
+}
+
+#[derive(PartialEq, Eq)]
+struct HashSourceIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mode: u32,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl From<&std::fs::Metadata> for HashSourceIdentity {
+    fn from(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mode: metadata.mode(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
     }
 }
 
@@ -787,26 +901,79 @@ mod tests {
         assert!(paths.contains(&deepest_relative.join("file.txt")));
     }
 
-    #[tokio::test]
-    async fn compute_checksum_streams_file_contents() {
+    #[test]
+    fn compute_checksum_streams_file_contents() {
         let temp = tempfile::tempdir().unwrap();
         let contents = (0..100_000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
-        tokio::fs::write(temp.path().join("file.bin"), &contents)
-            .await
-            .unwrap();
-        let mut entry = DirEntryWithMeta::test_file_with_size(
-            PathBuf::from("file.bin"),
-            contents.len() as u64,
-            0,
-        );
+        let path = temp.path().join("file.bin");
+        std::fs::write(&path, &contents).unwrap();
+        let metadata = path.metadata().unwrap();
+        let mut entry = DirEntryWithMeta {
+            path: PathBuf::from("file.bin"),
+            size: metadata.size(),
+            mtime: metadata.mtime(),
+            ino: metadata.ino(),
+            mode: metadata.mode(),
+            target: None,
+            is_dir: false,
+            checksum: 0,
+            digest: None,
+        };
 
         entry
-            .compute_content_hashes(&temp.path().to_path_buf())
-            .await
+            .compute_content_hashes(temp.path(), 64 * 1024, || false)
             .unwrap();
 
         assert_eq!(entry.checksum(), adler32::adler32(&contents[..]).unwrap());
         assert_eq!(entry.digest(), Some(crate::sync::content_digest(&contents)));
+    }
+
+    #[test]
+    fn compute_checksum_rejects_changed_or_symlinked_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.bin");
+        std::fs::write(&path, b"before").unwrap();
+        let entry = DirEntryWithMeta::test_file_from_path(PathBuf::from("file.bin"), &path);
+
+        std::fs::write(&path, b"longer after").unwrap();
+        let mut changed = entry.clone();
+        let error = changed
+            .compute_content_hashes(temp.path(), 1024, || false)
+            .unwrap_err();
+        assert!(error.to_string().contains("changed between scan and checksum"));
+        assert_eq!(changed.digest(), None);
+
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("target.bin", &path).unwrap();
+        std::fs::write(temp.path().join("target.bin"), b"before").unwrap();
+        let mut symlinked = entry;
+        assert!(symlinked
+            .compute_content_hashes(temp.path(), 1024, || false)
+            .is_err());
+        assert_eq!(symlinked.digest(), None);
+    }
+
+    #[test]
+    fn compute_checksum_does_not_follow_symlinked_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        let external = temp.path().join("external");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        let path = directory.join("file.bin");
+        std::fs::write(&path, b"contents").unwrap();
+        let mut entry =
+            DirEntryWithMeta::test_file_from_path(PathBuf::from("directory/file.bin"), &path);
+
+        std::fs::hard_link(&path, external.join("file.bin")).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+        std::os::unix::fs::symlink(&external, &directory).unwrap();
+
+        assert!(entry
+            .compute_content_hashes(temp.path(), 1024, || false)
+            .is_err());
+        assert_eq!(entry.digest(), None);
     }
 
     #[test]

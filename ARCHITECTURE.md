@@ -461,8 +461,16 @@ detail generation, apply operations, and local state save, is moved to
 The scanner uses a flat global `VecDeque`/`FuturesUnordered` scheduler with at
 most 64 one-directory scans active. It streams entries through a bounded `mpsc`
 channel; the owning collector polls that scanner future directly so scan errors
-cannot silently turn into partial snapshots. File hashing has a separate bound
-of eight and uses ordered futures.
+cannot silently turn into partial snapshots. File hashing runs each whole-file
+Adler-32/BLAKE2b-256 pass in a blocking worker, using up to one worker per
+available CPU and at most 64 workers by default. Workers complete out of order
+so a slow file does not block new work; results and errors are indexed and
+committed in deterministic path order. `DUET_HASH_WORKERS` can override the
+worker count up to 64 for storage-specific tuning.
+Each worker reads in 1 MiB chunks, validates that the no-follow file handle still
+matches the scan, and checks that its identity remains stable through hashing.
+`DUET_HASH_BUFFER_BYTES` can override the per-worker read size up to 4 MiB, for
+a maximum aggregate hash-buffer allocation of 256 MiB.
 
 ## Platform Assumptions
 
