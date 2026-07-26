@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::{Result, WrapErr};
 use colored::*;
-use tokio::sync::mpsc;
 
 use crate::{full, profile, scan, state, sync};
 
@@ -162,14 +161,10 @@ pub(crate) fn info(name: String) -> Result<()> {
 
 pub(crate) async fn walk(path: PathBuf) -> Result<()> {
     let locations = vec![scan::location::Location::Include(PathBuf::from("."))];
-
-    let (tx, mut rx) = mpsc::channel(1024);
-    let handle = tokio::spawn(async move { scan::scan(path, "", &locations, &Vec::new(), tx).await });
-
-    while let Some(e) = rx.recv().await {
+    let entries = state::scan_entries(&path, &PathBuf::new(), &locations, &Vec::new()).await?;
+    for e in entries {
         println!("{}", e.path().display());
     }
-    handle.await.wrap_err("scanner task failed")??;
     Ok(())
 }
 

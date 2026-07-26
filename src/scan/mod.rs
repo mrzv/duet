@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -8,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use color_eyre::eyre::{eyre, Result, WrapErr};
 
 use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 
-use async_recursion::async_recursion;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use log;
 
@@ -341,6 +342,22 @@ struct ParentFromTo {
     to: usize,
 }
 
+#[derive(Debug)]
+struct ScanContext {
+    locations: Arc<Locations>,
+    restrict: Arc<PathBuf>,
+    base: Arc<PathBuf>,
+    ignore: Arc<Regexes>,
+    dev: u64,
+    tx: mpsc::Sender<DirEntryWithMeta>,
+}
+
+#[derive(Debug)]
+struct ScanJob {
+    path: PathBuf,
+    pft: ParentFromTo,
+}
+
 fn narrow_parent_from_to(pft: ParentFromTo, path: &PathBuf, locations: &Locations) -> ParentFromTo {
     let mut parent = pft.parent;
     let mut from = pft.from;
@@ -388,39 +405,28 @@ fn is_relevant_to_restrict(path: &Path, restrict: &Path) -> bool {
     path.starts_with(restrict) || restrict.starts_with(path)
 }
 
-#[async_recursion]
-async fn scan_dir(
-    path: PathBuf,
-    locations: Arc<Locations>,
-    restrict: Arc<PathBuf>,
-    base: Arc<PathBuf>,
-    ignore: Arc<Regexes>,
-    pft: ParentFromTo,
-    dev: u64,
-    tx: mpsc::Sender<DirEntryWithMeta>,
-    s: Arc<Semaphore>,
-) -> Result<()> {
+async fn scan_one_directory(context: Arc<ScanContext>, job: ScanJob) -> Result<Vec<ScanJob>> {
+    let ScanJob { path, pft } = job;
     log::trace!("Scanning: {}", path.display());
 
     // check the restriction
-    if !path.starts_with(&*restrict) && !restrict.starts_with(&path) {
-        log::trace!("Skipping (restriction): {:?} vs {:?}", path, restrict);
-        return Ok(());
+    if !path.starts_with(&*context.restrict) && !context.restrict.starts_with(&path) {
+        log::trace!("Skipping (restriction): {:?} vs {:?}", path, context.restrict);
+        return Ok(Vec::new());
     }
 
-    let pft = narrow_parent_from_to(pft, &path, &locations);
+    let pft = narrow_parent_from_to(pft, &path, &context.locations);
 
     // no need to descend if we are in the exclude regime and there are no descendants
-    if locations[pft.parent].is_exclude() && pft.from > pft.to {
+    if context.locations[pft.parent].is_exclude() && pft.from > pft.to {
         log::trace!("Skipping excluded: {:?}", path);
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // read the directory
     use tokio::fs;
-    let mut child_dirs = Vec::new();
+    let mut child_jobs = Vec::new();
 
-    let _sp = s.acquire().await.wrap_err("scanner semaphore closed")?;
     let mut dir = fs::read_dir(&path)
         .await
         .wrap_err_with(|| format!("unable to read directory {}", path.display()))?;
@@ -431,7 +437,7 @@ async fn scan_dir(
     {
         let path = child.path();
 
-        if is_match(&ignore, &path) {
+        if is_match(&context.ignore, &path) {
             log::trace!("Skipping (ignored): {:?}", path);
             continue;
         }
@@ -441,11 +447,11 @@ async fn scan_dir(
             .wrap_err_with(|| format!("unable to read metadata for {}", path.display()))?;
 
         let file_type = meta.file_type();
-        let location = find_parent(&path, &locations, &pft);
-        let child_pft = narrow_parent_from_to(pft.clone(), &path, &locations);
+        let location = find_parent(&path, &context.locations, &pft);
+        let child_pft = narrow_parent_from_to(pft.clone(), &path, &context.locations);
         let has_descendant_includes = child_pft.from <= child_pft.to
             && (child_pft.from..=child_pft.to)
-                .any(|i| locations[i].is_include() && locations[i].path() != &path);
+                .any(|i| context.locations[i].is_include() && context.locations[i].path() != &path);
 
         if location.is_exclude() && !has_descendant_includes {
             log::trace!("Not reporting (excluded): {:?}", path);
@@ -457,7 +463,7 @@ async fn scan_dir(
             || file_type.is_fifo()
             || file_type.is_socket()
         {
-            if path.starts_with(&*restrict) {
+            if path.starts_with(&*context.restrict) {
                 return Err(eyre!(
                     "unsupported special file in sync tree: {}",
                     path.display()
@@ -467,16 +473,21 @@ async fn scan_dir(
             continue;
         }
 
-        if meta.is_dir() && dev != meta.dev() && is_relevant_to_restrict(&path, &restrict) {
+        if meta.is_dir()
+            && context.dev != meta.dev()
+            && is_relevant_to_restrict(&path, &context.restrict)
+        {
             return Err(eyre!(
                 "refusing to cross filesystem boundary at {}",
                 path.display()
             ));
         }
 
-        if meta.is_dir() && dev == meta.dev() {
-            let path = path.clone();
-            child_dirs.push(path);
+        if meta.is_dir() && context.dev == meta.dev() {
+            child_jobs.push(ScanJob {
+                path: path.clone(),
+                pft: pft.clone(),
+            });
         }
 
         if location.is_exclude() {
@@ -485,7 +496,7 @@ async fn scan_dir(
         }
 
         // check restriction and crossing the filesystem boundary
-        if path.starts_with(&*restrict) && dev == meta.dev() {
+        if path.starts_with(&*context.restrict) && context.dev == meta.dev() {
             log::trace!("Reporting: {:?}", path);
             let target = if file_type.is_symlink() {
                 Some(fs::read_link(&path).await.wrap_err_with(|| {
@@ -495,36 +506,49 @@ async fn scan_dir(
                 None
             };
 
-            tx.send(DirEntryWithMeta {
-                path: relative(&*base, &path).to_path_buf(),
-                target,
-                size: meta.size(),
-                mtime: meta.mtime(),
-                ino: meta.ino(),
-                mode: meta.mode(),
-                is_dir: meta.is_dir(),
-                checksum: 0,
-                digest: None,
-            })
-            .await
-            .map_err(|_| eyre!("unable to send scan result for {}", path.display()))?
+            context
+                .tx
+                .send(DirEntryWithMeta {
+                    path: relative(&context.base, &path).to_path_buf(),
+                    target,
+                    size: meta.size(),
+                    mtime: meta.mtime(),
+                    ino: meta.ino(),
+                    mode: meta.mode(),
+                    is_dir: meta.is_dir(),
+                    checksum: 0,
+                    digest: None,
+                })
+                .await
+                .map_err(|_| eyre!("unable to send scan result for {}", path.display()))?
         }
     }
-    drop(dir);
-    drop(_sp);
+    Ok(child_jobs)
+}
 
-    scan_children(
-        child_dirs,
-        locations,
-        restrict,
-        base,
-        ignore,
-        pft,
-        dev,
-        tx,
-        s.clone(),
-    )
-    .await?;
+async fn run_scan_scheduler<F, Fut>(initial: ScanJob, limit: usize, mut worker: F) -> Result<()>
+where
+    F: FnMut(ScanJob) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<ScanJob>>>,
+{
+    assert!(limit > 0, "scan concurrency limit must be nonzero");
+    let mut pending = VecDeque::from([initial]);
+    let mut active = FuturesUnordered::new();
+
+    while !pending.is_empty() || !active.is_empty() {
+        while active.len() < limit {
+            let Some(job) = pending.pop_front() else {
+                break;
+            };
+            active.push(worker(job));
+        }
+
+        if let Some(result) = active.next().await {
+            let mut children = result?;
+            children.sort_by(|a, b| a.path.cmp(&b.path));
+            pending.extend(children);
+        }
+    }
 
     Ok(())
 }
@@ -533,6 +557,59 @@ async fn scan_dir(
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn test_job(path: impl Into<PathBuf>) -> ScanJob {
+        ScanJob {
+            path: path.into(),
+            pft: ParentFromTo {
+                parent: 0,
+                from: 0,
+                to: 0,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_runs_multiple_jobs_within_limit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let active_for_worker = active.clone();
+        let maximum_for_worker = maximum.clone();
+        let started_for_worker = started.clone();
+
+        run_scan_scheduler(test_job("root"), 4, move |job| {
+            started_for_worker.lock().unwrap().push(job.path.clone());
+            let active = active_for_worker.clone();
+            let maximum = maximum_for_worker.clone();
+            async move {
+                let now = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                maximum.fetch_max(now, AtomicOrdering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                active.fetch_sub(1, AtomicOrdering::SeqCst);
+                if job.path == Path::new("root") {
+                    Ok((0..12)
+                        .rev()
+                        .map(|i| test_job(format!("dir{i:02}")))
+                        .collect())
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(maximum.load(AtomicOrdering::SeqCst) > 1);
+        assert!(maximum.load(AtomicOrdering::SeqCst) <= 4);
+        assert_eq!(
+            *started.lock().unwrap(),
+            std::iter::once(PathBuf::from("root"))
+                .chain((0..12).map(|i| PathBuf::from(format!("dir{i:02}"))))
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[tokio::test]
     async fn scan_rejects_included_special_files() {
@@ -761,35 +838,6 @@ mod tests {
     }
 }
 
-async fn scan_children(
-    children: Vec<PathBuf>,
-    locations: Arc<Locations>,
-    restrict: Arc<PathBuf>,
-    base: Arc<PathBuf>,
-    ignore: Arc<Regexes>,
-    pft: ParentFromTo,
-    dev: u64,
-    tx: mpsc::Sender<DirEntryWithMeta>,
-    s: Arc<Semaphore>,
-) -> Result<()> {
-    for path in children {
-        scan_dir(
-            path,
-            locations.clone(),
-            restrict.clone(),
-            base.clone(),
-            ignore.clone(),
-            pft.clone(),
-            dev,
-            tx.clone(),
-            s.clone(),
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
 /// Send all [directory entries](DirEntryWithMeta) into the channel, given via its [Sender](mpsc::Sender) `tx`.
 ///
 /// # Arguments
@@ -805,6 +853,18 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(
     ignore: &Ignore,
     tx: mpsc::Sender<DirEntryWithMeta>,
 ) -> Result<()> {
+    scan_with_limit(base, path, locations, ignore, tx, 64).await
+}
+
+pub(crate) async fn scan_with_limit<P: AsRef<Path>, Q: AsRef<Path>>(
+    base: P,
+    path: Q,
+    locations: &Locations,
+    ignore: &Ignore,
+    tx: mpsc::Sender<DirEntryWithMeta>,
+    limit: usize,
+) -> Result<()> {
+    assert!(limit > 0, "scan concurrency limit must be nonzero");
     let base = PathBuf::from(base.as_ref());
     let mut restrict = Arc::new(PathBuf::from(&base));
     (*Arc::get_mut(&mut restrict).unwrap()).push(path);
@@ -812,8 +872,8 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(
 
     log::info!("Going to scan: {}", restrict.display());
 
-    let dev = base
-        .symlink_metadata()
+    let dev = tokio::fs::symlink_metadata(&*base)
+        .await
         .wrap_err_with(|| format!("unable to read metadata for scan base {}", base.display()))?
         .dev();
     let locations = location::canonicalize(locations);
@@ -826,28 +886,28 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(
         ignore_regex
             .push(glob_to_regex(p).wrap_err_with(|| format!("invalid ignore pattern {p}"))?);
     }
-    let ignore = Arc::new(ignore_regex.clone());
-
-    let s = Arc::new(Semaphore::new(64));
+    let ignore = Arc::new(ignore_regex);
 
     let path = (*base).clone();
     let to = locations.len() - 1;
-    scan_dir(
-        path,
+    let context = Arc::new(ScanContext {
         locations,
         restrict,
         base,
         ignore,
-        ParentFromTo {
+        dev,
+        tx,
+    });
+    let initial = ScanJob {
+        path,
+        pft: ParentFromTo {
             parent: 0,
             from: 0,
             to: to,
         },
-        dev,
-        tx,
-        s,
-    )
-    .await?;
-
-    Ok(())
+    };
+    run_scan_scheduler(initial, limit, |job| {
+        scan_one_directory(context.clone(), job)
+    })
+    .await
 }

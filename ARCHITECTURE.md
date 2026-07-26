@@ -253,9 +253,9 @@ The scanner:
 5. Reads symlink targets as metadata instead of following symlinks.
 6. Sends reported entries through the channel as `DirEntryWithMeta`.
 
-`state::scan_entries()` owns the scanner task, displays progress while receiving
-entries from the channel, awaits the scanner task, propagates scan failures, and
-sorts the final entries.
+`state::scan_entries()` directly owns and polls the scanner future while receiving
+entries from the channel. Cancellation drops the scan instead of detaching it;
+failures discard partial entries, and successful results are sorted by path.
 
 Restricted synchronization is handled at scan time. A path is scanned only when
 it is under the restriction or is an ancestor of the restriction, allowing Duet to
@@ -284,6 +284,8 @@ For added and modified regular files, `old_and_changes()` computes legacy
 Adler-32 and BLAKE2b-256 in one streaming pass. Metadata/inode identity remains
 the cheap scan comparison; cross-side content equality and strong apply
 verification use BLAKE2b-256. Adler is trusted only in negotiated legacy mode.
+Hashing uses ordered buffered futures with at most eight files active, so errors
+and resulting changes retain path order.
 
 When a requested scope contains legacy or hybrid entries without digests, both
 strong-capable peers hash their complete current manifests in that scope once.
@@ -456,10 +458,11 @@ Blocking filesystem work that can take time, such as signature generation,
 detail generation, apply operations, and local state save, is moved to
 `tokio::task::spawn_blocking()` from the orchestrator.
 
-The scanner uses an `mpsc` channel to stream entries from the walk to the
-collector and a semaphore to bound concurrent directory reads. The collector
-awaits the scanner task so scan errors cannot silently turn into partial
-snapshots.
+The scanner uses a flat global `VecDeque`/`FuturesUnordered` scheduler with at
+most 64 one-directory scans active. It streams entries through a bounded `mpsc`
+channel; the owning collector polls that scanner future directly so scan errors
+cannot silently turn into partial snapshots. File hashing has a separate bound
+of eight and uses ordered futures.
 
 ## Platform Assumptions
 

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use bincode::serde::{decode_from_slice, encode_into_std_write};
 use color_eyre::eyre::{eyre, Result, WrapErr};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -134,32 +135,122 @@ pub fn save_entries(statefile: &PathBuf, entries: &Entries) -> Result<()> {
     save_entries_as(statefile, entries, SnapshotFormat::V2)
 }
 
-pub async fn scan_entries(base: &PathBuf, path: &PathBuf, locations: &Locations, ignore: &profile::Ignore) -> Result<Entries> {
-    let base = base.clone();
-    let path = path.clone();
-    let locations = locations.clone();
-    let ignore = ignore.clone();
-    let mut entries = async move {
-        let (tx, mut rx) = mpsc::channel(32);
-        let scanner = tokio::spawn(async move { scan::scan(&base, &path, &locations, &ignore, tx).await });
-        let pb = indicatif::ProgressBar::new(1);
-        pb.set_style(indicatif::ProgressStyle::default_spinner().template("[{elapsed_precise}] {wide_msg}")?);
-        let mut entries = Entries::new();
-        while let Some(e) = rx.recv().await {
-            pb.set_message(e.path().display().to_string());
-            entries.push(e);
+async fn collect_scan<F>(scanner: F, mut rx: mpsc::Receiver<DirEntryWithMeta>) -> Result<Entries>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::pin!(scanner);
+    let pb = indicatif::ProgressBar::new(1);
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner().template("[{elapsed_precise}] {wide_msg}")?,
+    );
+    let mut entries = Entries::new();
+
+    loop {
+        tokio::select! {
+            result = &mut scanner => {
+                if let Err(error) = result {
+                    pb.finish_and_clear();
+                    return Err(error).wrap_err("scanner failed");
+                }
+                while let Some(entry) = rx.recv().await {
+                    pb.set_message(entry.path().display().to_string());
+                    entries.push(entry);
+                }
+                break;
+            }
+            entry = rx.recv() => match entry {
+                Some(entry) => {
+                    pb.set_message(entry.path().display().to_string());
+                    entries.push(entry);
+                }
+                None => {
+                    if let Err(error) = scanner.await {
+                        pb.finish_and_clear();
+                        return Err(error).wrap_err("scanner failed");
+                    }
+                    break;
+                }
+            }
         }
-        pb.finish_and_clear();
-        scanner.await.wrap_err("scanner task failed")?.wrap_err("scanner failed")?;
-        Ok::<Entries, color_eyre::eyre::Report>(entries)
-    }.await?;
+    }
+
+    pb.finish_and_clear();
     entries.sort();
     Ok(entries)
 }
 
+pub async fn scan_entries(
+    base: &PathBuf,
+    path: &PathBuf,
+    locations: &Locations,
+    ignore: &profile::Ignore,
+) -> Result<Entries> {
+    let base = base.clone();
+    let path = path.clone();
+    let locations = locations.clone();
+    let ignore = ignore.clone();
+    let (tx, rx) = mpsc::channel(32);
+    collect_scan(scan::scan(&base, &path, &locations, &ignore, tx), rx).await
+}
+
 pub async fn hash_manifest(base: &PathBuf, entries: &mut Entries) -> Result<()> {
-    for entry in entries.iter_mut().filter(|entry| entry.is_file()) {
-        entry.compute_content_hashes(base).await?;
+    hash_manifest_with_limit(base, entries, 8).await
+}
+
+async fn run_ordered_with_limit<T, U, E, F, Fut>(
+    items: Vec<T>,
+    limit: usize,
+    worker: F,
+) -> std::result::Result<Vec<U>, E>
+where
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<U, E>>,
+{
+    assert!(limit > 0, "concurrency limit must be nonzero");
+    stream::iter(items)
+        .map(worker)
+        .buffered(limit)
+        .try_collect()
+        .await
+}
+
+async fn hash_work_with_limit(
+    base: &PathBuf,
+    mut work: Vec<(usize, DirEntryWithMeta)>,
+    limit: usize,
+) -> Result<Vec<(usize, DirEntryWithMeta)>> {
+    assert!(limit > 0, "checksum concurrency limit must be nonzero");
+    work.sort_by(|(_, a), (_, b)| a.path().cmp(b.path()));
+    let pb = indicatif::ProgressBar::new(work.len() as u64);
+    let base = std::sync::Arc::new(base.clone());
+    let result = run_ordered_with_limit(work, limit, |(index, mut entry)| {
+        let base = base.clone();
+        let pb = pb.clone();
+        async move {
+            entry.compute_content_hashes(&base).await?;
+            pb.inc(1);
+            Ok((index, entry))
+        }
+    })
+    .await;
+    pb.finish_and_clear();
+    result
+}
+
+pub(crate) async fn hash_manifest_with_limit(
+    base: &PathBuf,
+    entries: &mut Entries,
+    limit: usize,
+) -> Result<()> {
+    let work = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.is_file())
+        .map(|(index, entry)| (index, entry.clone()))
+        .collect();
+    for (index, entry) in hash_work_with_limit(base, work, limit).await? {
+        entries[index] = entry;
     }
     Ok(())
 }
@@ -210,12 +301,20 @@ pub async fn old_and_changes(
     if migration_needed {
         hash_manifest(base, &mut current).await?;
     } else {
-        for change in &mut changes {
-            match change {
+        let work = changes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, change)| match change {
                 Change::Added(new) | Change::Modified(_, new) if new.is_file() => {
-                    new.compute_content_hashes(base).await?;
+                    Some((index, new.clone()))
                 }
-                _ => {}
+                _ => None,
+            })
+            .collect();
+        for (index, entry) in hash_work_with_limit(base, work, 8).await? {
+            match &mut changes[index] {
+                Change::Added(new) | Change::Modified(_, new) => *new = entry,
+                Change::Removed(_) => unreachable!("removed entries are not hashed"),
             }
         }
         // Keep the retained current manifest useful to the V2 migration/action flow.
@@ -237,6 +336,162 @@ mod tests {
     use super::*;
     use crate::scan::ContentDigest;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn scan_collection_is_cancellation_safe_and_never_returns_partial_entries() {
+        struct DropFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel(1);
+        let dropped_by_scanner = dropped.clone();
+        let scanner = async move {
+            let _drop_flag = DropFlag(dropped_by_scanner);
+            tx.send(DirEntryWithMeta::test_file(PathBuf::from("partial"), 0))
+                .await
+                .unwrap();
+            futures::future::pending::<()>().await;
+            Ok(())
+        };
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            collect_scan(scanner, rx)
+        )
+        .await
+        .is_err());
+        assert!(dropped.load(Ordering::SeqCst));
+
+        let (tx, rx) = mpsc::channel(1);
+        let scanner = async move {
+            tx.send(DirEntryWithMeta::test_file(PathBuf::from("partial"), 0))
+                .await
+                .unwrap();
+            Err(eyre!("injected scan failure"))
+        };
+        assert!(collect_scan(scanner, rx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ordered_worker_is_concurrent_bounded_and_reports_first_input_error() {
+        let active = std::sync::Arc::new(AtomicUsize::new(0));
+        let maximum = std::sync::Arc::new(AtomicUsize::new(0));
+        let active_for_worker = active.clone();
+        let maximum_for_worker = maximum.clone();
+        let output = run_ordered_with_limit((0..12).collect(), 3, move |item| {
+            let active = active_for_worker.clone();
+            let maximum = maximum_for_worker.clone();
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, ()>(item)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(output, (0..12).collect::<Vec<_>>());
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+        assert!(maximum.load(Ordering::SeqCst) <= 3);
+
+        let error = run_ordered_with_limit(vec![0, 1], 2, |item| async move {
+            if item == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Err::<(), _>("first")
+            } else {
+                Err::<(), _>("second")
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error, "first");
+    }
+
+    #[tokio::test]
+    async fn checksum_limit_one_matches_parallel_and_errors_do_not_partially_update() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in [("b", b"second".as_slice()), ("a", b"first".as_slice())] {
+            tokio::fs::write(dir.path().join(path), contents)
+                .await
+                .unwrap();
+        }
+        let original = vec![
+            DirEntryWithMeta::test_file(PathBuf::from("b"), 0),
+            DirEntryWithMeta::test_file(PathBuf::from("a"), 0),
+        ];
+        let mut serial = original.clone();
+        let mut parallel = original;
+        hash_manifest_with_limit(&dir.path().to_path_buf(), &mut serial, 1)
+            .await
+            .unwrap();
+        hash_manifest_with_limit(&dir.path().to_path_buf(), &mut parallel, 8)
+            .await
+            .unwrap();
+        let hashes = |entries: &Entries| {
+            entries
+                .iter()
+                .map(|entry| (entry.path().clone(), entry.checksum(), entry.digest()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hashes(&serial), hashes(&parallel));
+
+        let mut with_missing = vec![
+            DirEntryWithMeta::test_file(PathBuf::from("a"), 0),
+            DirEntryWithMeta::test_file(PathBuf::from("missing"), 0),
+        ];
+        assert!(
+            hash_manifest_with_limit(&dir.path().to_path_buf(), &mut with_missing, 2)
+                .await
+                .is_err()
+        );
+        assert_eq!(with_missing[0].checksum(), 0);
+        assert_eq!(with_missing[0].digest(), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_scan_results_are_sorted_and_repeatable() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["z/file", "a/file", "m/file"] {
+            tokio::fs::create_dir_all(dir.path().join(name).parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(dir.path().join(name), name.as_bytes())
+                .await
+                .unwrap();
+        }
+        let locations = vec![crate::scan::location::Location::Include(PathBuf::new())];
+        let first = scan_entries(
+            &dir.path().to_path_buf(),
+            &PathBuf::new(),
+            &locations,
+            &Vec::new(),
+        )
+        .await
+        .unwrap();
+        let second = scan_entries(
+            &dir.path().to_path_buf(),
+            &PathBuf::new(),
+            &locations,
+            &Vec::new(),
+        )
+        .await
+        .unwrap();
+        let paths = |entries: Entries| {
+            entries
+                .into_iter()
+                .map(|entry| entry.path().clone())
+                .collect::<Vec<_>>()
+        };
+        let first = paths(first);
+        let second = paths(second);
+        assert!(first.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(first, second);
+    }
 
     #[test]
     fn legacy_snapshot_is_headerless_and_round_trips_exactly() {

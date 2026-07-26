@@ -35,7 +35,6 @@ atomicwrites = "0.4.4"
 readwrite = { version = "0.2.0", features = ["tokio"] }
 openssh = "0.11.5"
 simple-logging = "2.0.2"
-async-recursion = "1.1.1"
 async-std = "1.13.1"
 chrono = "0.4.40"
 byte-unit = "5.1.6"
