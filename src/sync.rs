@@ -770,22 +770,27 @@ pub fn start_apply_attempt(
     attempt_id: Option<&str>,
 ) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
-    if let Some(parent) = marker_path.parent() {
-        fs::create_dir_all(parent).wrap_err_with(|| {
-            format!(
-                "unable to create apply recovery marker directory {}",
-                parent.display()
-            )
-        })?;
-    }
+    let parent = marker_path.parent().ok_or_else(|| eyre!(
+        "apply recovery marker {} has no parent directory", marker_path.display()
+    ))?;
+    create_dir_all_durable(parent).wrap_err_with(|| format!(
+        "unable to create apply recovery marker directory {}", parent.display()
+    ))?;
     let contents = apply_attempt_contents(side, state_path, base, "apply", actions, attempt_id);
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&marker_path)
-        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .and_then(|mut file| {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        })
     {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_directory(parent).wrap_err_with(|| format!(
+            "unable to sync apply recovery marker directory {}", parent.display()
+        )),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             let existing = fs::read_to_string(&marker_path).wrap_err_with(|| {
                 format!(
@@ -794,7 +799,17 @@ pub fn start_apply_attempt(
                 )
             })?;
             if existing == contents {
-                Ok(())
+                let file = fs::OpenOptions::new().read(true).write(true).open(&marker_path)
+                    .wrap_err_with(|| format!(
+                        "unable to open existing apply recovery marker {}", marker_path.display()
+                    ))?;
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                file.sync_all().wrap_err_with(|| format!(
+                    "unable to sync existing apply recovery marker {}", marker_path.display()
+                ))?;
+                sync_directory(parent).wrap_err_with(|| format!(
+                    "unable to sync apply recovery marker directory {}", parent.display()
+                ))
             } else {
                 Err(eyre!(
                     "{}",
@@ -825,28 +840,27 @@ pub fn mark_apply_attempt_state_save(
             marker_path.display()
         )
     })?;
-    let committed_operations = committed_operations_from_marker(&existing);
-    let committed_steps = committed_steps_from_marker(&existing);
     let mut contents =
         apply_attempt_contents(side, state_path, base, "state-save", actions, attempt_id);
-    for operation in committed_operations {
-        contents.push_str("committed-operation: ");
-        contents.push_str(&operation);
+    for line in existing.lines().filter(|line| {
+        line.starts_with("staged-file: ")
+            || line.starts_with("committed-operation: ")
+            || line.starts_with("committed-step: ")
+    }) {
+        contents.push_str(line);
         contents.push('\n');
     }
-    for step in committed_steps {
-        contents.push_str("committed-step: ");
-        contents.push_str(&step);
-        contents.push('\n');
-    }
-    fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&marker_path)
-        .and_then(|mut file| file.write_all(contents.as_bytes()))
+    use atomicwrites::{AllowOverwrite, AtomicFile};
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    AtomicFile::new(&marker_path, AllowOverwrite)
+        .write_with_options(|file| {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(contents.as_bytes())
+        }, options)
         .wrap_err_with(|| {
             format!(
-                "unable to update apply recovery marker {}",
+                "unable to atomically update apply recovery marker {}",
                 marker_path.display()
             )
         })?;
@@ -931,7 +945,14 @@ fn applied_change(action: &Action) -> Option<&Change> {
 pub fn finish_apply_attempt(state_path: &Path) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
     match fs::remove_file(&marker_path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let parent = marker_path.parent().ok_or_else(|| eyre!(
+                "apply recovery marker {} has no parent directory", marker_path.display()
+            ))?;
+            sync_directory(parent).wrap_err_with(|| format!(
+                "unable to sync cleared apply recovery marker directory {}", parent.display()
+            ))
+        },
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).wrap_err_with(|| {
             format!(
@@ -1153,20 +1174,85 @@ fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
     parsed
 }
 
-fn committed_operations_from_marker(marker: &str) -> Vec<String> {
-    marker
-        .lines()
-        .filter_map(|line| line.strip_prefix("committed-operation: "))
-        .map(ToString::to_string)
-        .collect()
+pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.try_exists().wrap_err_with(|| format!(
+        "unable to check directory {}", current.display()
+    ))? {
+        missing.push(current.to_path_buf());
+        current = current.parent().ok_or_else(|| eyre!(
+            "directory {} has no existing ancestor", path.display()
+        ))?;
+    }
+    fs::create_dir_all(path)
+        .wrap_err_with(|| format!("unable to create directory {}", path.display()))?;
+    for directory in missing.iter().rev() {
+        let parent = directory.parent().ok_or_else(|| eyre!(
+            "directory {} has no parent", directory.display()
+        ))?;
+        sync_directory(parent)?;
+    }
+    Ok(())
 }
 
-fn committed_steps_from_marker(marker: &str) -> Vec<String> {
-    marker
-        .lines()
-        .filter_map(|line| line.strip_prefix("committed-step: "))
-        .map(ToString::to_string)
-        .collect()
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .wrap_err_with(|| format!("unable to open directory for syncing {}", path.display()))?
+        .sync_all()
+        .wrap_err_with(|| format!("unable to sync directory {}", path.display()))
+}
+
+fn complete_apply_phase(base: &Path, actions: &[Action], attempt_state: Option<&Path>) -> Result<()> {
+    let metadata_synced_directories: HashSet<_> = actions
+        .iter()
+        .filter_map(applied_change)
+        .filter_map(|change| match change {
+            Change::Added(entry) | Change::Modified(_, entry) if entry.is_dir() => {
+                Some(base.join(entry.path()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut directories = HashSet::new();
+    directories.insert(base.to_path_buf());
+    for action in actions {
+        let mut path = base.join(action.path());
+        if path != base && !path.pop() {
+            continue;
+        }
+        loop {
+            if !metadata_synced_directories.contains(&path)
+                && path.try_exists().wrap_err_with(|| format!(
+                "unable to check affected path {}", path.display()
+            ))?
+                && fs::symlink_metadata(&path).wrap_err_with(|| format!(
+                "unable to inspect affected path {}", path.display()
+            ))?.is_dir() {
+                directories.insert(path.clone());
+            }
+            if path == base || !path.pop() {
+                break;
+            }
+        }
+    }
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        sync_directory(&directory)?;
+    }
+    if let Some(state_path) = attempt_state {
+        let marker_path = apply_attempt_path(state_path)?;
+        fs::OpenOptions::new().read(true).open(&marker_path)
+            .and_then(|file| file.sync_all())
+            .wrap_err_with(|| format!(
+                "unable to sync accumulated apply recovery records {}", marker_path.display()
+            ))?;
+    }
+    Ok(())
 }
 
 fn apply_attempt_description(state_path: &Path, marker_path: &Path, marker: &str) -> String {
@@ -1790,11 +1876,6 @@ fn prune_ignored_removal_blockers(
 
         let kind = policy.classify(relative_path);
         if policy.should_prune(&kind) {
-                record_committed_step(
-                    attempt_state,
-                    "prune-blocker",
-                    &relative_path.to_path_buf(),
-                )?;
                 if file_type.is_dir() {
                     let base_dev = fs::symlink_metadata(base)
                         .wrap_err_with(|| {
@@ -1816,6 +1897,11 @@ fn prune_ignored_removal_blockers(
                         format!("failed to prune file {}", path.display())
                     })?;
                 }
+                record_committed_step(
+                    attempt_state,
+                    "prune-blocker",
+                    &relative_path.to_path_buf(),
+                )?;
         } else {
             return Err(removal_blocker_error(
                 dirname,
@@ -2417,7 +2503,7 @@ struct TempOutput {
     final_path: PathBuf,
     temp_path: PathBuf,
     file: Option<fs::File>,
-    _parent_guard: Option<WritableDirGuard>,
+    parent_guard: Option<WritableDirGuard>,
 }
 
 impl TempOutput {
@@ -2431,7 +2517,7 @@ impl TempOutput {
             final_path,
             temp_path,
             file: Some(file),
-            _parent_guard: parent_guard,
+            parent_guard,
         })
     }
 
@@ -2518,6 +2604,7 @@ impl TempOutput {
 
     fn finish(mut self, entry: &Entry) -> Result<Entry> {
         let final_entry = self.prepare_metadata(entry)?;
+        self.sync_all()?;
         self.verify_path_identity(&self.temp_path)?;
         fs::rename(&self.temp_path, &self.final_path).wrap_err_with(|| {
             format!(
@@ -2527,11 +2614,13 @@ impl TempOutput {
             )
         })?;
         self.verify_path_identity(&self.final_path)?;
+        self.restore_parent()?;
         Ok(final_entry)
     }
 
     fn finish_without_replacing(mut self, description: &str, entry: &Entry) -> Result<Entry> {
         let final_entry = self.prepare_metadata(entry)?;
+        self.sync_all()?;
         self.verify_path_identity(&self.temp_path)?;
         match fs::hard_link(&self.temp_path, &self.final_path) {
             Ok(()) => {}
@@ -2556,6 +2645,7 @@ impl TempOutput {
         fs::remove_file(&self.temp_path).wrap_err_with(|| {
             format!("failed to remove temporary file {}", self.temp_path.display())
         })?;
+        self.restore_parent()?;
         Ok(final_entry)
     }
 
@@ -2571,6 +2661,22 @@ impl TempOutput {
             .wrap_err_with(|| {
                 format!("failed to flush temporary file {}", self.temp_path.display())
             })
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        self.file.as_ref()
+            .ok_or_else(|| eyre!("temporary output is closed"))?
+            .sync_all()
+            .wrap_err_with(|| format!(
+                "failed to sync temporary file {}", self.temp_path.display()
+            ))
+    }
+
+    fn restore_parent(&mut self) -> Result<()> {
+        if let Some(guard) = self.parent_guard.take() {
+            guard.restore()?;
+        }
+        Ok(())
     }
 }
 
@@ -2659,11 +2765,22 @@ impl WritableDirGuard {
             original_mode,
         }))
     }
+
+    fn restore(mut self) -> Result<()> {
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(self.original_mode))
+            .wrap_err_with(|| format!(
+                "failed to restore directory permissions after sync {}", self.path.display()
+            ))?;
+        self.path.clear();
+        Ok(())
+    }
 }
 
 impl Drop for WritableDirGuard {
     fn drop(&mut self) {
-        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.original_mode));
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.original_mode));
+        }
     }
 }
 
@@ -2980,6 +3097,7 @@ impl DetailApplier {
             self.new_entries.push(e.clone());
         }
         self.new_entries.sort();
+        complete_apply_phase(&self.base, &self.actions, self.attempt_state.as_deref())?;
         Ok(self.new_entries)
     }
 
@@ -3756,6 +3874,8 @@ pub fn apply_detailed_changes_with_policy(
 
     std::mem::swap(all_old, &mut new_entries);
 
+    complete_apply_phase(base, actions, attempt_state)?;
+
     Ok(())
 }
 
@@ -3985,21 +4105,71 @@ fn update_file_with_diff(
 fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
     let meta = fs::symlink_metadata(path)
         .wrap_err_with(|| format!("failed to read metadata for {}", path.display()))?;
-    if !e.is_symlink() {
-        let mut perms = meta.permissions();
-        perms.set_mode(synced_mode(e.mode()));
-        fs::set_permissions(path, perms)
+    if e.is_symlink() {
+        filetime::set_symlink_file_times(
+            path,
+            filetime::FileTime::from_unix_time(meta.atime(), 0),
+            filetime::FileTime::from_unix_time(e.mtime(), 0),
+        )
+        .wrap_err_with(|| format!("failed to set time for {}", path.display()))?;
+    } else {
+        let desired_mode = synced_mode(e.mode());
+        let file = match open_metadata_target(path, e.is_dir()) {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && desired_mode & if e.is_dir() { 0o400 } else { 0o600 } != 0 =>
+            {
+                fs::set_permissions(path, fs::Permissions::from_mode(desired_mode)).wrap_err_with(
+                    || format!("failed to set permissions for {}", path.display()),
+                )?;
+                open_metadata_target(path, e.is_dir()).wrap_err_with(|| {
+                    format!("failed to open metadata target {}", path.display())
+                })?
+            }
+            Err(error) => {
+                return Err(error)
+                    .wrap_err_with(|| format!("failed to open metadata target {}", path.display()));
+            }
+        };
+        file.set_permissions(fs::Permissions::from_mode(desired_mode))
             .wrap_err_with(|| format!("failed to set permissions for {}", path.display()))?;
+        filetime::set_file_handle_times(
+            &file,
+            Some(filetime::FileTime::from_unix_time(meta.atime(), 0)),
+            Some(filetime::FileTime::from_unix_time(e.mtime(), 0)),
+        )
+        .wrap_err_with(|| format!("failed to set time for {}", path.display()))?;
+        file.sync_all()
+            .wrap_err_with(|| format!("failed to sync metadata for {}", path.display()))?;
     }
-    filetime::set_symlink_file_times(
-        path,
-        filetime::FileTime::from_unix_time(meta.atime(), 0),
-        filetime::FileTime::from_unix_time(e.mtime(), 0),
-    )
-    .wrap_err_with(|| format!("failed to set time for {}", path.display()))?;
     let mut new_entry = e.clone();
-    new_entry.set_ino(meta.ino());
+    let final_meta = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to verify metadata for {}", path.display()))?;
+    new_entry.set_ino(final_meta.ino());
     Ok(new_entry)
+}
+
+fn open_metadata_target(path: &Path, is_dir: bool) -> io::Result<fs::File> {
+    let flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if is_dir {
+        return fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags | libc::O_DIRECTORY)
+            .open(path);
+    }
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(flags)
+            .open(path),
+        Err(error) => Err(error),
+    }
 }
 
 fn synced_mode(mode: u32) -> u32 {
@@ -4054,6 +4224,53 @@ mod tests {
 
     fn synced_existing_dir_entry(base: &Path, path: &str) -> Entry {
         update_meta(&base.join(path), &Entry::test_dir(PathBuf::from(path))).unwrap()
+    }
+
+    #[test]
+    fn metadata_update_syncs_targets_with_restrictive_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("file");
+        fs::write(&file_path, b"contents").unwrap();
+        let file_entry = test_file_entry_with_mode("file", b"contents", 0o000);
+        update_meta(&file_path, &file_entry).unwrap();
+        assert_eq!(mode(&file_path), 0o000);
+
+        let directory_path = dir.path().join("directory");
+        fs::create_dir(&directory_path).unwrap();
+        let mut directory_entry = Entry::test_dir(PathBuf::from("directory"));
+        directory_entry.set_mode(0o000);
+        update_meta(&directory_path, &directory_entry).unwrap();
+        assert_eq!(mode(&directory_path), 0o000);
+
+        let unreadable_path = dir.path().join("unreadable");
+        fs::write(&unreadable_path, b"contents").unwrap();
+        fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable_entry = test_file_entry_with_mode("unreadable", b"contents", 0o400);
+        update_meta(&unreadable_path, &unreadable_entry).unwrap();
+        assert_eq!(mode(&unreadable_path), 0o400);
+    }
+
+    #[test]
+    fn apply_phase_does_not_reopen_metadata_synced_restrictive_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let directory_path = base.path().join("directory");
+        fs::create_dir(&directory_path).unwrap();
+        fs::write(directory_path.join("child"), b"contents").unwrap();
+        let mut old_directory = Entry::test_dir(PathBuf::from("directory"));
+        old_directory.set_mode(0o700);
+        let mut new_directory = old_directory.clone();
+        new_directory.set_mode(0o300);
+        update_meta(&directory_path, &new_directory).unwrap();
+        let child = test_file_entry("directory/child", b"contents");
+        let actions = vec![
+            Action::Local(Change::Modified(old_directory, new_directory)),
+            Action::Local(Change::Added(child)),
+        ];
+
+        complete_apply_phase(base.path(), &actions, None).unwrap();
+
+        assert_eq!(mode(&directory_path), 0o300);
+        fs::set_permissions(&directory_path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
@@ -5423,7 +5640,7 @@ mod tests {
             "{}",
             marker
         );
-        assert!(!marker.contains("staged-file: "), "{}", marker);
+        assert!(marker.contains("staged-file: "), "{}", marker);
         assert!(
             marker.contains("committed-operation: add-file a.txt"),
             "{}",
@@ -5442,6 +5659,32 @@ mod tests {
 
         finish_apply_attempt(&state).unwrap();
         check_apply_attempt_clear(&state).unwrap();
+    }
+
+    #[test]
+    fn apply_attempt_marker_is_private_and_phase_transition_preserves_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+        let actions = vec![Action::Local(Change::Added(Entry::test_file(
+            PathBuf::from("a.txt"), 0,
+        )))];
+
+        start_apply_attempt("local", &state, &base, &actions, None).unwrap();
+        let marker_path = apply_attempt_path(&state).unwrap();
+        fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o644)).unwrap();
+        start_apply_attempt("local", &state, &base, &actions, None).unwrap();
+        assert_eq!(fs::metadata(&marker_path).unwrap().permissions().mode() & 0o777, 0o600);
+        record_staged_file(Some(&state), Path::new(".duet-part-test")).unwrap();
+        record_committed_step(Some(&state), "rename-file", Path::new("a.txt")).unwrap();
+        mark_apply_attempt_state_save("local", &state, &base, &actions, None).unwrap();
+
+        let marker = fs::read_to_string(&marker_path).unwrap();
+        assert!(marker.contains("phase: state-save"), "{}", marker);
+        assert!(marker.contains("staged-file: .duet-part-test"), "{}", marker);
+        assert!(marker.contains("committed-step: rename-file a.txt"), "{}", marker);
+        assert_eq!(fs::metadata(&marker_path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

@@ -141,10 +141,10 @@ pub async fn sync(
     let remote_fut = async {
         let start = Instant::now();
         let result = if strong {
-            remote.changes_v2(remote_path, remote_locations, remote_ignore, remote_id).await
+            remote.changes_v2(remote_path, remote_locations, remote_ignore, remote_id.clone()).await
                 .map_err(|e| remote_rpc_error("Couldn't get remote V2 changes", e))
         } else {
-            remote.changes(remote_path, remote_locations, remote_ignore, remote_id).await
+            remote.changes(remote_path, remote_locations, remote_ignore, remote_id.clone()).await
                 .map(|changes| state::ChangesV2 {
                     changes: changes.into_iter().map(Into::into).collect(),
                     current: Vec::new(),
@@ -516,12 +516,19 @@ pub async fn sync(
     )?;
 
     let state_save_start = Instant::now();
+    let coordinated_cleanup = has_remote_capability(&remote_info, rpc::CAPABILITY_COORDINATED_MARKER_CLEANUP);
     let local_state_display = local_state.display().to_string();
     let local_state_for_save = local_state.clone();
     let (remote_result, local_result) = tokio::join!(
         async {
             let start = Instant::now();
-            let result = if strong { remote.save_state_v2().await } else { remote.save_state().await };
+            let result = if coordinated_cleanup {
+                remote.save_state_pending(strong).await
+            } else if strong {
+                remote.save_state_v2().await
+            } else {
+                remote.save_state().await
+            };
             (result, start.elapsed())
         },
         tokio::task::spawn_blocking(move || {
@@ -541,6 +548,10 @@ pub async fn sync(
     })?;
     let (remote_result, remote_state_save_duration) = remote_result;
     remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
+    if coordinated_cleanup {
+        remote.clear_apply_attempt(remote_id).await
+            .map_err(|e| remote_rpc_error("failed to clear remote recovery marker", e))?;
+    }
     sync_ops::finish_apply_attempt(&local_state)?;
     performance.record_phase("local_state_save", local_state_save_duration);
     performance.record_phase("remote_state_save_rpc", remote_state_save_duration);

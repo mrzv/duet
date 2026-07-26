@@ -39,6 +39,7 @@ pub(crate) const CAPABILITY_RECOVERY: &str = "recovery-v1";
 pub(crate) const CAPABILITY_PREFLIGHT_APPLY: &str = "preflight-apply-v1";
 pub(crate) const CAPABILITY_REMOVAL_BLOCKER_REPORT: &str = "removal-blocker-report-v1";
 pub(crate) const CAPABILITY_CONTENT_DIGEST_BLAKE2B256: &str = "content-digest-blake2b256-v1";
+pub(crate) const CAPABILITY_COORDINATED_MARKER_CLEANUP: &str = "coordinated-marker-cleanup-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -57,6 +58,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PREFLIGHT_APPLY,
     CAPABILITY_REMOVAL_BLOCKER_REPORT,
     CAPABILITY_CONTENT_DIGEST_BLAKE2B256,
+    CAPABILITY_COORDINATED_MARKER_CLEANUP,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -185,6 +187,7 @@ pub trait DuetServer {
     ) -> Result<sync::ApplyPreflightReport, RPCError>;
     fn save_state_v2(&self) -> Result<(), RPCError>;
     fn prepare_migration_v2(&mut self) -> Result<(), RPCError>;
+    fn save_state_pending(&self, strong: bool) -> Result<(), RPCError>;
 }
 
 struct DuetServerImpl {
@@ -363,13 +366,16 @@ impl DuetServerImpl {
         Ok(())
     }
 
-    fn save_state_as(&self, format: SnapshotFormat) -> Result<(), RPCError> {
+    fn save_state_as(&self, format: SnapshotFormat, clear_marker: bool) -> Result<(), RPCError> {
         let remote_state = self.initialized_remote_state("save state")?;
         self.accepted_actions("save state")?;
         crate::state::save_entries_as(&remote_state, &self.all_old, format)
             .map_err(|e| rpc_report_error("save remote state", Some(&remote_state), e))?;
-        sync::finish_apply_attempt(&remote_state)
-            .map_err(|e| rpc_report_error("finish apply recovery", Some(&remote_state), e))
+        if clear_marker {
+            sync::finish_apply_attempt(&remote_state)
+                .map_err(|e| rpc_report_error("finish apply recovery", Some(&remote_state), e))?;
+        }
+        Ok(())
     }
 }
 
@@ -513,7 +519,7 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn save_state(&self) -> Result<(), RPCError> {
-        self.save_state_as(SnapshotFormat::LegacyV1)
+        self.save_state_as(SnapshotFormat::LegacyV1, true)
     }
 
     fn set_remote_state_dir(&mut self, remote_state_dir: PathBuf) -> Result<(), RPCError> {
@@ -915,13 +921,18 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn save_state_v2(&self) -> Result<(), RPCError> {
-        self.save_state_as(SnapshotFormat::V2)
+        self.save_state_as(SnapshotFormat::V2, true)
     }
 
     fn prepare_migration_v2(&mut self) -> Result<(), RPCError> {
         self.initialized_remote_state("prepare strong digest migration")?;
         crate::state::replace_scope(&mut self.all_old, &self.restrict, &self.current_scan);
         Ok(())
+    }
+
+    fn save_state_pending(&self, strong: bool) -> Result<(), RPCError> {
+        let format = if strong { SnapshotFormat::V2 } else { SnapshotFormat::LegacyV1 };
+        self.save_state_as(format, false)
     }
 }
 
@@ -1092,6 +1103,7 @@ mod tests {
         assert!(client.removal_blocker_report_v2(Vec::new(), sync::ApplyOptions::default()).is_err());
         assert!(client.save_state_v2().is_err());
         assert!(client.prepare_migration_v2().is_err());
+        assert!(client.save_state_pending(true).is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -1116,6 +1128,7 @@ mod tests {
                 ("removal_blocker_report_v2", 34),
                 ("save_state_v2", 35),
                 ("prepare_migration_v2", 36),
+                ("save_state_pending", 37),
             ]
         );
     }
@@ -1153,6 +1166,7 @@ mod tests {
                 CAPABILITY_PREFLIGHT_APPLY.to_string(),
                 CAPABILITY_REMOVAL_BLOCKER_REPORT.to_string(),
                 CAPABILITY_CONTENT_DIGEST_BLAKE2B256.to_string(),
+                CAPABILITY_COORDINATED_MARKER_CLEANUP.to_string(),
             ]
         );
     }
@@ -1235,6 +1249,26 @@ mod tests {
         let v2 = crate::state::load_entries_with_format(&path).unwrap();
         assert_eq!(v2.format, SnapshotFormat::V2);
         assert_eq!(v2.entries[0].digest(), entry.digest());
+    }
+
+    #[test]
+    fn pending_save_preserves_marker_until_coordinated_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = DuetServerImpl::new().unwrap();
+        server.remote_state_dir = dir.path().to_path_buf();
+        server.remote_id = "peer".to_string();
+        server.changes_ready = true;
+        server.actions_ready = true;
+        let remote_state = dir.path().join("peer");
+        sync::start_apply_attempt("remote", &remote_state, dir.path(), &[], None).unwrap();
+        let marker = dir.path().join(".peer.duet-apply");
+
+        server.save_state_pending(true).unwrap();
+
+        assert!(marker.exists());
+        assert_eq!(crate::state::load_entries_with_format(&remote_state).unwrap().format, SnapshotFormat::V2);
+        server.clear_apply_attempt("peer".to_string()).unwrap();
+        assert!(!marker.exists());
     }
 
     #[test]

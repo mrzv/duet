@@ -1,4 +1,5 @@
 use std::io::{BufWriter, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use bincode::serde::{decode_from_slice, encode_into_std_write};
@@ -112,16 +113,19 @@ fn write_entries(writer: &mut impl Write, entries: &Entries, format: SnapshotFor
 pub fn save_entries_as(statefile: &Path, entries: &Entries, format: SnapshotFormat) -> Result<()> {
     sync::validate_entries("state file", entries)?;
     if let Some(parent) = statefile.parent() {
-        std::fs::create_dir_all(parent)
+        sync::create_dir_all_durable(parent)
             .wrap_err_with(|| format!("unable to create state directory {}", parent.display()))?;
     }
     use atomicwrites::{AllowOverwrite, AtomicFile};
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
     AtomicFile::new(statefile, AllowOverwrite)
-        .write(|file| {
+        .write_with_options(|file| {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             let mut writer = BufWriter::new(file);
             write_entries(&mut writer, entries, format).map_err(std::io::Error::other)?;
             writer.flush()
-        })
+        }, options)
         .wrap_err_with(|| format!("unable to atomically save state file {}", statefile.display()))?;
     Ok(())
 }
@@ -232,6 +236,7 @@ pub async fn old_and_changes(
 mod tests {
     use super::*;
     use crate::scan::ContentDigest;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn legacy_snapshot_is_headerless_and_round_trips_exactly() {
@@ -299,6 +304,14 @@ mod tests {
         let loaded = decode_entries(&bytes).unwrap();
         assert_eq!(loaded.format, SnapshotFormat::V2);
         assert_eq!(loaded.entries[0].digest(), Some(ContentDigest([9; 32])));
+    }
+
+    #[test]
+    fn snapshot_file_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("nested/state");
+        save_entries(&state_path, &Vec::new()).unwrap();
+        assert_eq!(std::fs::metadata(state_path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
 
