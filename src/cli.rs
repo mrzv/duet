@@ -47,11 +47,6 @@ pub enum Command {
         clear: bool,
         yes: bool,
     },
-    Preflight {
-        profile: ProfileSource,
-        path: Option<PathBuf>,
-        options: SyncOptions,
-    },
     Sync {
         profile: ProfileSource,
         path: Option<PathBuf>,
@@ -114,15 +109,6 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         if path_is_recover {
             return Err(eyre!("recover is a subcommand, not a profile-file path"));
         }
-        if path.as_deref() == Some(std::path::Path::new("preflight")) {
-            let path = pargs.opt_free_from_os_str(parse_path)?;
-            ensure_no_args(pargs)?;
-            return Ok(Command::Preflight {
-                profile: ProfileSource::File(profile_file),
-                path,
-                options,
-            });
-        }
         ensure_no_args(pargs)?;
         return Ok(Command::Sync {
             profile: ProfileSource::File(profile_file),
@@ -181,22 +167,6 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
                 remote,
                 clear,
                 yes: options.yes,
-            }
-        }
-        "preflight" => {
-            let profile = match pargs.free_from_str::<String>() {
-                Ok(profile) => profile,
-                Err(pico_args::Error::MissingArgument) => {
-                    return Err(eyre!(
-                        "preflight requires a profile: duet preflight <profile> [path]"
-                    ));
-                }
-                Err(err) => return Err(err.into()),
-            };
-            Command::Preflight {
-                profile: ProfileSource::Named(profile),
-                path: pargs.opt_free_from_os_str(parse_path)?,
-                options,
             }
         }
         _ => Command::Sync {
@@ -264,7 +234,7 @@ fn ensure_help_args(pargs: pico_args::Arguments) -> Result<()> {
 
     if remaining.len() == 1 {
         let arg = remaining[0].to_string_lossy();
-        if matches!(arg.as_ref(), "preflight" | "recover" | "_recover") {
+        if matches!(arg.as_ref(), "recover" | "_recover") {
             return Ok(());
         }
     }
@@ -331,8 +301,6 @@ mod tests {
         );
         assert_eq!(parse_args(&["--license"]), Command::License);
         assert_eq!(parse_args(&["--server"]), Command::Server);
-        assert_eq!(parse_args(&["-h", "preflight"]), Command::Help);
-        assert_eq!(parse_args(&["preflight", "-h"]), Command::Help);
         assert_eq!(parse_args(&["--help", "recover"]), Command::Help);
         assert_eq!(parse_args(&["recover", "-h"]), Command::Help);
     }
@@ -442,26 +410,11 @@ mod tests {
                 },
             }
         );
-    }
-
-    #[test]
-    fn parses_preflight_command() {
-        let mut options = default_options();
-        options.prune_ignored = true;
         assert_eq!(
-            parse_args(&["--prune-ignored", "preflight", "work", "docs"]),
-            Command::Preflight {
-                profile: ProfileSource::Named("work".to_string()),
-                path: Some(PathBuf::from("docs")),
-                options,
-            }
-        );
-
-        assert_eq!(
-            parse_args(&["--profile-file", "profile.prf", "preflight", "docs"]),
-            Command::Preflight {
+            parse_args(&["--profile-file", "profile.prf", "preflight"]),
+            Command::Sync {
                 profile: ProfileSource::File(PathBuf::from("profile.prf")),
-                path: Some(PathBuf::from("docs")),
+                path: Some(PathBuf::from("preflight")),
                 options: default_options(),
             }
         );
@@ -560,7 +513,6 @@ mod tests {
             .contains("recover is a subcommand"));
         assert!(parse_args_error(&["--profile-file", "profile.prf", "_recover"])
             .contains("recover is a subcommand"));
-        assert!(parse_args_error(&["preflight"]).contains("preflight requires a profile"));
         assert!(parse_args_error(&["preflight", "work", "path1", "path2"])
             .contains("unexpected argument"));
     }

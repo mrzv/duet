@@ -37,6 +37,8 @@ pub(crate) const CAPABILITY_APPLY_OPTIONS: &str = "apply-options-v1";
 pub(crate) const CAPABILITY_PRUNE_PATTERNS: &str = "prune-patterns-v1";
 pub(crate) const CAPABILITY_PREFLIGHT_REPORT: &str = "preflight-report-v1";
 pub(crate) const CAPABILITY_RECOVERY: &str = "recovery-v1";
+pub(crate) const CAPABILITY_PREFLIGHT_APPLY: &str = "preflight-apply-v1";
+pub(crate) const CAPABILITY_REMOVAL_BLOCKER_REPORT: &str = "removal-blocker-report-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -52,6 +54,8 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PRUNE_PATTERNS,
     CAPABILITY_PREFLIGHT_REPORT,
     CAPABILITY_RECOVERY,
+    CAPABILITY_PREFLIGHT_APPLY,
+    CAPABILITY_REMOVAL_BLOCKER_REPORT,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -145,6 +149,16 @@ pub trait DuetServer {
     ) -> Result<sync::ApplyPreflightReport, RPCError>;
     fn describe_apply_attempt(&self, remote_id: String) -> Result<Option<String>, RPCError>;
     fn clear_apply_attempt(&self, remote_id: String) -> Result<(), RPCError>;
+    fn preflight_apply(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<(), RPCError>;
+    fn removal_blocker_report(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<sync::ApplyPreflightReport, RPCError>;
 }
 
 struct DuetServerImpl {
@@ -781,6 +795,20 @@ impl DuetServer for DuetServerImpl {
             .map_err(|e| rpc_report_error("preflight report", Some(&self.base), e))
     }
 
+    fn preflight_apply(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<(), RPCError> {
+        let remote_state = self.initialized_remote_state("preflight apply")?;
+        sync::preflight_state_save(&remote_state)
+            .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
+        sync::validate_actions(&actions)
+            .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
+        sync::preflight_apply_with_policy(&self.base, &actions, self.scan_policy.as_ref(), options)
+            .map_err(|e| rpc_report_error("preflight apply", Some(&self.base), e))
+    }
+
     fn describe_apply_attempt(&self, remote_id: String) -> Result<Option<String>, RPCError> {
         let remote_state = self.remote_state_for_id(&remote_id)?;
         sync::describe_apply_attempt(&remote_state)
@@ -791,6 +819,18 @@ impl DuetServer for DuetServerImpl {
         let remote_state = self.remote_state_for_id(&remote_id)?;
         sync::clear_apply_attempt(&remote_state)
             .map_err(|e| rpc_report_error("clear recovery marker", Some(&remote_state), e))
+    }
+
+    fn removal_blocker_report(
+        &self,
+        actions: Actions,
+        options: sync::ApplyOptions,
+    ) -> Result<sync::ApplyPreflightReport, RPCError> {
+        self.initialized_remote_state("removal blocker report")?;
+        sync::validate_actions(&actions)
+            .map_err(|e| rpc_report_error("validate actions", Some(&self.base), e))?;
+        sync::preflight_apply_report(&self.base, &actions, self.scan_policy.as_ref(), options)
+            .map_err(|e| rpc_report_error("removal blocker report", Some(&self.base), e))
     }
 }
 
@@ -948,6 +988,12 @@ mod tests {
             .is_err());
         assert!(client.describe_apply_attempt("remote".to_string()).is_err());
         assert!(client.clear_apply_attempt("remote".to_string()).is_err());
+        assert!(client
+            .preflight_apply(Vec::new(), sync::ApplyOptions::default())
+            .is_err());
+        assert!(client
+            .removal_blocker_report(Vec::new(), sync::ApplyOptions::default())
+            .is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -963,6 +1009,8 @@ mod tests {
                 ("preflight_apply_report", 25),
                 ("describe_apply_attempt", 26),
                 ("clear_apply_attempt", 27),
+                ("preflight_apply", 28),
+                ("removal_blocker_report", 29),
             ]
         );
     }
@@ -996,7 +1044,9 @@ mod tests {
                 CAPABILITY_APPLY_OPTIONS.to_string(),
                 CAPABILITY_PRUNE_PATTERNS.to_string(),
                 CAPABILITY_PREFLIGHT_REPORT.to_string(),
-                CAPABILITY_RECOVERY.to_string()
+                CAPABILITY_RECOVERY.to_string(),
+                CAPABILITY_PREFLIGHT_APPLY.to_string(),
+                CAPABILITY_REMOVAL_BLOCKER_REPORT.to_string(),
             ]
         );
     }

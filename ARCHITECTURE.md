@@ -58,8 +58,8 @@ User-facing commands:
   a path under the local base.
 - `duet --profile-file <file> [path]`: synchronize a profile file and keep state
   next to that file.
-- `duet preflight <profile> [path]`: scan both sides, resolve actions, and
-  report apply blockers without applying filesystem changes or saving state.
+- `duet --dry-run <profile> [path]`: scan both sides, report actions and apply
+  blockers, and exit without applying filesystem changes or saving state.
 - `duet recover <profile-or-statefile>`: print any unfinished local
   apply-attempt marker and optionally clear it after manual inspection.
 - `duet recover --remote <profile>`: inspect or clear a remote-side marker using
@@ -291,7 +291,8 @@ Conflict handling depends on flags:
   resolution.
 - default mode: ask about conflicts sequentially, then confirm before applying.
 - `--yes`: proceed automatically only when there are no unresolved conflicts.
-- `--dry-run`: print actions without applying anything.
+- `--dry-run`: print actions, run non-mutating local/remote preflight checks,
+  and exit without applying changes or saving state.
 
 Resolution converts a `Conflict` into a directed action:
 

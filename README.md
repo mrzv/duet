@@ -10,8 +10,6 @@ changes from that state.
 USAGE:
     duet [FLAGS] <profile> [path]
     duet [FLAGS] --profile-file <file> [path]
-    duet [FLAGS] preflight <profile> [path]
-    duet [FLAGS] --profile-file <file> preflight [path]
     duet recover [--clear] [--yes] [--remote] <profile-or-statefile>
 
 FLAGS:
@@ -20,7 +18,7 @@ FLAGS:
     -b, --batch         run as a batch (abort on conflict)
     -f, --force         in batch mode, apply what's possible, even if there are conflicts
     -v, --verbose       verbose output
-    -n, --dry-run       don't apply changes
+    -n, --dry-run       check what sync would do without applying changes
         --debug-info    print protocol and capability negotiation details
         --prune-ignored delete ignored files/directories that block removing a synced parent
         --profile-performance
@@ -54,9 +52,10 @@ ARGS:
     <profile>    profile to synchronize
     <path>       path to synchronize
 
-PREFLIGHT:
-    preflight checks what a sync would do, reports directory removal blockers on
-    both sides, and exits without applying changes or saving state.
+DRY RUN:
+    --dry-run checks what sync would do, reports directory removal blockers on
+    both sides, validates preflight checks, and exits without applying changes
+    or saving state.
 
 ```
 
@@ -105,7 +104,7 @@ when those ignored children should be deleted to allow the parent removal.
 Use `[prune]` for generated, disposable basename globs that should be ignored and
 automatically deleted when they are the only reason a synced parent directory
 cannot be removed. Excluded paths (`-path`) are never pruned automatically.
-Run `duet preflight <profile> [path]` to inspect blockers before applying a sync.
+Run `duet --dry-run <profile> [path]` to inspect blockers before applying a sync.
 
 ## Metadata And Permissions
 

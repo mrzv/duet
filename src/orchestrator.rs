@@ -188,7 +188,12 @@ pub async fn sync(
         show_debug_info(&remote_info, tuning);
     }
     performance.counters.total_actions = actions.len();
-    let resolution = resolve_actions(&mut actions, options.clone())?;
+    let resolution = if options.dry_run {
+        show_dry_run_actions(&actions, options.verbose);
+        AllResolution::Proceed
+    } else {
+        resolve_actions(&mut actions, options.clone())?
+    };
     performance.counters.unresolved_conflicts = num_unresolved_conflicts(actions.iter());
     performance.counters.identical_actions = num_identical(actions.iter());
     performance.record_phase("resolve_actions", resolve_start.elapsed());
@@ -196,6 +201,25 @@ pub async fn sync(
     if let AllResolution::Abort = resolution {
         println!("Aborting");
         quit::with_code(ABORT_CODE);
+    }
+
+    if options.dry_run && actions.is_empty() {
+        performance.counters.active_actions = 0;
+        finish_dry_run(
+            performance.counters.total_actions,
+            performance.counters.active_actions,
+            performance.counters.unresolved_conflicts,
+        );
+        if profiling_enabled {
+            performance.finish(total_start.elapsed());
+            if print_performance {
+                performance.print_human();
+            }
+            if let Some(path) = performance_json {
+                performance.write_json(&path)?;
+            }
+        }
+        return Ok(());
     }
 
     log::debug!("synchronizing");
@@ -209,8 +233,25 @@ pub async fn sync(
     );
     performance.counters.active_actions = actions.len();
 
+    if options.dry_run && actions.is_empty() {
+        finish_dry_run(
+            performance.counters.total_actions,
+            performance.counters.active_actions,
+            performance.counters.unresolved_conflicts,
+        );
+        if profiling_enabled {
+            performance.finish(total_start.elapsed());
+            if print_performance {
+                performance.print_human();
+            }
+            if let Some(path) = performance_json {
+                performance.write_json(&path)?;
+            }
+        }
+        return Ok(());
+    }
+
     let preflight_start = Instant::now();
-    sync_ops::preflight_state_save(&local_state)?;
     let remote_actions: Actions = reverse(&actions);
     apply_options = resolve_removal_blockers(
         &remote,
@@ -222,6 +263,7 @@ pub async fn sync(
         apply_options,
     )
     .await?;
+    sync_ops::preflight_state_save(&local_state)?;
     sync_ops::preflight_apply_with_policy(
         &local_base,
         actions.as_ref(),
@@ -244,6 +286,31 @@ pub async fn sync(
     }
     if apply_options.prune_ignored {
         require_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_OPTIONS)?;
+    }
+    if options.dry_run {
+        require_remote_capability(&remote_info, rpc::CAPABILITY_PREFLIGHT_APPLY)?;
+        remote
+            .preflight_apply(remote_actions, apply_options)
+            .await
+            .map_err(|e| remote_rpc_error("Failed to preflight remote apply", e))?;
+        performance.record_phase("preflight_and_set_actions", preflight_start.elapsed());
+        finish_dry_run(
+            performance.counters.total_actions,
+            performance.counters.active_actions,
+            performance.counters.unresolved_conflicts,
+        );
+        if profiling_enabled {
+            performance.finish(total_start.elapsed());
+            if print_performance {
+                performance.print_human();
+            }
+            if let Some(path) = performance_json {
+                performance.write_json(&path)?;
+            }
+        }
+        return Ok(());
+    }
+    if apply_options.prune_ignored {
         remote
             .set_apply_options(apply_options)
             .await
@@ -473,140 +540,6 @@ pub async fn sync(
     Ok(())
 }
 
-pub async fn preflight(
-    source: ProfileSource,
-    path: Option<PathBuf>,
-    options: SyncOptions,
-) -> Result<()> {
-    env_logger::init();
-    let context = prepare_context(source, path)?;
-    sync_ops::check_apply_attempt_clear(&context.local_state)?;
-    sync_ops::preflight_state_save(&context.local_state)?;
-
-    let SyncContext {
-        profile: prf,
-        local_id,
-        legacy_local_id,
-        local_base,
-        remote_base,
-        remote_server,
-        remote_cmd,
-        path,
-        local_state,
-        remote_state_dir,
-        server_log,
-        ..
-    } = context;
-
-    let scan_ignore = prf.scan_ignore();
-    let scan_policy = sync_ops::ScanPolicy::with_prune(
-        prf.locations.clone(),
-        prf.ignore.clone(),
-        prf.prune.clone(),
-    );
-    let mut apply_options = sync_ops::ApplyOptions {
-        prune_ignored: options.prune_ignored,
-    };
-
-    let remote_session = open_remote_session(remote_server).await;
-    let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
-        .await
-        .unwrap_or_else(|e| {
-            let diagnostic =
-                sync_error::render_report("setup", "launch server", Some(server_log.clone()), e);
-            eprintln!("{}", diagnostic.cyan());
-            quit::with_code(SERVER_ERROR_CODE);
-        });
-    let remote = remote::get_remote(&mut server)?;
-    let remote_path = path.clone();
-    let remote_locations = prf.locations.clone();
-    let remote_ignore = scan_ignore.clone();
-    let remote_prune = prf.prune.clone();
-    let remote_info = remote.server_info().await.map_err(server_info_error)?;
-    require_remote_capability(&remote_info, rpc::CAPABILITY_PREFLIGHT_REPORT)?;
-
-    let local_fut = state::old_and_changes(
-        &local_base,
-        &path,
-        &prf.locations,
-        &scan_ignore,
-        Some(&local_state),
-    );
-
-    let remote_fut = async {
-        remote
-            .set_base(remote_base)
-            .await
-            .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
-        if !remote_prune.is_empty() {
-            require_remote_capability(&remote_info, rpc::CAPABILITY_PRUNE_PATTERNS)?;
-            remote
-                .set_prune_patterns(remote_prune)
-                .await
-                .map_err(|e| remote_rpc_error("Couldn't set remote prune patterns", e))?;
-        }
-        if let Some(remote_state_dir) = remote_state_dir {
-            require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
-            remote
-                .set_remote_state_dir(remote_state_dir)
-                .await
-                .map_err(remote_state_dir_error)?;
-        }
-        let remote_id = select_remote_state_id(&remote, &remote_info, local_id, legacy_local_id)
-            .await?;
-        remote
-            .changes(remote_path, remote_locations, remote_ignore, remote_id)
-            .await
-            .map_err(|e| remote_rpc_error("Couldn't get remote changes", e))
-    };
-
-    let (local_result, remote_result) = tokio::join!(local_fut, remote_fut);
-    let (_, local_changes) = local_result?;
-    let remote_changes = remote_result?;
-    remote
-        .preflight_apply_report(Vec::new(), apply_options)
-        .await
-        .map_err(|e| remote_rpc_error("Failed to preflight remote state save", e))?;
-    let mut actions = build_actions(&local_changes, &remote_changes);
-    let mut resolve_options = options.clone();
-    resolve_options.dry_run = false;
-    let resolution = resolve_actions(&mut actions, resolve_options)?;
-    if let AllResolution::Abort = resolution {
-        println!("Aborting");
-        quit::with_code(ABORT_CODE);
-    }
-    let actions: Actions = actions
-        .into_iter()
-        .filter(|a| !a.is_unresolved_conflict())
-        .collect();
-    let remote_actions = reverse(&actions);
-
-    apply_options = resolve_removal_blockers(
-        &remote,
-        &remote_info,
-        &local_base,
-        &actions,
-        &remote_actions,
-        &scan_policy,
-        apply_options,
-    )
-    .await?;
-    sync_ops::preflight_apply_with_policy(&local_base, &actions, Some(&scan_policy), apply_options)?;
-    if !remote_actions.is_empty() {
-        if apply_options.prune_ignored {
-            require_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_OPTIONS)?;
-        }
-        let report = remote
-            .preflight_apply_report(remote_actions, apply_options)
-            .await
-            .map_err(|e| remote_rpc_error("Failed to get remote preflight report", e))?;
-        ensure_preflight_report_clear("remote", &report)?;
-    }
-
-    println!("Preflight completed: no directory removal blockers found");
-    Ok(())
-}
-
 pub async fn recover_remote(target: PathBuf, clear: bool, yes: bool) -> Result<()> {
     env_logger::init();
     let profile_name = remote_recovery_profile_name(&target)?;
@@ -776,10 +709,27 @@ where
         Some(scan_policy),
         apply_options,
     )?;
-    let remote_report = remote_preflight_report(remote, remote_info, remote_actions, apply_options).await?;
+    let local_blocked = local_report.has_unprunable_blockers();
+    if local_blocked {
+        print_preflight_report("local", &local_report);
+    }
 
-    ensure_preflight_report_clear("local", &local_report)?;
-    ensure_preflight_report_clear("remote", &remote_report)?;
+    let remote_report = match remote_preflight_report(remote, remote_info, remote_actions, apply_options).await {
+        Ok(report) => report,
+        Err(_) if local_blocked => return Err(preflight_blocker_error("local")),
+        Err(error) => return Err(error),
+    };
+    let remote_blocked = remote_report.has_unprunable_blockers();
+    if remote_blocked {
+        print_preflight_report("remote", &remote_report);
+    }
+
+    if local_blocked {
+        return Err(preflight_blocker_error("local"));
+    }
+    if remote_blocked {
+        return Err(preflight_blocker_error("remote"));
+    }
     Ok(apply_options)
 }
 
@@ -792,6 +742,12 @@ async fn remote_preflight_report<R>(
 where
     R: DuetServerAsync,
 {
+    if has_remote_capability(remote_info, rpc::CAPABILITY_REMOVAL_BLOCKER_REPORT) {
+        return remote
+            .removal_blocker_report(remote_actions.clone(), apply_options)
+            .await
+            .map_err(|e| remote_rpc_error("Failed to get remote removal blocker report", e));
+    }
     if !has_remote_capability(remote_info, rpc::CAPABILITY_PREFLIGHT_REPORT) {
         return Ok(sync_ops::ApplyPreflightReport::default());
     }
@@ -801,15 +757,23 @@ where
         .map_err(|e| remote_rpc_error("Failed to get remote preflight report", e))
 }
 
-fn ensure_preflight_report_clear(side: &str, report: &sync_ops::ApplyPreflightReport) -> Result<()> {
-    if report.is_clear() || !report.has_unprunable_blockers() {
+#[cfg(test)]
+fn ensure_preflight_report_clear(
+    side: &str,
+    report: &sync_ops::ApplyPreflightReport,
+) -> Result<()> {
+    if report.blockers.is_empty() || !report.has_unprunable_blockers() {
         return Ok(());
     }
     print_preflight_report(side, report);
-    Err(eyre!(
+    Err(preflight_blocker_error(side))
+}
+
+fn preflight_blocker_error(side: &str) -> color_eyre::eyre::Report {
+    eyre!(
         "{} preflight found directory removal blockers; resolve them manually, use --prune-ignored for disposable ignored content, or mark disposable patterns in [prune]",
         side
-    ))
+    )
 }
 
 fn print_preflight_report(side: &str, report: &sync_ops::ApplyPreflightReport) {
@@ -1408,11 +1372,32 @@ fn changed_bytes(changes: &state::Changes) -> u64 {
         .sum()
 }
 
+fn show_dry_run_actions(actions: &Actions, verbose: bool) {
+    if !actions.is_empty() {
+        resolution::show_actions(actions, verbose);
+    }
+}
+
+fn finish_dry_run(total_actions: usize, active_actions: usize, unresolved_conflicts: usize) {
+    if total_actions == 0 {
+        println!("Dry run completed: no changes detected");
+    } else if unresolved_conflicts > 0 {
+        println!(
+            "Dry run completed with {} unresolved conflicts. Checks for those paths are incomplete until the conflicts are resolved.",
+            unresolved_conflicts
+        );
+    } else if active_actions == 0 {
+        println!("Dry run completed: no changes would be applied");
+    } else {
+        println!("Dry run completed: no changes applied");
+    }
+}
+
 fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllResolution> {
     let SyncOptions {
         interactive,
         yes,
-        dry_run,
+        dry_run: _,
         batch,
         force,
         verbose,
@@ -1424,11 +1409,6 @@ fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllRes
 
     if actions.is_empty() {
         println!("No changes detected");
-        quit::with_code(OK_CODE);
-    }
-
-    if dry_run {
-        resolution::show_actions(&actions, verbose);
         quit::with_code(OK_CODE);
     }
 

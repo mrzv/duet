@@ -47,10 +47,6 @@ pub struct ApplyPreflightReport {
 }
 
 impl ApplyPreflightReport {
-    pub fn is_clear(&self) -> bool {
-        self.blockers.is_empty()
-    }
-
     pub fn has_unprunable_blockers(&self) -> bool {
         self.blockers.iter().any(|blocker| !blocker.prunable)
     }
@@ -4560,7 +4556,7 @@ mod tests {
         let report = preflight_apply_report(&base, &actions, None, ApplyOptions::default())
             .unwrap();
 
-        assert!(report.is_clear());
+        assert!(report.blockers.is_empty());
         assert!(!report.has_unprunable_blockers());
     }
 

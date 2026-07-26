@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -13,6 +14,10 @@ struct SyncCase {
 
 impl SyncCase {
     fn new() -> Self {
+        Self::new_with_rules("+a.txt\n")
+    }
+
+    fn new_with_rules(rules: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let local = temp.path().join("local");
         let remote = temp.path().join("remote");
@@ -23,10 +28,11 @@ impl SyncCase {
         fs::write(
             &profile,
             format!(
-                "{}\n{} {}\n+a.txt\n",
+                "{}\n{} {}\n{}",
                 local.display(),
                 duet_bin().display(),
-                remote.display()
+                remote.display(),
+                rules
             ),
         )
         .unwrap();
@@ -68,6 +74,14 @@ fn assert_success(output: Output) {
     );
 }
 
+fn combined_output(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 fn write(path: &Path, contents: &str) {
     fs::write(path, contents).unwrap();
 }
@@ -92,6 +106,63 @@ fn local_added_file_copies_to_remote() {
     assert_success(case.sync());
 
     assert_eq!(read(&case.remote.join("a.txt")), "from local");
+}
+
+#[test]
+fn dry_run_does_not_apply_changes() {
+    let case = SyncCase::new();
+    write(&case.local.join("a.txt"), "from local");
+
+    let output = case.sync_with_args(&["--dry-run"]);
+
+    assert_success(output);
+    assert!(!case.remote.join("a.txt").exists());
+}
+
+#[test]
+fn dry_run_reports_ignored_directory_removal_blockers() {
+    let case = SyncCase::new_with_rules("+dir\n\n[ignore]\n__pycache__\n");
+    fs::create_dir_all(case.local.join("dir")).unwrap();
+    write(&case.local.join("dir/tracked.txt"), "tracked");
+    assert_success(case.sync());
+
+    fs::remove_dir_all(case.local.join("dir")).unwrap();
+    fs::create_dir_all(case.remote.join("dir/__pycache__")).unwrap();
+    write(&case.remote.join("dir/__pycache__/cache.pyc"), "cache");
+
+    let output = case.sync_with_args(&["--dry-run"]);
+    let output_text = combined_output(&output);
+
+    assert!(!output.status.success(), "{}", output_text);
+    assert!(output_text.contains("ignored"), "{}", output_text);
+    assert!(output_text.contains("__pycache__"), "{}", output_text);
+    assert!(output_text.contains("--prune-ignored"), "{}", output_text);
+    assert!(case.remote.join("dir/tracked.txt").exists());
+    assert!(case.remote.join("dir/__pycache__/cache.pyc").exists());
+}
+
+#[test]
+fn dry_run_validates_remote_apply_preflight() {
+    let case = SyncCase::new();
+    write(&case.local.join("a.txt"), "from local");
+    assert_success(case.sync());
+
+    fs::remove_file(case.local.join("a.txt")).unwrap();
+    let mut permissions = fs::metadata(&case.remote).unwrap().permissions();
+    permissions.set_mode(0o555);
+    fs::set_permissions(&case.remote, permissions).unwrap();
+
+    let output = case.sync_with_args(&["--dry-run"]);
+
+    let mut permissions = fs::metadata(&case.remote).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&case.remote, permissions).unwrap();
+
+    let output_text = combined_output(&output);
+    assert!(!output.status.success(), "{}", output_text);
+    assert!(output_text.contains("preflight apply"), "{}", output_text);
+    assert!(output_text.contains("not writable"), "{}", output_text);
+    assert!(case.remote.join("a.txt").exists());
 }
 
 #[test]
