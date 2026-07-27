@@ -15,6 +15,10 @@
 - Expanded `--dry-run` to run the full non-mutating preflight checks, including local and remote directory removal blocker reports.
 - Bounded directory scanning globally to 64 concurrent reads and made content hashing CPU-parallel across files, defaulting to up to one whole-file worker per available CPU (maximum 64) while preserving deterministic results.
 - Reused one private staging directory in the first output parent per side-local apply phase, verified published parent identities, and batched source-stage and destination-parent durability barriers while retaining per-file output durability.
+- Batched private regular-file outputs by count and content bytes, synced each batch concurrently with bounded portable workers, and published only fully synced batches in action order before recording recovery progress.
+- Kept restrictive destination-parent modes unchanged while outputs are pending, limited pending descriptors using `RLIMIT_NOFILE`, and recorded each successful ordered publication before attempting the next batch item.
+- Made streamed apply fail closed after any frame error, recorded file completion immediately after successful publication syscalls, validated parent identity before temporary chmod, and converted output-sync worker panics into deterministic batch errors.
+- Replaced output-parent pathname chmod bootstrap with verified retained-inode descriptors on Linux/Android and fail-closed handling where no safe permission-independent descriptor is available.
 
 ### Fixed
 - Made scan cancellation own and stop in-flight work, and prevented scan failures from exposing partial entries.

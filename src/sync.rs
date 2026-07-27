@@ -9,7 +9,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -35,6 +35,16 @@ const MAX_DETAIL_BATCH_FRAMES: u32 = 4096;
 const MAX_DETAIL_BATCH_PAYLOAD_BYTES: u32 = 64 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 128 * 1024;
 const SYNCED_MODE_MASK: u32 = 0o7777;
+const DEFAULT_OUTPUT_BATCH_FILES: usize = 256;
+const DEFAULT_OUTPUT_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_OUTPUT_SYNC_WORKERS_MAX: usize = 64;
+const MAX_OUTPUT_BATCH_FILES: usize = 512;
+const MAX_OUTPUT_BATCH_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_OUTPUT_SYNC_WORKERS: usize = 64;
+const OUTPUT_BATCH_FD_HEADROOM: usize = 64;
+const ENV_OUTPUT_BATCH_FILES: &str = "DUET_SYNC_OUTPUT_BATCH_FILES";
+const ENV_OUTPUT_BATCH_BYTES: &str = "DUET_SYNC_OUTPUT_BATCH_BYTES";
+const ENV_OUTPUT_SYNC_WORKERS: &str = "DUET_SYNC_OUTPUT_SYNC_WORKERS";
 static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1212,6 +1222,18 @@ fn directory_identity(
     let metadata = directory.metadata().wrap_err_with(|| {
         format!("failed to inspect {} {}", description, path.display())
     })?;
+    if !metadata.is_dir() {
+        return Err(eyre!("{} {} is not a directory", description, path.display()));
+    }
+    Ok(DirectoryIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+fn directory_path_identity(path: &Path, description: &str) -> Result<DirectoryIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to inspect {} {}", description, path.display()))?;
     if !metadata.is_dir() {
         return Err(eyre!("{} {} is not a directory", description, path.display()));
     }
@@ -2885,12 +2907,23 @@ impl StagingArea {
 
 impl Drop for StagingArea {
     fn drop(&mut self) {
-        if !self.finished && self.shared.verify_identity().is_ok() {
-            let _ = unlinkat(
-                self.shared.stage_parent_directory.as_raw_fd(),
-                &self.shared.name,
-                libc::AT_REMOVEDIR,
-            );
+        if !self.finished {
+            let guard = WritableDirGuard::from_retained(
+                &self.shared.stage_parent_path,
+                &self.shared.stage_parent_directory,
+            )
+            .ok()
+            .flatten();
+            if self.shared.verify_identity().is_ok() {
+                let _ = unlinkat(
+                    self.shared.stage_parent_directory.as_raw_fd(),
+                    &self.shared.name,
+                    libc::AT_REMOVEDIR,
+                );
+            }
+            if let Some(guard) = guard {
+                let _ = guard.restore();
+            }
         }
     }
 }
@@ -2898,13 +2931,12 @@ impl Drop for StagingArea {
 struct TempOutput {
     final_path: PathBuf,
     parent_path: PathBuf,
+    parent_identity: DirectoryIdentity,
     temp_path: PathBuf,
     final_name: std::ffi::CString,
     output_name: std::ffi::CString,
-    parent_directory: fs::File,
     staging: Arc<StagingState>,
     file: Option<fs::File>,
-    parent_guard: Option<WritableDirGuard>,
 }
 
 fn output_parent(path: &Path) -> &Path {
@@ -2917,7 +2949,7 @@ impl TempOutput {
     fn new(final_path: PathBuf, staging: Arc<StagingState>) -> Result<Self> {
         let parent = output_parent(&final_path);
         let parent_path = parent.to_path_buf();
-        let (parent_directory, parent_guard) = WritableDirGuard::new(parent)?;
+        let parent_identity = directory_path_identity(parent, "output parent directory")?;
         let final_name = path_component_cstring(
             final_path
                 .file_name()
@@ -2928,13 +2960,12 @@ impl TempOutput {
         let output = TempOutput {
             final_path,
             parent_path,
+            parent_identity,
             temp_path,
             final_name,
             output_name,
-            parent_directory,
             staging,
             file: Some(file),
-            parent_guard,
         };
         output.verify_at_identity(
             &output.staging.directory,
@@ -3030,84 +3061,167 @@ impl TempOutput {
         Ok(())
     }
 
-    fn finish(mut self, entry: &Entry) -> Result<Entry> {
+    fn prepare(mut self, entry: &Entry, publication: OutputPublication) -> Result<PreparedOutput> {
         let final_entry = self.prepare_metadata(entry)?;
-        self.sync_all()?;
-        self.verify_at_identity(
-            &self.staging.directory,
-            &self.output_name,
-            &self.temp_path,
-        )?;
-        self.verify_parent_path_identity()?;
-        self.staging.verify_identity()?;
-        cvt(unsafe {
-            libc::renameat(
-                self.staging.directory.as_raw_fd(),
-                self.output_name.as_ptr(),
-                self.parent_directory.as_raw_fd(),
-                self.final_name.as_ptr(),
-            )
+        Ok(PreparedOutput {
+            output: self,
+            final_entry,
+            publication,
         })
-        .wrap_err_with(|| {
-            format!(
-                "failed to rename temporary file {} to {}",
-                self.temp_path.display(),
-                self.final_path.display()
-            )
+    }
+
+    fn publish_replacing(
+        self,
+        final_entry: Entry,
+        expected: &Entry,
+        on_commit: impl FnOnce(&Entry) -> Result<()>,
+    ) -> Result<Entry> {
+        verify_current_matches_entry(&self.final_path, expected, "rename target")?;
+        self.with_publication_parent(|parent_directory| {
+            self.verify_at_identity(
+                &self.staging.directory,
+                &self.output_name,
+                &self.temp_path,
+            )?;
+            self.staging.verify_identity()?;
+            cvt(unsafe {
+                libc::renameat(
+                    self.staging.directory.as_raw_fd(),
+                    self.output_name.as_ptr(),
+                    parent_directory.as_raw_fd(),
+                    self.final_name.as_ptr(),
+                )
+            })
+            .wrap_err_with(|| {
+                format!(
+                    "failed to rename temporary file {} to {}",
+                    self.temp_path.display(),
+                    self.final_path.display()
+                )
+            })?;
+            on_commit(&final_entry)?;
+            verify_path_identity(
+                &self.parent_path,
+                parent_directory,
+                "output parent directory",
+            )?;
+            self.verify_at_identity(parent_directory, &self.final_name, &self.final_path)?;
+            self.staging
+                .record_published_parent(&self.parent_path, parent_directory)
         })?;
-        self.verify_parent_path_identity()?;
-        self.verify_at_identity(&self.parent_directory, &self.final_name, &self.final_path)?;
-        self.staging
-            .record_published_parent(&self.parent_path, &self.parent_directory)?;
-        self.restore_parent()?;
         Ok(final_entry)
     }
 
-    fn finish_without_replacing(mut self, description: &str, entry: &Entry) -> Result<Entry> {
+    fn publish_without_replacing(
+        self,
+        final_entry: Entry,
+        description: &str,
+        on_commit: impl FnOnce(&Entry) -> Result<()>,
+    ) -> Result<Entry> {
+        self.with_publication_parent(|parent_directory| {
+            self.verify_at_identity(
+                &self.staging.directory,
+                &self.output_name,
+                &self.temp_path,
+            )?;
+            self.staging.verify_identity()?;
+            match cvt(unsafe {
+                libc::linkat(
+                    self.staging.directory.as_raw_fd(),
+                    self.output_name.as_ptr(),
+                    parent_directory.as_raw_fd(),
+                    self.final_name.as_ptr(),
+                    0,
+                )
+            }) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    return Err(eyre!(
+                        "{} {} already exists",
+                        description,
+                        self.final_path.display()
+                    ));
+                }
+                Err(err) => {
+                    return Err(err).wrap_err_with(|| {
+                        format!(
+                            "failed to link temporary file {} to {}",
+                            self.temp_path.display(),
+                            self.final_path.display()
+                        )
+                    });
+                }
+            }
+            on_commit(&final_entry)?;
+            verify_path_identity(
+                &self.parent_path,
+                parent_directory,
+                "output parent directory",
+            )?;
+            self.verify_at_identity(parent_directory, &self.final_name, &self.final_path)?;
+            self.staging
+                .record_published_parent(&self.parent_path, parent_directory)?;
+            unlinkat(self.staging.directory.as_raw_fd(), &self.output_name, 0).wrap_err_with(|| {
+                format!("failed to remove temporary file {}", self.temp_path.display())
+            })
+        })?;
+        Ok(final_entry)
+    }
+
+    #[cfg(test)]
+    fn finish(mut self, entry: &Entry) -> Result<Entry> {
         let final_entry = self.prepare_metadata(entry)?;
         self.sync_all()?;
-        self.verify_at_identity(
-            &self.staging.directory,
-            &self.output_name,
-            &self.temp_path,
+        self.publish_replacing_without_target_check(final_entry)
+    }
+
+    #[cfg(test)]
+    fn finish_without_replacing(self, description: &str, entry: &Entry) -> Result<Entry> {
+        let prepared = self.prepare(
+            entry,
+            OutputPublication::NoReplace {
+                description: description.to_string(),
+            },
         )?;
-        self.verify_parent_path_identity()?;
-        self.staging.verify_identity()?;
-        match cvt(unsafe {
-            libc::linkat(
-                self.staging.directory.as_raw_fd(),
-                self.output_name.as_ptr(),
-                self.parent_directory.as_raw_fd(),
-                self.final_name.as_ptr(),
-                0,
-            )
-        }) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(eyre!(
-                    "{} {} already exists",
-                    description,
+        prepared.output.sync_all()?;
+        prepared
+            .output
+            .publish_without_replacing(prepared.final_entry, description, |_| Ok(()))
+    }
+
+    #[cfg(test)]
+    fn publish_replacing_without_target_check(self, final_entry: Entry) -> Result<Entry> {
+        self.with_publication_parent(|parent_directory| {
+            self.verify_at_identity(
+                &self.staging.directory,
+                &self.output_name,
+                &self.temp_path,
+            )?;
+            self.staging.verify_identity()?;
+            cvt(unsafe {
+                libc::renameat(
+                    self.staging.directory.as_raw_fd(),
+                    self.output_name.as_ptr(),
+                    parent_directory.as_raw_fd(),
+                    self.final_name.as_ptr(),
+                )
+            })
+            .wrap_err_with(|| {
+                format!(
+                    "failed to rename temporary file {} to {}",
+                    self.temp_path.display(),
                     self.final_path.display()
-                ));
-            }
-            Err(err) => {
-                return Err(err).wrap_err_with(|| {
-                    format!(
-                        "failed to link temporary file {} to {}",
-                        self.temp_path.display(),
-                        self.final_path.display()
-                    )
-                });
-            }
-        }
-        self.verify_parent_path_identity()?;
-        self.verify_at_identity(&self.parent_directory, &self.final_name, &self.final_path)?;
-        self.staging
-            .record_published_parent(&self.parent_path, &self.parent_directory)?;
-        unlinkat(self.staging.directory.as_raw_fd(), &self.output_name, 0).wrap_err_with(|| {
-            format!("failed to remove temporary file {}", self.temp_path.display())
+                )
+            })?;
+            verify_path_identity(
+                &self.parent_path,
+                parent_directory,
+                "output parent directory",
+            )?;
+            self.verify_at_identity(parent_directory, &self.final_name, &self.final_path)?;
+            self.staging
+                .record_published_parent(&self.parent_path, parent_directory)
         })?;
-        self.restore_parent()?;
         Ok(final_entry)
     }
 
@@ -3131,6 +3245,7 @@ impl TempOutput {
             })
     }
 
+    #[cfg(test)]
     fn sync_all(&self) -> Result<()> {
         self.file.as_ref()
             .ok_or_else(|| eyre!("temporary output is closed"))?
@@ -3140,17 +3255,290 @@ impl TempOutput {
             ))
     }
 
-    fn verify_parent_path_identity(&self) -> Result<()> {
-        verify_path_identity(
+    fn with_publication_parent<T>(
+        &self,
+        operation: impl FnOnce(&fs::File) -> Result<T>,
+    ) -> Result<T> {
+        let (parent_directory, parent_guard) = WritableDirGuard::new_with_expected(
             &self.parent_path,
-            &self.parent_directory,
+            Some(self.parent_identity),
+        )?;
+        verify_directory_handle_identity(
+            &parent_directory,
+            self.parent_identity,
+            &self.parent_path,
             "output parent directory",
-        )
+        )?;
+        let result = operation(&parent_directory);
+        let restore = restore_parent_guard(parent_guard);
+        match (result, restore) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
-    fn restore_parent(&mut self) -> Result<()> {
-        if let Some(guard) = self.parent_guard.take() {
-            guard.restore()?;
+}
+
+fn restore_parent_guard(parent_guard: Option<WritableDirGuard>) -> Result<()> {
+    if let Some(guard) = parent_guard {
+        guard.restore()?;
+    }
+    Ok(())
+}
+
+enum OutputPublication {
+    Replace { expected: Entry },
+    NoReplace { description: String },
+}
+
+struct PreparedOutput {
+    output: TempOutput,
+    final_entry: Entry,
+    publication: OutputPublication,
+}
+
+struct PendingOutput {
+    action_index: usize,
+    prepared: PreparedOutput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputBatchConfig {
+    max_files: usize,
+    max_bytes: u64,
+    workers: usize,
+}
+
+impl OutputBatchConfig {
+    fn default_for_host() -> Self {
+        let parallelism = thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1);
+        Self {
+            max_files: DEFAULT_OUTPUT_BATCH_FILES,
+            max_bytes: DEFAULT_OUTPUT_BATCH_BYTES,
+            workers: parallelism.min(DEFAULT_OUTPUT_SYNC_WORKERS_MAX),
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::default_for_host().with_env_overrides_from(|name| std::env::var(name).ok())
+    }
+
+    fn with_env_overrides_from(mut self, mut get: impl FnMut(&str) -> Option<String>) -> Self {
+        if let Some(value) = get(ENV_OUTPUT_BATCH_FILES).and_then(|value| value.parse().ok()) {
+            self.max_files = value;
+        }
+        if let Some(value) = get(ENV_OUTPUT_BATCH_BYTES).and_then(|value| value.parse().ok()) {
+            self.max_bytes = value;
+        }
+        if let Some(value) = get(ENV_OUTPUT_SYNC_WORKERS).and_then(|value| value.parse().ok()) {
+            self.workers = value;
+        }
+        self.normalized()
+    }
+
+    fn normalized(self) -> Self {
+        self.normalized_with_file_limit(output_batch_file_limit())
+    }
+
+    fn normalized_with_file_limit(self, file_limit: usize) -> Self {
+        Self {
+            max_files: self
+                .max_files
+                .clamp(1, MAX_OUTPUT_BATCH_FILES.min(file_limit.max(1))),
+            max_bytes: self.max_bytes.clamp(1, MAX_OUTPUT_BATCH_BYTES),
+            workers: self.workers.clamp(1, MAX_OUTPUT_SYNC_WORKERS),
+        }
+    }
+}
+
+fn output_batch_file_limit() -> usize {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return MAX_OUTPUT_BATCH_FILES;
+    }
+    let soft = unsafe { limit.assume_init() }.rlim_cur;
+    if soft == libc::RLIM_INFINITY {
+        return MAX_OUTPUT_BATCH_FILES;
+    }
+    let soft = soft.min(usize::MAX as libc::rlim_t) as usize;
+    soft.saturating_sub(OUTPUT_BATCH_FD_HEADROOM)
+        .clamp(1, MAX_OUTPUT_BATCH_FILES)
+}
+
+trait OutputSyncWorker: Send + Sync {
+    fn sync(&self, batch_index: usize, output: &TempOutput) -> io::Result<()>;
+}
+
+struct FileOutputSyncWorker;
+
+impl OutputSyncWorker for FileOutputSyncWorker {
+    fn sync(&self, _batch_index: usize, output: &TempOutput) -> io::Result<()> {
+        output
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "temporary output is closed"))?
+            .sync_all()
+    }
+}
+
+struct FilePublicationBatch {
+    config: OutputBatchConfig,
+    sync_worker: Arc<dyn OutputSyncWorker>,
+    pending: Vec<PendingOutput>,
+    pending_bytes: u64,
+    #[cfg(test)]
+    post_commit_hook: Option<Arc<dyn Fn(usize) -> Result<()> + Send + Sync>>,
+}
+
+impl FilePublicationBatch {
+    fn new() -> Self {
+        Self::with_worker(OutputBatchConfig::from_env(), Arc::new(FileOutputSyncWorker))
+    }
+
+    fn with_worker(config: OutputBatchConfig, sync_worker: Arc<dyn OutputSyncWorker>) -> Self {
+        Self {
+            config: config.normalized(),
+            sync_worker,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            #[cfg(test)]
+            post_commit_hook: None,
+        }
+    }
+
+    fn should_flush_before(&self, bytes: u64) -> bool {
+        !self.pending.is_empty()
+            && (self.pending.len() >= self.config.max_files
+                || self.pending_bytes.saturating_add(bytes) > self.config.max_bytes)
+    }
+
+    fn push(&mut self, action_index: usize, prepared: PreparedOutput) -> bool {
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(prepared.final_entry.size());
+        self.pending.push(PendingOutput {
+            action_index,
+            prepared,
+        });
+        self.pending.len() >= self.config.max_files
+            || self.pending_bytes >= self.config.max_bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.pending.len() >= self.config.max_files
+            || self.pending_bytes >= self.config.max_bytes
+    }
+
+    fn flush(
+        &mut self,
+        actions: &[Action],
+        recorder: &mut ApplyRecorder,
+        new_entries: &mut Vec<Entry>,
+    ) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let pending = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
+        let next = AtomicUsize::new(0);
+        let (sender, receiver) = mpsc::channel();
+        let worker_count = self.config.workers.min(pending.len()).max(1);
+        let spawn_result = thread::scope(|scope| -> io::Result<()> {
+            for _ in 0..worker_count {
+                let sender = sender.clone();
+                let pending = &pending;
+                let sync_worker = Arc::clone(&self.sync_worker);
+                let next = &next;
+                thread::Builder::new()
+                    .spawn_scoped(scope, move || loop {
+                        let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                        if index >= pending.len() {
+                            break;
+                        }
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            sync_worker.sync(index, &pending[index].prepared.output)
+                        }))
+                        .unwrap_or_else(|panic| {
+                            let message = panic
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                .unwrap_or("unknown panic");
+                            Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("sync worker panicked: {}", message),
+                            ))
+                        });
+                        if sender.send((index, result)).is_err() {
+                            break;
+                        }
+                    })?;
+            }
+            Ok(())
+        });
+        drop(sender);
+        spawn_result.wrap_err("failed to start temporary file sync worker")?;
+
+        let mut results: Vec<Option<io::Result<()>>> =
+            (0..pending.len()).map(|_| None).collect();
+        for (index, result) in receiver {
+            results[index] = Some(result);
+        }
+        for (index, result) in results.into_iter().enumerate() {
+            match result {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "failed to sync output for {} at batch item {}",
+                            pending[index].prepared.final_entry.path().display(),
+                            index
+                        )
+                    });
+                }
+                None => {
+                    return Err(eyre!(
+                        "temporary file sync worker stopped before syncing batch item {}",
+                        index
+                    ));
+                }
+            }
+        }
+
+        for item in pending {
+            let action_index = item.action_index;
+            let PreparedOutput {
+                output,
+                final_entry,
+                publication,
+            } = item.prepared;
+            let on_commit = |entry: &Entry| -> Result<()> {
+                recorder.record_committed_step("rename-file", entry.path())?;
+                new_entries.push(entry.clone());
+                recorder.record_committed_step("update-metadata", entry.path())?;
+                recorder.record_committed_action(&actions[action_index])?;
+                #[cfg(test)]
+                if let Some(hook) = &self.post_commit_hook {
+                    hook(action_index)?;
+                }
+                Ok(())
+            };
+            match publication {
+                OutputPublication::Replace { expected } => {
+                    output.publish_replacing(final_entry, &expected, on_commit)?;
+                }
+                OutputPublication::NoReplace { description } => {
+                    output.publish_without_replacing(final_entry, &description, on_commit)?;
+                }
+            }
         }
         Ok(())
     }
@@ -3561,40 +3949,85 @@ struct WritableDirGuard {
 
 impl WritableDirGuard {
     fn new(path: &Path) -> Result<(fs::File, Option<Self>)> {
+        Self::new_with_expected(path, None)
+    }
+
+    fn new_with_expected(
+        path: &Path,
+        expected: Option<DirectoryIdentity>,
+    ) -> Result<(fs::File, Option<Self>)> {
         let path_meta = fs::symlink_metadata(path).wrap_err_with(|| {
             format!("failed to read directory metadata for {}", path.display())
         })?;
         if !path_meta.is_dir() {
             return Err(eyre!("output parent {} is not a directory", path.display()));
         }
+        if let Some(expected) = expected {
+            if path_meta.dev() != expected.dev || path_meta.ino() != expected.ino {
+                return Err(eyre!(
+                    "output parent directory path {} no longer refers to the recorded directory",
+                    path.display()
+                ));
+            }
+        }
         let original_mode = path_meta.permissions().mode();
         if owner_write_execute(original_mode) {
             let directory = open_directory_for_access(path)?;
             verify_path_identity(path, &directory, "output parent directory")?;
+            if let Some(expected) = expected {
+                verify_directory_handle_identity(
+                    &directory,
+                    expected,
+                    path,
+                    "output parent directory",
+                )?;
+            }
             return Ok((directory, None));
         }
-        let directory = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .wrap_err_with(|| format!("failed to open directory {}", path.display()))?;
-        verify_path_identity(path, &directory, "output parent directory")?;
-        let mut perms = path_meta.permissions();
-        perms.set_mode(original_mode | 0o700);
-        directory.set_permissions(perms).wrap_err_with(|| {
-            format!(
-                "failed to make directory writable for sync {}",
-                path.display()
-            )
-        })?;
+        let directory = match open_directory_for_access(path) {
+            Ok(directory) => directory,
+            Err(error) if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                error.kind() == io::ErrorKind::PermissionDenied
+            }) => open_directory_after_bootstrap_widening(
+                path,
+                &path_meta,
+                expected,
+                original_mode,
+            )?,
+            Err(error) => return Err(error),
+        };
         if let Err(error) = verify_path_identity(path, &directory, "output parent directory") {
-            let _ = directory.set_permissions(fs::Permissions::from_mode(original_mode));
+            let _ = set_retained_directory_mode(&directory, original_mode, path);
+            return Err(error);
+        }
+        if let Some(expected) = expected {
+            if let Err(error) = verify_directory_handle_identity(
+                &directory,
+                expected,
+                path,
+                "output parent directory",
+            ) {
+                let _ = set_retained_directory_mode(&directory, original_mode, path);
+                return Err(error);
+            }
+        }
+        if let Err(error) = set_retained_directory_mode(&directory, original_mode | 0o700, path) {
+            let _ = set_retained_directory_mode(&directory, original_mode, path);
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "failed to make directory writable for sync {}",
+                    path.display()
+                )
+            });
+        }
+        if let Err(error) = verify_path_identity(path, &directory, "output parent directory") {
+            let _ = set_retained_directory_mode(&directory, original_mode, path);
             return Err(error);
         }
         let guard_directory = match directory.try_clone() {
             Ok(directory) => directory,
             Err(error) => {
-                let _ = directory.set_permissions(fs::Permissions::from_mode(original_mode));
+                let _ = set_retained_directory_mode(&directory, original_mode, path);
                 return Err(error).wrap_err_with(|| {
                     format!("failed to retain directory handle for {}", path.display())
                 });
@@ -3644,6 +4077,140 @@ impl WritableDirGuard {
     }
 }
 
+fn open_directory_after_bootstrap_widening(
+    path: &Path,
+    initial: &fs::Metadata,
+    expected: Option<DirectoryIdentity>,
+    original_mode: u32,
+) -> Result<fs::File> {
+    let parent_path = output_parent(path);
+    let name = path_component_cstring(
+        path.file_name()
+            .ok_or_else(|| eyre!("output parent {} has no final component", path.display()))?,
+        "output parent directory name",
+    )?;
+    let parent = open_directory_for_access(parent_path)?;
+    verify_path_identity(parent_path, &parent, "output parent ancestor")?;
+    let expected = expected.unwrap_or(DirectoryIdentity {
+        dev: initial.dev(),
+        ino: initial.ino(),
+    });
+    let retained = open_permission_independent_directory_at(&parent, &name).wrap_err_with(|| {
+        format!(
+            "failed to retain mode-independent access to output parent {}",
+            path.display()
+        )
+    })?;
+    verify_directory_handle_identity(
+        &retained,
+        expected,
+        path,
+        "output parent directory",
+    )?;
+    verify_path_identity(path, &retained, "output parent directory")?;
+    if let Err(error) = set_retained_directory_mode(&retained, original_mode | 0o700, path) {
+        let restore = set_retained_directory_mode(&retained, original_mode, path);
+        return match restore {
+            Ok(()) => Err(error).wrap_err_with(|| {
+                format!(
+                    "failed to bootstrap publication access to output parent {}",
+                    path.display()
+                )
+            }),
+            Err(restore) => Err(eyre!(
+                "failed to bootstrap publication access to output parent {}: {}; additionally failed to restore mode {:04o}: {}",
+                path.display(),
+                error,
+                original_mode,
+                restore
+            )),
+        };
+    }
+
+    let directory = match open_directory_at_for_access(&parent, &name) {
+        Ok(directory) => directory,
+        Err(error) => {
+            let restore = set_retained_directory_mode(&retained, original_mode, path);
+            return match restore {
+                Ok(()) => Err(error).wrap_err_with(|| {
+                    format!("failed to open widened output parent {}", path.display())
+                }),
+                Err(restore) => Err(eyre!(
+                    "failed to open widened output parent {}: {}; additionally failed to restore mode {:04o}: {}",
+                    path.display(),
+                    error,
+                    original_mode,
+                    restore
+                )),
+            };
+        }
+    };
+    let verify = verify_directory_handle_identity(
+        &directory,
+        expected,
+        path,
+        "output parent directory",
+    )
+    .and_then(|()| verify_same_directory_handles(&retained, &directory, path, "output parent directory"))
+    .and_then(|()| verify_path_identity(path, &directory, "output parent directory"));
+    if let Err(error) = verify {
+        let restore = set_retained_directory_mode(&retained, original_mode, path);
+        return match restore {
+            Ok(()) => Err(error),
+            Err(restore) => Err(eyre!(
+                "{}; additionally failed to restore output parent {} mode {:04o}: {}",
+                error,
+                path.display(),
+                original_mode,
+                restore
+            )),
+        };
+    }
+    Ok(directory)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_permission_independent_directory_at(
+    parent: &fs::File,
+    name: &std::ffi::CStr,
+) -> io::Result<fs::File> {
+    openat_file(
+        parent.as_raw_fd(),
+        name,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+#[cfg(target_vendor = "apple")]
+fn open_permission_independent_directory_at(
+    _parent: &fs::File,
+    _name: &std::ffi::CStr,
+) -> io::Result<fs::File> {
+    // O_EVTONLY still requests FREAD unless the process has Apple's private
+    // disallow-rw-for-o-evtonly entitlement. Normal processes therefore
+    // cannot use it to retain a mode-000 directory safely.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "safe mode-independent directory descriptors require a private O_EVTONLY entitlement on Apple platforms",
+    ))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+)))]
+fn open_permission_independent_directory_at(
+    _parent: &fs::File,
+    _name: &std::ffi::CStr,
+) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "safe mode-independent directory descriptors are unsupported on this platform",
+    ))
+}
+
 fn open_directory_for_access(path: &Path) -> Result<fs::File> {
     fs::OpenOptions::new()
         .read(true)
@@ -3661,6 +4228,17 @@ fn open_directory_at_for_access(parent: &fs::File, name: &std::ffi::CStr) -> io:
     )
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_new_stage_for_access(
+    parent: &fs::File,
+    name: &std::ffi::CStr,
+    _created: &libc::stat,
+    _path: &Path,
+) -> Result<fs::File> {
+    open_directory_at_for_access(parent, name).map_err(Into::into)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn open_new_stage_for_access(
     parent: &fs::File,
     name: &std::ffi::CStr,
@@ -3669,40 +4247,56 @@ fn open_new_stage_for_access(
 ) -> Result<fs::File> {
     match open_directory_at_for_access(parent, name) {
         Ok(directory) => return Ok(directory),
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
         Err(error) => return Err(error.into()),
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        let before = fstatat_nofollow(parent.as_raw_fd(), name)
-            .wrap_err_with(|| format!("failed to inspect new temporary directory {}", path.display()))?;
-        verify_stat_identity(created, &before, libc::S_IFDIR, path, "new temporary directory")?;
-        cvt(unsafe {
-            libc::fchmodat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                0o700,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })
-        .wrap_err_with(|| {
-            format!(
-                "failed to bootstrap search access to new temporary directory {} without following symlinks",
-                path.display()
-            )
-        })?;
-        let after = fstatat_nofollow(parent.as_raw_fd(), name)
-            .wrap_err_with(|| format!("failed to verify new temporary directory {}", path.display()))?;
-        verify_stat_identity(created, &after, libc::S_IFDIR, path, "new temporary directory")?;
-        return open_directory_at_for_access(parent, name).wrap_err_with(|| {
-            format!("failed to retain new temporary directory {} after securing it", path.display())
-        });
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unreachable!("O_PATH stage open either succeeds or returns directly")
+    let before = fstatat_nofollow(parent.as_raw_fd(), name).wrap_err_with(|| {
+        format!(
+            "failed to inspect new temporary directory {}",
+            path.display()
+        )
+    })?;
+    verify_stat_identity(
+        created,
+        &before,
+        libc::S_IFDIR,
+        path,
+        "new temporary directory",
+    )?;
+    cvt(unsafe {
+        libc::fchmodat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            0o700,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })
+    .wrap_err_with(|| {
+        format!(
+            "failed to bootstrap search access to new temporary directory {} without following symlinks",
+            path.display()
+        )
+    })?;
+    let after = fstatat_nofollow(parent.as_raw_fd(), name).wrap_err_with(|| {
+        format!(
+            "failed to verify new temporary directory {}",
+            path.display()
+        )
+    })?;
+    verify_stat_identity(
+        created,
+        &after,
+        libc::S_IFDIR,
+        path,
+        "new temporary directory",
+    )?;
+    open_directory_at_for_access(parent, name).wrap_err_with(|| {
+        format!(
+            "failed to retain new temporary directory {} after securing it",
+            path.display()
+        )
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -3960,7 +4554,10 @@ pub struct DetailApplier {
     action_index: usize,
     new_entries: Vec<Entry>,
     state: Option<ApplyState>,
+    output_batch: FilePublicationBatch,
+    // Drop pending outputs before removing their shared staging directory.
     staging: Option<StagingArea>,
+    failed: Option<String>,
 }
 
 impl DetailApplier {
@@ -4002,10 +4599,23 @@ impl DetailApplier {
             new_entries: Vec::new(),
             state: None,
             staging: None,
+            output_batch: FilePublicationBatch::new(),
+            failed: None,
         }
     }
 
     pub fn apply_frame(&mut self, frame: DetailFrame) -> Result<()> {
+        if let Some(failed) = &self.failed {
+            return Err(eyre!("detail apply stream already failed: {}", failed));
+        }
+        let result = self.apply_frame_inner(frame);
+        if let Err(error) = &result {
+            self.failed = Some(format!("{:#}", error));
+        }
+        result
+    }
+
+    fn apply_frame_inner(&mut self, frame: DetailFrame) -> Result<()> {
         let frame_index = frame.action_index as usize;
         if frame_index >= self.actions.len() {
             return Err(eyre!(
@@ -4106,10 +4716,14 @@ impl DetailApplier {
     }
 
     pub fn finish(mut self) -> Result<Vec<Entry>> {
+        if let Some(failed) = &self.failed {
+            return Err(eyre!("detail apply stream already failed: {}", failed));
+        }
         if self.state.is_some() {
             return Err(eyre!("detail stream ended with an unfinished file"));
         }
         self.advance_to_action(self.actions.len())?;
+        self.flush_outputs()?;
         self.apply_directory_second_pass()?;
 
         for e in self.all_old.iter().skip(self.old_index) {
@@ -4138,6 +4752,7 @@ impl DetailApplier {
                     self.action_index
                 ));
             }
+            self.flush_outputs()?;
             self.apply_action_without_detail(self.action_index)?;
             self.action_index += 1;
         }
@@ -4332,6 +4947,8 @@ impl DetailApplier {
 
     fn begin_file_detail(&mut self, action_index: usize) -> Result<()> {
         self.prepare_action(action_index);
+        let output_bytes = action_output_entry(&self.actions[action_index])?.size();
+        self.flush_before_output(output_bytes)?;
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         ensure_parent_directory(&filename)?;
         let output = self.new_output(filename)?;
@@ -4344,6 +4961,8 @@ impl DetailApplier {
 
     fn begin_diff_detail(&mut self, action_index: usize) -> Result<()> {
         self.prepare_action(action_index);
+        let output_bytes = action_output_entry(&self.actions[action_index])?.size();
+        self.flush_before_output(output_bytes)?;
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         let old_entry = match &self.actions[action_index] {
             Action::Local(Change::Modified(e, _))
@@ -4399,23 +5018,35 @@ impl DetailApplier {
             | Action::ResolvedLocal((_, _), Change::Modified(_, e)) => e,
             _ => return Err(eyre!("file detail finished for non-file action")),
         };
-        let filename = safe_join(&self.base, entry.path())?;
         output.verify_contents(entry, "file output")?;
-        let final_entry = if let Some(old_entry) = replacement_old_entry(&self.actions[action_index]) {
-            verify_current_matches_entry(&filename, old_entry, "rename target")?;
-            output.finish(entry)?
+        let publication = if let Some(old_entry) = replacement_old_entry(&self.actions[action_index]) {
+            OutputPublication::Replace {
+                expected: old_entry.clone(),
+            }
         } else {
-            output.finish_without_replacing("rename target", entry)?
+            OutputPublication::NoReplace {
+                description: "rename target".to_string(),
+            }
         };
-        self.recorder
-            .record_committed_step("rename-file", entry.path())?;
-        self.new_entries.push(final_entry);
-        self.recorder
-            .record_committed_step("update-metadata", entry.path())?;
-        self.recorder
-            .record_committed_action(&self.actions[action_index])?;
+        let prepared = output.prepare(entry, publication)?;
+        let flush = self.output_batch.push(action_index, prepared);
         self.action_index = action_index + 1;
+        if flush {
+            self.flush_outputs()?;
+        }
         Ok(())
+    }
+
+    fn flush_before_output(&mut self, bytes: u64) -> Result<()> {
+        if self.output_batch.should_flush_before(bytes) {
+            self.flush_outputs()?;
+        }
+        Ok(())
+    }
+
+    fn flush_outputs(&mut self) -> Result<()> {
+        self.output_batch
+            .flush(&self.actions, &mut self.recorder, &mut self.new_entries)
     }
 
     fn apply_directory_second_pass(&mut self) -> Result<()> {
@@ -4518,6 +5149,20 @@ fn detail_filename(base: &Path, action: &Action) -> Result<PathBuf> {
     }
 }
 
+fn action_output_entry(action: &Action) -> Result<&Entry> {
+    let entry = match action {
+        Action::Local(Change::Added(entry))
+        | Action::ResolvedLocal((_, _), Change::Added(entry))
+        | Action::Local(Change::Modified(_, entry))
+        | Action::ResolvedLocal((_, _), Change::Modified(_, entry)) => entry,
+        _ => return Err(eyre!("action has no regular file output")),
+    };
+    if !entry.is_file() {
+        return Err(eyre!("action has no regular file output"));
+    }
+    Ok(entry)
+}
+
 fn replacement_old_entry(action: &Action) -> Option<&Entry> {
     match action {
         Action::Local(Change::Modified(e, _))
@@ -4533,6 +5178,20 @@ where
     details_iter
         .next()
         .ok_or_else(|| eyre!("missing detail for {}", path.display()))
+}
+
+fn fallback_action_can_follow_pending(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Local(Change::Added(entry))
+            | Action::ResolvedLocal((_, _), Change::Added(entry))
+            if entry.is_file()
+    ) || matches!(
+        action,
+        Action::Local(Change::Modified(old, new))
+            | Action::ResolvedLocal((_, _), Change::Modified(old, new))
+            if old.is_file() && new.is_file() && !old.same_contents(new)
+    )
 }
 
 fn copy_from_source(
@@ -4584,6 +5243,28 @@ pub fn apply_detailed_changes_with_policy(
     scan_policy: Option<&ScanPolicy>,
     apply_options: ApplyOptions,
 ) -> Result<()> {
+    apply_detailed_changes_with_output_batch(
+        base,
+        actions,
+        details,
+        all_old,
+        attempt_state,
+        scan_policy,
+        apply_options,
+        FilePublicationBatch::new(),
+    )
+}
+
+fn apply_detailed_changes_with_output_batch(
+    base: &PathBuf,
+    actions: &Vec<Action>,
+    details: &Vec<ChangeDetails>,
+    all_old: &mut Vec<Entry>,
+    attempt_state: Option<&Path>,
+    scan_policy: Option<&ScanPolicy>,
+    apply_options: ApplyOptions,
+    output_batch: FilePublicationBatch,
+) -> Result<()> {
     validate_actions(actions)?;
     let removal_policy = RemovalBlockerPolicy::new(scan_policy, apply_options)?;
     log::debug!("details.len() = {}", details.len());
@@ -4592,8 +5273,14 @@ pub fn apply_detailed_changes_with_policy(
     let mut old_iter = all_old.iter().peekable();
     let mut leftover_details: Vec<&ChangeDetails> = Vec::new();
     let mut staging = None;
+    // Drop pending outputs before their shared staging directory on early return.
+    let mut output_batch = output_batch;
+    let mut recorder = ApplyRecorder::new(attempt_state.map(Path::to_path_buf));
 
-    for action in actions {
+    for (action_index, action) in actions.iter().enumerate() {
+        if !fallback_action_can_follow_pending(action) {
+            output_batch.flush(actions, &mut recorder, &mut new_entries)?;
+        }
         let path = action.path();
         loop {
             let oe = old_iter.peek();
@@ -4621,6 +5308,7 @@ pub fn apply_detailed_changes_with_policy(
         match action {
             Action::Local(change) | Action::ResolvedLocal((_, _), change) => {
                 log::debug!("applying detailed change to {}", action.path().display());
+                let mut queued_file_output = false;
                 match change {
                     Change::Removed(e) => {
                         let filename = safe_join(base, e.path())?;
@@ -4658,14 +5346,22 @@ pub fn apply_detailed_changes_with_policy(
                         } else {
                             log::debug!("Adding {}", e.path().display());
                             let detail = next_detail(&mut details_iter, e.path())?;
-                            new_entries.push(create_file(
+                            if output_batch.should_flush_before(e.size()) {
+                                output_batch.flush(actions, &mut recorder, &mut new_entries)?;
+                            }
+                            create_file(
                                 &filename,
                                 detail,
                                 e,
                                 &mut staging,
-                                attempt_state,
-                            )?);
-                            record_committed_step(attempt_state, "update-metadata", e.path())?;
+                                &mut recorder,
+                                action_index,
+                                &mut output_batch,
+                            )?;
+                            queued_file_output = true;
+                            if output_batch.is_full() {
+                                output_batch.flush(actions, &mut recorder, &mut new_entries)?;
+                            }
                         }
                     }
                     Change::Modified(e1, e2) => {
@@ -4676,14 +5372,31 @@ pub fn apply_detailed_changes_with_policy(
                                     let detail = next_detail(&mut details_iter, e2.path())?;
                                     match detail {
                                         ChangeDetails::Diff(delta) => {
-                                            new_entries.push(update_file_with_diff(
+                                            if output_batch.should_flush_before(e2.size()) {
+                                                output_batch.flush(
+                                                    actions,
+                                                    &mut recorder,
+                                                    &mut new_entries,
+                                                )?;
+                                            }
+                                            update_file_with_diff(
                                                 &filename,
                                                 e1,
                                                 e2,
                                                 delta,
                                                 &mut staging,
-                                                attempt_state,
-                                            )?);
+                                                &mut recorder,
+                                                action_index,
+                                                &mut output_batch,
+                                            )?;
+                                            queued_file_output = true;
+                                            if output_batch.is_full() {
+                                                output_batch.flush(
+                                                    actions,
+                                                    &mut recorder,
+                                                    &mut new_entries,
+                                                )?;
+                                            }
                                         }
                                         _ => {
                                             return Err(eyre!(
@@ -4702,11 +5415,13 @@ pub fn apply_detailed_changes_with_policy(
                                 if e1.same_contents(e2) {
                                     new_entries.push(update_meta(&filename, e2)?);
                                 }
-                                record_committed_step(
-                                    attempt_state,
-                                    "update-metadata",
-                                    e2.path(),
-                                )?;
+                                if !queued_file_output {
+                                    record_committed_step(
+                                        attempt_state,
+                                        "update-metadata",
+                                        e2.path(),
+                                    )?;
+                                }
                             } else {
                                 // e2 not a file
                                 // remove the file
@@ -4753,18 +5468,30 @@ pub fn apply_detailed_changes_with_policy(
                             record_committed_step(attempt_state, "remove-symlink", e1.path())?;
                             if e2.is_file() {
                                 let detail = next_detail(&mut details_iter, e2.path())?;
-                                new_entries.push(create_file(
+                                if output_batch.should_flush_before(e2.size()) {
+                                    output_batch.flush(
+                                        actions,
+                                        &mut recorder,
+                                        &mut new_entries,
+                                    )?;
+                                }
+                                create_file(
                                     &filename,
                                     detail,
                                     e2,
                                     &mut staging,
-                                    attempt_state,
-                                )?);
-                                record_committed_step(
-                                    attempt_state,
-                                    "update-metadata",
-                                    e2.path(),
+                                    &mut recorder,
+                                    action_index,
+                                    &mut output_batch,
                                 )?;
+                                queued_file_output = true;
+                                if output_batch.is_full() {
+                                    output_batch.flush(
+                                        actions,
+                                        &mut recorder,
+                                        &mut new_entries,
+                                    )?;
+                                }
                             } else if let Some(p) = e2.target() {
                                 std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
                                     format!(
@@ -4804,7 +5531,7 @@ pub fn apply_detailed_changes_with_policy(
                         }
                     }
                 }
-                if !change.is_dir() {
+                if !change.is_dir() && !queued_file_output {
                     record_committed_action(attempt_state, action)?;
                 }
             }
@@ -4833,11 +5560,13 @@ pub fn apply_detailed_changes_with_policy(
     if details_iter.next().is_some() {
         return Err(eyre!("unexpected extra file detail"));
     }
+    output_batch.flush(actions, &mut recorder, &mut new_entries)?;
 
     // second pass, in reverse order, to remove directories and update their metadata
     let mut details_iter = leftover_details.iter().rev();
     let removed_paths = removed_destination_paths(actions);
-    for action in actions.iter().rev() {
+    for (action_index, action) in actions.iter().enumerate().rev() {
+        output_batch.flush(actions, &mut recorder, &mut new_entries)?;
         match action {
             Action::Local(change) | Action::ResolvedLocal((_, _), change) => {
                 if !change.is_dir() {
@@ -4866,7 +5595,7 @@ pub fn apply_detailed_changes_with_policy(
                     }
                     Change::Modified(e1, e2) => {
                         let dirname = safe_join(base, e2.path())?;
-                        let mut prepared_entry = None;
+                        let mut queued_file_output = false;
                         if e1.is_dir() && !e2.is_dir() {
                             verify_current_matches_entry(&dirname, e1, "replace target")?;
                             prune_ignored_removal_blockers(
@@ -4897,26 +5626,41 @@ pub fn apply_detailed_changes_with_policy(
                                 let detail = details_iter.next().ok_or_else(|| {
                                     eyre!("missing detail for {}", e2.path().display())
                                 })?;
-                                prepared_entry = Some(create_file(
+                                create_file(
                                     &dirname,
                                     detail,
                                     e2,
                                     &mut staging,
-                                    attempt_state,
-                                )?);
+                                    &mut recorder,
+                                    action_index,
+                                    &mut output_batch,
+                                )?;
+                                queued_file_output = true;
+                                output_batch.flush(
+                                    actions,
+                                    &mut recorder,
+                                    &mut new_entries,
+                                )?;
                             }
                         }
                         if e1.is_dir() && e2.is_dir() {
                             verify_current_matches_entry(&dirname, e1, "metadata target")?;
                         }
-                        new_entries.push(match prepared_entry {
-                            Some(entry) => entry,
-                            None => update_meta(&dirname, e2)?,
-                        });
-                        record_committed_step(attempt_state, "update-metadata", e2.path())?;
+                        if !queued_file_output {
+                            new_entries.push(update_meta(&dirname, e2)?);
+                            record_committed_step(attempt_state, "update-metadata", e2.path())?;
+                        }
                     }
                 }
-                record_committed_action(attempt_state, action)?;
+                if output_batch.is_empty() {
+                    let is_directory_to_file = matches!(
+                        change,
+                        Change::Modified(old, new) if old.is_dir() && new.is_file()
+                    );
+                    if !is_directory_to_file {
+                        record_committed_action(attempt_state, action)?;
+                    }
+                }
             }
             _ => {}
         }
@@ -4928,14 +5672,13 @@ pub fn apply_detailed_changes_with_policy(
     }
     new_entries.sort(); // directory -> file or symlink will be out of order, so need to sort them
 
-    std::mem::swap(all_old, &mut new_entries);
-
     let metadata_synced = metadata_synced_directories(base, actions);
     let already_synced = match staging {
         Some(staging) => staging.finish(&metadata_synced)?,
         None => HashSet::new(),
     };
     complete_apply_phase(base, actions, attempt_state, &already_synced)?;
+    std::mem::swap(all_old, &mut new_entries);
 
     Ok(())
 }
@@ -4943,11 +5686,11 @@ pub fn apply_detailed_changes_with_policy(
 fn fallback_output(
     staging: &mut Option<StagingArea>,
     final_path: PathBuf,
-    attempt_state: Option<&Path>,
+    recorder: &mut ApplyRecorder,
 ) -> Result<TempOutput> {
     if staging.is_none() {
         let area = StagingArea::new(output_parent(&final_path))?;
-        record_staged_file(attempt_state, area.path())?;
+        recorder.record_staged_file(area.path())?;
         *staging = Some(area);
     }
     TempOutput::new(
@@ -4964,12 +5707,20 @@ fn create_file(
     detail: &ChangeDetails,
     entry: &Entry,
     staging: &mut Option<StagingArea>,
-    attempt_state: Option<&Path>,
-) -> Result<Entry> {
+    recorder: &mut ApplyRecorder,
+    action_index: usize,
+    output_batch: &mut FilePublicationBatch,
+) -> Result<()> {
     match detail {
-        ChangeDetails::Contents(v) => {
-            create_file_with_contents(filename, v, entry, staging, attempt_state)
-        }
+        ChangeDetails::Contents(v) => create_file_with_contents(
+            filename,
+            v,
+            entry,
+            staging,
+            recorder,
+            action_index,
+            output_batch,
+        ),
         _ => Err(eyre!(
             "mismatch when adding {}, expected Contents, but not found",
             filename.display()
@@ -4982,8 +5733,10 @@ fn create_file_with_contents(
     data: &[u8],
     entry: &Entry,
     staging: &mut Option<StagingArea>,
-    attempt_state: Option<&Path>,
-) -> Result<Entry> {
+    recorder: &mut ApplyRecorder,
+    action_index: usize,
+    output_batch: &mut FilePublicationBatch,
+) -> Result<()> {
     if data.len() as u64 != entry.size() {
         return Err(eyre!(
             "file detail for {} size mismatch: expected {}, got {}",
@@ -5006,7 +5759,7 @@ fn create_file_with_contents(
     }
 
     ensure_parent_directory(filename)?;
-    let mut output = fallback_output(staging, filename.to_path_buf(), attempt_state)?;
+    let mut output = fallback_output(staging, filename.to_path_buf(), recorder)?;
     output
         .file
         .as_mut()
@@ -5014,9 +5767,14 @@ fn create_file_with_contents(
         .write_all(data)
         .wrap_err_with(|| format!("failed to write temporary file for {}", filename.display()))?;
     output.verify_contents(entry, "file output")?;
-    let final_entry = output.finish_without_replacing("rename target", entry)?;
-    record_committed_step(attempt_state, "rename-file", filename)?;
-    Ok(final_entry)
+    let prepared = output.prepare(
+        entry,
+        OutputPublication::NoReplace {
+            description: "rename target".to_string(),
+        },
+    )?;
+    output_batch.push(action_index, prepared);
+    Ok(())
 }
 
 fn verify_file_matches_entry(filename: &Path, entry: &Entry, description: &str) -> Result<()> {
@@ -5165,13 +5923,15 @@ fn update_file_with_diff(
     new_entry: &Entry,
     delta: &Delta,
     staging: &mut Option<StagingArea>,
-    attempt_state: Option<&Path>,
-) -> Result<Entry> {
+    recorder: &mut ApplyRecorder,
+    action_index: usize,
+    output_batch: &mut FilePublicationBatch,
+) -> Result<()> {
     validate_delta(delta)?;
     verify_file_matches_entry(filename, old_entry, "diff source")?;
     let source = fs::File::open(filename)
         .wrap_err_with(|| format!("failed to open file {}", filename.display()))?;
-    let mut output = fallback_output(staging, filename.to_path_buf(), attempt_state)?;
+    let mut output = fallback_output(staging, filename.to_path_buf(), recorder)?;
     let output_file = output
         .file
         .as_mut()
@@ -5179,10 +5939,14 @@ fn update_file_with_diff(
     restore_seek(output_file, source, vec![0; delta.window], delta)
         .wrap_err_with(|| format!("failed to restore diff for {}", filename.display()))?;
     output.verify_contents(new_entry, "diff output")?;
-    verify_current_matches_entry(filename, old_entry, "rename target")?;
-    let final_entry = output.finish(new_entry)?;
-    record_committed_step(attempt_state, "rename-file", filename)?;
-    Ok(final_entry)
+    let prepared = output.prepare(
+        new_entry,
+        OutputPublication::Replace {
+            expected: old_entry.clone(),
+        },
+    )?;
+    output_batch.push(action_index, prepared);
+    Ok(())
 }
 
 fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
@@ -5265,6 +6029,8 @@ mod tests {
     use crate::rustsync::Block;
     use rand::{RngCore, SeedableRng};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Condvar;
+    use std::time::{Duration, Instant};
 
     fn test_file_entry(path: &str, contents: &[u8]) -> Entry {
         Entry::test_file_with_size(
@@ -5329,6 +6095,1003 @@ mod tests {
 
     fn synced_existing_dir_entry(base: &Path, path: &str) -> Entry {
         update_meta(&base.join(path), &Entry::test_dir(PathBuf::from(path))).unwrap()
+    }
+
+    fn stream_file(applier: &mut DetailApplier, action_index: usize, contents: &[u8]) -> Result<()> {
+        applier.apply_frame(DetailFrame {
+            action_index: action_index as u32,
+            payload: DetailPayload::FileBegin,
+        })?;
+        applier.apply_frame(DetailFrame {
+            action_index: action_index as u32,
+            payload: DetailPayload::FileBytes(contents.to_vec()),
+        })?;
+        applier.apply_frame(DetailFrame {
+            action_index: action_index as u32,
+            payload: DetailPayload::FileEnd,
+        })
+    }
+
+    fn prepared_test_output(
+        base: &Path,
+        staging: &StagingArea,
+        entry: &Entry,
+        contents: &[u8],
+    ) -> PreparedOutput {
+        let mut output = TempOutput::new(base.join(entry.path()), staging.shared()).unwrap();
+        output.file.as_mut().unwrap().write_all(contents).unwrap();
+        output.verify_contents(entry, "test output").unwrap();
+        output
+            .prepare(
+                entry,
+                OutputPublication::NoReplace {
+                    description: "test target".to_string(),
+                },
+            )
+            .unwrap()
+    }
+
+    struct NoopSyncWorker;
+
+    impl OutputSyncWorker for NoopSyncWorker {
+        fn sync(&self, _batch_index: usize, _output: &TempOutput) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct OverlapSyncWorker {
+        expected_overlap: usize,
+        state: Mutex<(usize, usize)>,
+        changed: Condvar,
+    }
+
+    impl OutputSyncWorker for OverlapSyncWorker {
+        fn sync(&self, _batch_index: usize, _output: &TempOutput) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            state.1 = state.1.max(state.0);
+            self.changed.notify_all();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while state.1 < self.expected_overlap {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "sync workers did not overlap",
+                    ));
+                }
+                state = self.changed.wait_timeout(state, remaining).unwrap().0;
+            }
+            state.0 -= 1;
+            self.changed.notify_all();
+            Ok(())
+        }
+    }
+
+    struct ReverseCompletionSyncWorker {
+        state: Mutex<(bool, Vec<usize>)>,
+        changed: Condvar,
+    }
+
+    impl OutputSyncWorker for ReverseCompletionSyncWorker {
+        fn sync(&self, batch_index: usize, _output: &TempOutput) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            if batch_index == 0 {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !state.0 {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "later sync worker did not complete",
+                        ));
+                    }
+                    state = self.changed.wait_timeout(state, remaining).unwrap().0;
+                }
+            } else if batch_index == 1 {
+                state.0 = true;
+                self.changed.notify_all();
+            }
+            state.1.push(batch_index);
+            Ok(())
+        }
+    }
+
+    struct PathFailureSyncWorker;
+
+    impl OutputSyncWorker for PathFailureSyncWorker {
+        fn sync(&self, _batch_index: usize, output: &TempOutput) -> io::Result<()> {
+            match output.final_path.file_name().and_then(|name| name.to_str()) {
+                Some("a.txt") | Some("c.txt") => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("sync failed for {}", output.final_path.display()),
+                )),
+                Some("b.txt") | Some("d.txt") => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("later sync failed for {}", output.final_path.display()),
+                )),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    struct BatchCountingSyncWorker {
+        batches: AtomicUsize,
+        files: AtomicUsize,
+    }
+
+    struct ParentModeSyncWorker {
+        parent: PathBuf,
+        expected_mode: u32,
+    }
+
+    struct PanicAndErrorSyncWorker;
+
+    impl OutputSyncWorker for PanicAndErrorSyncWorker {
+        fn sync(&self, batch_index: usize, _output: &TempOutput) -> io::Result<()> {
+            if batch_index == 0 {
+                panic!("injected first worker panic");
+            }
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected later worker error",
+            ))
+        }
+    }
+
+    impl OutputSyncWorker for ParentModeSyncWorker {
+        fn sync(&self, _batch_index: usize, _output: &TempOutput) -> io::Result<()> {
+            let actual = fs::symlink_metadata(&self.parent)?.mode() & SYNCED_MODE_MASK;
+            if actual != self.expected_mode {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "destination parent mode changed during sync: expected {:04o}, got {:04o}",
+                        self.expected_mode, actual
+                    ),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl OutputSyncWorker for BatchCountingSyncWorker {
+        fn sync(&self, batch_index: usize, _output: &TempOutput) -> io::Result<()> {
+            if batch_index == 0 {
+                self.batches.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.files.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn output_batch_config_validates_env_overrides_and_caps_resources() {
+        let baseline = OutputBatchConfig {
+            max_files: 12,
+            max_bytes: 34,
+            workers: 5,
+        };
+        let invalid = baseline.with_env_overrides_from(|_| Some("invalid".to_string()));
+        assert_eq!(invalid, baseline);
+
+        let capped = baseline.with_env_overrides_from(|name| match name {
+            ENV_OUTPUT_BATCH_FILES => Some(usize::MAX.to_string()),
+            ENV_OUTPUT_BATCH_BYTES => Some(u64::MAX.to_string()),
+            ENV_OUTPUT_SYNC_WORKERS => Some("0".to_string()),
+            _ => None,
+        });
+        assert_eq!(capped.max_files, output_batch_file_limit());
+        assert_eq!(capped.max_bytes, MAX_OUTPUT_BATCH_BYTES);
+        assert_eq!(capped.workers, 1);
+
+        let low_fd_limit = OutputBatchConfig {
+            max_files: usize::MAX,
+            max_bytes: 1,
+            workers: 1,
+        }
+        .normalized_with_file_limit(17);
+        assert_eq!(low_fd_limit.max_files, 17);
+        assert_eq!(
+            OutputBatchConfig {
+                max_files: usize::MAX,
+                max_bytes: 1,
+                workers: 1,
+            }
+            .normalized_with_file_limit(usize::MAX)
+            .max_files,
+            MAX_OUTPUT_BATCH_FILES
+        );
+
+        let host = OutputBatchConfig::default_for_host().normalized();
+        assert!((1..=MAX_OUTPUT_SYNC_WORKERS).contains(&host.workers));
+        assert!(host.max_files <= output_batch_file_limit());
+    }
+
+    #[test]
+    fn publication_failure_records_each_prior_publication_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state_path = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        fs::write(&state_path, b"old snapshot").unwrap();
+        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        start_apply_attempt("local", &state_path, &base, &actions, None).unwrap();
+        let staging = StagingArea::new(&base).unwrap();
+        let mut batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+        batch.push(0, prepared_test_output(&base, &staging, &entries[0], b"a"));
+        batch.push(1, prepared_test_output(&base, &staging, &entries[1], b"b"));
+        fs::write(base.join("b.txt"), b"racing destination").unwrap();
+        let mut recorder = ApplyRecorder::new(Some(state_path.clone()));
+        let mut new_entries = Vec::new();
+
+        let error = batch
+            .flush(&actions, &mut recorder, &mut new_entries)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"), "{}", error);
+        assert_eq!(fs::read(base.join("a.txt")).unwrap(), b"a");
+        assert_eq!(fs::read(base.join("b.txt")).unwrap(), b"racing destination");
+        assert_eq!(new_entries.len(), 1);
+        assert_eq!(new_entries[0].path(), Path::new("a.txt"));
+        assert_eq!(fs::read(&state_path).unwrap(), b"old snapshot");
+        let marker = fs::read_to_string(apply_attempt_path(&state_path).unwrap()).unwrap();
+        assert!(marker.contains("committed-step: rename-file a.txt"));
+        assert!(marker.contains("committed-step: update-metadata a.txt"));
+        assert!(marker.contains("committed-operation: add-file a.txt"));
+        assert!(!marker.contains("committed-operation: add-file b.txt"));
+        staging.finish(&HashSet::new()).unwrap();
+    }
+
+    #[test]
+    fn streamed_publication_failure_poisons_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state_path = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        fs::write(&state_path, b"old snapshot").unwrap();
+        fs::write(base.join("b.txt"), b"racing destination").unwrap();
+        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        start_apply_attempt("local", &state_path, &base, &actions, None).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(
+            base.clone(),
+            actions,
+            Vec::new(),
+            Some(state_path.clone()),
+        );
+        applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+
+        stream_file(&mut applier, 0, b"a").unwrap();
+        let publication_error = stream_file(&mut applier, 1, b"b").unwrap_err();
+        assert!(
+            publication_error.to_string().contains("already exists"),
+            "{}",
+            publication_error
+        );
+        let retry_error = applier
+            .apply_file_byte_chunk(FileByteChunk::new(1, b"ignored".to_vec()))
+            .unwrap_err();
+        assert!(
+            retry_error
+                .to_string()
+                .contains("detail apply stream already failed"),
+            "{}",
+            retry_error
+        );
+        let finish_error = applier.finish().unwrap_err();
+
+        assert!(
+            finish_error
+                .to_string()
+                .contains("detail apply stream already failed"),
+            "{}",
+            finish_error
+        );
+        assert_eq!(fs::read(base.join("a.txt")).unwrap(), b"a");
+        assert_eq!(fs::read(base.join("b.txt")).unwrap(), b"racing destination");
+        assert_eq!(fs::read(&state_path).unwrap(), b"old snapshot");
+        let marker = fs::read_to_string(apply_attempt_path(&state_path).unwrap()).unwrap();
+        assert!(marker.contains("committed-operation: add-file a.txt"));
+        assert!(!marker.contains("committed-operation: add-file b.txt"));
+    }
+
+    #[test]
+    fn post_publication_failure_records_commit_and_poisons_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state_path = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        fs::write(&state_path, b"old snapshot").unwrap();
+        let entry = test_file_entry("a.txt", b"a");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        start_apply_attempt("local", &state_path, &base, &actions, None).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(
+            base.clone(),
+            actions,
+            Vec::new(),
+            Some(state_path.clone()),
+        );
+        let mut batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 1,
+                max_bytes: 1024,
+                workers: 1,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+        batch.post_commit_hook = Some(Arc::new(|_| {
+            Err(eyre!("injected post-publication failure"))
+        }));
+        applier.output_batch = batch;
+
+        let error = stream_file(&mut applier, 0, b"a").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected post-publication failure"),
+            "{}",
+            error
+        );
+        assert_eq!(applier.new_entries.len(), 1);
+        assert_eq!(applier.new_entries[0].path(), Path::new("a.txt"));
+        assert_eq!(fs::read(base.join("a.txt")).unwrap(), b"a");
+        assert_eq!(fs::read(&state_path).unwrap(), b"old snapshot");
+        let marker = fs::read_to_string(apply_attempt_path(&state_path).unwrap()).unwrap();
+        assert!(marker.contains("committed-step: rename-file a.txt"));
+        assert!(marker.contains("committed-step: update-metadata a.txt"));
+        assert!(marker.contains("committed-operation: add-file a.txt"));
+        let finish_error = applier.finish().unwrap_err();
+        assert!(
+            finish_error
+                .to_string()
+                .contains("detail apply stream already failed"),
+            "{}",
+            finish_error
+        );
+    }
+
+    #[test]
+    fn replacement_parent_is_rejected_before_publication_widening() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let parent = base.join("parent");
+        let moved_parent = base.join("moved-parent");
+        fs::create_dir_all(&parent).unwrap();
+        let entry = test_file_entry("parent/a.txt", b"a");
+        let actions = vec![Action::Local(Change::Added(entry.clone()))];
+        let staging = StagingArea::new(&base).unwrap();
+        let mut batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 1,
+                max_bytes: 1024,
+                workers: 1,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+        batch.push(0, prepared_test_output(&base, &staging, &entry, b"a"));
+        fs::rename(&parent, &moved_parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = batch
+            .flush(
+                &actions,
+                &mut ApplyRecorder::new(None),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("recorded directory"),
+            "{}",
+            error
+        );
+        assert_eq!(mode(&parent), 0o500);
+        assert!(!parent.join("a.txt").exists());
+        assert!(!moved_parent.join("a.txt").exists());
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        staging.finish(&HashSet::new()).unwrap();
+    }
+
+    #[test]
+    fn worker_panics_are_indexed_errors_and_publish_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        let mut batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            Arc::new(PanicAndErrorSyncWorker),
+        );
+        batch.push(
+            0,
+            prepared_test_output(dir.path(), &staging, &entries[0], b"a"),
+        );
+        batch.push(
+            1,
+            prepared_test_output(dir.path(), &staging, &entries[1], b"b"),
+        );
+
+        let error = batch
+            .flush(
+                &actions,
+                &mut ApplyRecorder::new(None),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        let error_chain = format!("{:#}", error);
+
+        assert!(error.to_string().contains("a.txt"), "{}", error);
+        assert!(error_chain.contains("sync worker panicked"), "{}", error_chain);
+        assert!(!dir.path().join("a.txt").exists());
+        assert!(!dir.path().join("b.txt").exists());
+        staging.finish(&HashSet::new()).unwrap();
+    }
+
+    #[test]
+    fn pending_batches_do_not_widen_restrictive_destination_parents() {
+        for requested_mode in [0o000, 0o300] {
+            for fail_second_publication in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let base = dir.path().join("base");
+                let parent = base.join("parent");
+                fs::create_dir_all(&parent).unwrap();
+                if fail_second_publication {
+                    fs::write(parent.join("b.txt"), b"racing destination").unwrap();
+                }
+                fs::set_permissions(&parent, fs::Permissions::from_mode(requested_mode)).unwrap();
+                let entries = [
+                    test_file_entry("parent/a.txt", b"a"),
+                    test_file_entry("parent/b.txt", b"b"),
+                ];
+                let actions = entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| Action::Local(Change::Added(entry)))
+                    .collect::<Vec<_>>();
+                let staging = StagingArea::new(&base).unwrap();
+                let mut batch = FilePublicationBatch::with_worker(
+                    OutputBatchConfig {
+                        max_files: 2,
+                        max_bytes: 1024,
+                        workers: 2,
+                    },
+                    Arc::new(ParentModeSyncWorker {
+                        parent: parent.clone(),
+                        expected_mode: requested_mode,
+                    }),
+                );
+                batch.push(
+                    0,
+                    prepared_test_output(&base, &staging, &entries[0], b"a"),
+                );
+                batch.push(
+                    1,
+                    prepared_test_output(&base, &staging, &entries[1], b"b"),
+                );
+
+                assert_eq!(mode(&parent), requested_mode);
+                let result = batch.flush(
+                    &actions,
+                    &mut ApplyRecorder::new(None),
+                    &mut Vec::new(),
+                );
+                let bootstrap_unsupported = requested_mode == 0o000
+                    && !cfg!(any(target_os = "linux", target_os = "android"));
+                assert_eq!(
+                    result.is_err(),
+                    fail_second_publication || bootstrap_unsupported,
+                    "mode {:04o}, fail_second_publication {}: {:?}",
+                    requested_mode,
+                    fail_second_publication,
+                    result
+                );
+                assert_eq!(mode(&parent), requested_mode);
+
+                fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+                if bootstrap_unsupported {
+                    assert!(!parent.join("a.txt").exists());
+                } else {
+                    assert_eq!(fs::read(parent.join("a.txt")).unwrap(), b"a");
+                }
+                if fail_second_publication {
+                    assert_eq!(
+                        fs::read(parent.join("b.txt")).unwrap(),
+                        b"racing destination"
+                    );
+                } else if bootstrap_unsupported {
+                    assert!(!parent.join("b.txt").exists());
+                } else {
+                    assert_eq!(fs::read(parent.join("b.txt")).unwrap(), b"b");
+                }
+                staging.finish(&HashSet::new()).unwrap();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn mode_independent_directory_handle_tracks_inode_across_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_path = dir.path().join("parent");
+        let moved_path = dir.path().join("moved-parent");
+        fs::create_dir(&parent_path).unwrap();
+        fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o000)).unwrap();
+        let containing = open_directory_for_access(dir.path()).unwrap();
+        let name = path_component_cstring(parent_path.file_name().unwrap(), "test parent").unwrap();
+        let retained = open_permission_independent_directory_at(&containing, &name).unwrap();
+        let expected = directory_identity(&retained, &parent_path, "test parent").unwrap();
+        fs::rename(&parent_path, &moved_path).unwrap();
+        fs::create_dir(&parent_path).unwrap();
+        fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o555)).unwrap();
+
+        set_retained_directory_mode(&retained, 0o700, &moved_path).unwrap();
+
+        assert_eq!(mode(&moved_path), 0o700);
+        assert_eq!(mode(&parent_path), 0o555);
+        assert_eq!(
+            directory_identity(&retained, &moved_path, "test parent").unwrap(),
+            expected
+        );
+        set_retained_directory_mode(&retained, 0o000, &moved_path).unwrap();
+        assert_eq!(mode(&moved_path), 0o000);
+        assert_eq!(mode(&parent_path), 0o555);
+        fs::set_permissions(&moved_path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn fallback_many_file_outputs_use_multiple_bounded_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let file_count = 70;
+        let entries = (0..file_count)
+            .map(|index| test_file_entry(&format!("file-{:03}.txt", index), b"x"))
+            .collect::<Vec<_>>();
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        let details = (0..file_count)
+            .map(|_| ChangeDetails::Contents(b"x".to_vec()))
+            .collect::<Vec<_>>();
+        let worker = Arc::new(BatchCountingSyncWorker {
+            batches: AtomicUsize::new(0),
+            files: AtomicUsize::new(0),
+        });
+        let batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 16,
+                max_bytes: 1024,
+                workers: 4,
+            },
+            worker.clone(),
+        );
+        let mut all_old = Vec::new();
+
+        apply_detailed_changes_with_output_batch(
+            &base,
+            &actions,
+            &details,
+            &mut all_old,
+            None,
+            None,
+            ApplyOptions::default(),
+            batch,
+        )
+        .unwrap();
+
+        assert_eq!(worker.files.load(AtomicOrdering::Relaxed), file_count);
+        assert_eq!(worker.batches.load(AtomicOrdering::Relaxed), 5);
+        assert_eq!(all_old.len(), file_count);
+        for entry in entries {
+            assert_eq!(fs::read(base.join(entry.path())).unwrap(), b"x");
+        }
+    }
+
+    #[test]
+    fn fallback_error_drops_pending_outputs_before_staging_area() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        let details = vec![
+            ChangeDetails::Contents(b"a".to_vec()),
+            ChangeDetails::Contents(b"wrong size".to_vec()),
+        ];
+        let batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 10,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+
+        let error = apply_detailed_changes_with_output_batch(
+            &base,
+            &actions,
+            &details,
+            &mut Vec::new(),
+            None,
+            None,
+            ApplyOptions::default(),
+            batch,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("size mismatch"), "{}", error);
+        assert!(!base.join("a.txt").exists());
+        assert!(!base.join("b.txt").exists());
+        assert!(fs::read_dir(&base)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".duet-stage-")));
+    }
+
+    #[test]
+    fn fallback_publication_race_records_prior_file_without_advancing_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state_path = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        fs::write(&state_path, b"old snapshot").unwrap();
+        fs::write(base.join("b.txt"), b"racing destination").unwrap();
+        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        let details = vec![
+            ChangeDetails::Contents(b"a".to_vec()),
+            ChangeDetails::Contents(b"b".to_vec()),
+        ];
+        start_apply_attempt("local", &state_path, &base, &actions, None).unwrap();
+        let batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+        let mut all_old = Vec::new();
+
+        let error = apply_detailed_changes_with_output_batch(
+            &base,
+            &actions,
+            &details,
+            &mut all_old,
+            Some(&state_path),
+            None,
+            ApplyOptions::default(),
+            batch,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"), "{}", error);
+        assert_eq!(fs::read(base.join("a.txt")).unwrap(), b"a");
+        assert_eq!(fs::read(base.join("b.txt")).unwrap(), b"racing destination");
+        assert!(all_old.is_empty());
+        assert_eq!(fs::read(&state_path).unwrap(), b"old snapshot");
+        let marker = fs::read_to_string(apply_attempt_path(&state_path).unwrap()).unwrap();
+        assert!(marker.contains("committed-operation: add-file a.txt"));
+        assert!(!marker.contains("committed-operation: add-file b.txt"));
+    }
+
+    #[test]
+    fn output_sync_workers_overlap_and_respect_the_worker_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let entries = (0..4)
+            .map(|index| test_file_entry(&format!("{}.txt", index), b"x"))
+            .collect::<Vec<_>>();
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        let worker = Arc::new(OverlapSyncWorker {
+            expected_overlap: 2,
+            state: Mutex::new((0, 0)),
+            changed: Condvar::new(),
+        });
+        let mut batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 4,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            worker.clone(),
+        );
+        for (index, entry) in entries.iter().enumerate() {
+            batch.push(
+                index,
+                prepared_test_output(dir.path(), &staging, entry, b"x"),
+            );
+        }
+
+        batch
+            .flush(
+                &actions,
+                &mut ApplyRecorder::new(None),
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(worker.state.lock().unwrap().1, 2);
+        staging.finish(&HashSet::new()).unwrap();
+    }
+
+    #[test]
+    fn output_batches_flush_at_count_and_byte_thresholds() {
+        let count_dir = tempfile::tempdir().unwrap();
+        let count_entries = [
+            test_file_entry("a.txt", b"aaa"),
+            test_file_entry("b.txt", b"bbb"),
+        ];
+        let count_actions = count_entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect();
+        let mut count_applier = DetailApplier::new_with_attempt(
+            count_dir.path().to_path_buf(),
+            count_actions,
+            Vec::new(),
+            None,
+        );
+        count_applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 1,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+        stream_file(&mut count_applier, 0, b"aaa").unwrap();
+        assert!(!count_dir.path().join("a.txt").exists());
+        stream_file(&mut count_applier, 1, b"bbb").unwrap();
+        assert!(count_dir.path().join("a.txt").exists());
+        assert!(count_dir.path().join("b.txt").exists());
+        count_applier.finish().unwrap();
+
+        let byte_dir = tempfile::tempdir().unwrap();
+        let byte_actions = count_entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect();
+        let mut byte_applier = DetailApplier::new_with_attempt(
+            byte_dir.path().to_path_buf(),
+            byte_actions,
+            Vec::new(),
+            None,
+        );
+        byte_applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 10,
+                max_bytes: 5,
+                workers: 1,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+        stream_file(&mut byte_applier, 0, b"aaa").unwrap();
+        byte_applier
+            .apply_frame(DetailFrame {
+                action_index: 1,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap();
+        assert!(byte_dir.path().join("a.txt").exists());
+        assert!(!byte_dir.path().join("b.txt").exists());
+        byte_applier
+            .apply_frame(DetailFrame {
+                action_index: 1,
+                payload: DetailPayload::FileBytes(b"bbb".to_vec()),
+            })
+            .unwrap();
+        byte_applier
+            .apply_frame(DetailFrame {
+                action_index: 1,
+                payload: DetailPayload::FileEnd,
+            })
+            .unwrap();
+        assert!(!byte_dir.path().join("b.txt").exists());
+        byte_applier.finish().unwrap();
+        assert!(byte_dir.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn output_publication_and_recovery_records_follow_action_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state_path = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        start_apply_attempt("local", &state_path, &base, &actions, None).unwrap();
+        let worker = Arc::new(ReverseCompletionSyncWorker {
+            state: Mutex::new((false, Vec::new())),
+            changed: Condvar::new(),
+        });
+        let mut applier = DetailApplier::new_with_attempt(
+            base.clone(),
+            actions,
+            Vec::new(),
+            Some(state_path.clone()),
+        );
+        applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            worker.clone(),
+        );
+
+        stream_file(&mut applier, 0, b"a").unwrap();
+        stream_file(&mut applier, 1, b"b").unwrap();
+
+        assert_eq!(worker.state.lock().unwrap().1, vec![1, 0]);
+        let marker = fs::read_to_string(apply_attempt_path(&state_path).unwrap()).unwrap();
+        let committed = marker
+            .lines()
+            .filter(|line| line.starts_with("committed-operation: "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            committed,
+            vec![
+                "committed-operation: add-file a.txt",
+                "committed-operation: add-file b.txt",
+            ]
+        );
+        assert_eq!(applier.new_entries[0].path(), Path::new("a.txt"));
+        assert_eq!(applier.new_entries[1].path(), Path::new("b.txt"));
+        applier.finish().unwrap();
+    }
+
+    #[test]
+    fn sync_failure_publishes_nothing_and_reports_earliest_batch_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state_path = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        fs::write(&state_path, b"old snapshot").unwrap();
+        fs::write(base.join("a.txt"), b"unchanged-a").unwrap();
+        fs::write(base.join("b.txt"), b"unchanged-b").unwrap();
+        let entries = [test_file_entry("a.txt", b"new-a"), test_file_entry("b.txt", b"new-b")];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        start_apply_attempt("local", &state_path, &base, &actions, None).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(
+            base.clone(),
+            actions,
+            Vec::new(),
+            Some(state_path.clone()),
+        );
+        applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            Arc::new(PathFailureSyncWorker),
+        );
+
+        stream_file(&mut applier, 0, b"new-a").unwrap();
+        let error = stream_file(&mut applier, 1, b"new-b").unwrap_err();
+
+        assert!(error.to_string().contains("a.txt"), "{}", error);
+        assert_eq!(fs::read(base.join("a.txt")).unwrap(), b"unchanged-a");
+        assert_eq!(fs::read(base.join("b.txt")).unwrap(), b"unchanged-b");
+        assert!(applier.new_entries.is_empty());
+        assert_eq!(fs::read(&state_path).unwrap(), b"old snapshot");
+        let marker_path = apply_attempt_path(&state_path).unwrap();
+        assert!(marker_path.exists());
+        let marker = fs::read_to_string(marker_path).unwrap();
+        assert!(!marker.contains("committed-operation:"), "{}", marker);
+    }
+
+    #[test]
+    fn later_batch_sync_failure_keeps_prior_publications_without_advancing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state_path = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        fs::write(&state_path, b"old snapshot").unwrap();
+        let entries = [
+            test_file_entry("first.txt", b"first"),
+            test_file_entry("second.txt", b"second"),
+            test_file_entry("c.txt", b"third"),
+            test_file_entry("d.txt", b"fourth"),
+        ];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        start_apply_attempt("local", &state_path, &base, &actions, None).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(
+            base.clone(),
+            actions,
+            Vec::new(),
+            Some(state_path.clone()),
+        );
+        applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            Arc::new(PathFailureSyncWorker),
+        );
+
+        stream_file(&mut applier, 0, b"first").unwrap();
+        stream_file(&mut applier, 1, b"second").unwrap();
+        assert!(base.join("first.txt").exists());
+        assert!(base.join("second.txt").exists());
+        stream_file(&mut applier, 2, b"third").unwrap();
+        let error = stream_file(&mut applier, 3, b"fourth").unwrap_err();
+
+        assert!(error.to_string().contains("c.txt"), "{}", error);
+        assert!(!base.join("c.txt").exists());
+        assert!(!base.join("d.txt").exists());
+        assert_eq!(fs::read(&state_path).unwrap(), b"old snapshot");
+        let marker_path = apply_attempt_path(&state_path).unwrap();
+        assert!(marker_path.exists());
+        let marker = fs::read_to_string(marker_path).unwrap();
+        assert!(marker.contains("committed-operation: add-file first.txt"));
+        assert!(marker.contains("committed-operation: add-file second.txt"));
+        assert!(!marker.contains("committed-operation: add-file c.txt"));
     }
 
     #[test]
@@ -5545,6 +7308,22 @@ mod tests {
     }
 
     #[test]
+    fn stage_drop_cleans_up_under_restrictive_parent_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        let staging = StagingArea::new(&parent).unwrap();
+        let stage_path = staging.path().to_path_buf();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+
+        drop(staging);
+
+        assert_eq!(mode(&parent), 0o000);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!stage_path.exists());
+    }
+
+    #[test]
     fn complete_apply_phase_syncs_existing_writable_unreadable_parent() {
         let base = tempfile::tempdir().unwrap();
         let parent = base.path().join("parent");
@@ -5614,12 +7393,13 @@ mod tests {
         fs::rename(&parent, &moved_parent).unwrap();
         fs::create_dir(&parent).unwrap();
 
-        let error = applier
+        applier
             .apply_frame(DetailFrame {
                 action_index: 0,
                 payload: DetailPayload::FileEnd,
             })
-            .unwrap_err();
+            .unwrap();
+        let error = applier.finish().unwrap_err();
 
         assert!(
             error
@@ -5661,6 +7441,7 @@ mod tests {
             Vec::new(),
             Some(state.clone()),
         );
+        applier.output_batch.config.max_files = 1;
         for (index, contents) in [b"first".as_slice(), b"second".as_slice()]
             .iter()
             .copied()
@@ -5766,12 +7547,13 @@ mod tests {
         fs::rename(&stage_path, &moved_stage).unwrap();
         fs::create_dir(&stage_path).unwrap();
 
-        let error = applier
+        applier
             .apply_frame(DetailFrame {
                 action_index: 0,
                 payload: DetailPayload::FileEnd,
             })
-            .unwrap_err();
+            .unwrap();
+        let error = applier.finish().unwrap_err();
 
         assert!(
             error.to_string().contains("no longer refers to the retained directory"),
@@ -5782,7 +7564,6 @@ mod tests {
         assert_eq!(marker_staged_paths(&state), vec![stage_path.clone()]);
         let recovery = describe_apply_attempt(&state).unwrap().unwrap();
         assert!(recovery.contains(&stage_path.display().to_string()), "{}", recovery);
-        drop(applier);
         assert!(apply_attempt_path(&state).unwrap().exists());
         fs::remove_dir(moved_stage).unwrap();
         fs::remove_dir(stage_path).unwrap();
@@ -5874,14 +7655,17 @@ mod tests {
                     payload: DetailPayload::FileEnd,
                 })
                 .unwrap();
-            assert_eq!(mode(&base.join(entry.path())), requested_modes[index]);
-            assert_eq!(fs::metadata(base.join(entry.path())).unwrap().mtime(), entry.mtime());
+            assert!(!base.join(entry.path()).exists());
+            let pending = &applier.output_batch.pending[index].prepared.output;
+            assert_eq!(mode(pending.temp_path()), requested_modes[index]);
         }
 
         let final_entries = applier.finish().unwrap();
         assert_eq!(final_entries.len(), entries.len());
         for final_entry in final_entries {
             let metadata = fs::metadata(base.join(final_entry.path())).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, final_entry.mode() & 0o777);
+            assert_eq!(metadata.mtime(), final_entry.mtime());
             assert_eq!(final_entry.ino(), metadata.ino());
         }
     }
@@ -5945,7 +7729,7 @@ mod tests {
                 })
                 .unwrap();
             assert!(stage_path.as_ref().unwrap().exists());
-            assert_eq!(mode(&base.join(entries[index].path())), 0o644);
+            assert!(!base.join(entries[index].path()).exists());
         }
 
         let stage_path = stage_path.unwrap();
@@ -6043,6 +7827,12 @@ mod tests {
             })
             .unwrap();
 
+        assert_eq!(mode(&base.join("file.txt")), 0o644);
+        assert_eq!(
+            mode(applier.output_batch.pending[0].prepared.output.temp_path()),
+            0o400
+        );
+        applier.finish().unwrap();
         assert_eq!(mode(&base.join("file.txt")), 0o400);
         assert_eq!(fs::metadata(base.join("file.txt")).unwrap().mtime(), 0);
     }
@@ -6479,13 +8269,13 @@ mod tests {
                 payload: DetailPayload::DiffBytes(b"new!".to_vec()),
             })
             .unwrap();
-        let error = applier
+        applier
             .apply_frame(DetailFrame {
                 action_index: 0,
                 payload: DetailPayload::DiffEnd,
             })
-            .unwrap_err()
-            .to_string();
+            .unwrap();
+        let error = applier.finish().unwrap_err().to_string();
 
         assert!(error.contains("rename target"), "{}", error);
         assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"race");
@@ -6551,13 +8341,13 @@ mod tests {
                 payload: DetailPayload::FileBytes(b"new".to_vec()),
             })
             .unwrap();
-        let error = applier
+        applier
             .apply_frame(DetailFrame {
                 action_index: 0,
                 payload: DetailPayload::FileEnd,
             })
-            .unwrap_err()
-            .to_string();
+            .unwrap();
+        let error = applier.finish().unwrap_err().to_string();
 
         assert!(error.contains("rename target"), "{}", error);
         assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"race");
@@ -6593,6 +8383,12 @@ mod tests {
                 payload: DetailPayload::FileEnd,
             })
             .unwrap();
+        let stage_path = applier
+            .staging
+            .as_ref()
+            .expect("staging area exists while output is pending")
+            .path()
+            .to_path_buf();
         let error = applier
             .apply_frame(DetailFrame {
                 action_index: 0,
@@ -6602,6 +8398,8 @@ mod tests {
             .to_string();
 
         assert!(error.contains("already processed"), "{}", error);
+        drop(applier);
+        assert!(!stage_path.exists());
     }
 
     #[test]

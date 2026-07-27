@@ -436,12 +436,36 @@ destination parent and records the phase path once in the recovery marker. Any
 temporary permission change needed for stage creation is restored immediately;
 the phase retains only the parent and stage descriptors and their identities.
 Each `TempOutput` uses a unique mode-0600 component inside the shared directory,
-then applies final metadata while the output remains hidden. Before
-descriptor-relative publication, the output is flushed, verified with the
-expected BLAKE2b-256 digest (or Adler only in legacy mode), synced, and rechecked
-against the retained stage and destination-parent descriptors. Added files use
-no-clobber linking; replacements use descriptor-relative rename. Successful
-publication also records the destination parent's path, device, and inode.
+then flushes, verifies the expected BLAKE2b-256 digest (or Adler only in legacy
+mode), and applies final metadata while the output remains hidden. Completed
+outputs collect into bounded pre-publication batches. Each batch syncs output
+file handles concurrently with a bounded blocking worker set; no output in the
+batch is published unless every file sync succeeds. Successful batches publish
+descriptor-relatively in original action order, revalidating the target, stage,
+and destination-parent identities immediately before each publication. Added
+files use no-clobber linking and replacements use descriptor-relative rename.
+Immediately after each successful `renameat`/`linkat`, Duet appends that output's
+committed-step/action recovery records and updates phase-local reconstructed
+state before post-publication checks, cleanup, parent-mode restoration, or the
+next output. These completion records are best effort across the unavoidable
+syscall-to-userspace instruction boundary: if execution continues they are
+appended immediately, while a signal or process loss in that boundary still
+leaves the initial durable apply marker authoritative. Successful publication
+also records the destination parent's path, device, and inode.
+Pending outputs retain only their private file handle and the expected parent
+identity; they do not retain a destination-parent descriptor or widen its mode.
+The saved parent identity is checked before publication-time widening and again
+against the opened descriptor.
+
+Batches flush before adding an output that would exceed the count or aggregate
+content-byte limit, when either limit is reached, before a later conflicting
+non-file operation, and at phase end. Defaults are 256 files, 64 MiB, and one
+sync worker per available CPU capped at 64. Hidden benchmark overrides are
+`DUET_SYNC_OUTPUT_BATCH_FILES`, `DUET_SYNC_OUTPUT_BATCH_BYTES`, and
+`DUET_SYNC_OUTPUT_SYNC_WORKERS`; hard caps are 512 files, 1 GiB, and 64 workers,
+with every setting clamped to at least one. The effective file cap is reduced
+further when `RLIMIT_NOFILE` minus 64 reserved descriptors is lower. A single
+file may exceed the byte limit, but it is isolated from other pending outputs.
 
 After all outputs have been published or removed, the apply phase syncs the shared
 source stage directory once and removes it descriptor-relatively. A short retained-
@@ -452,9 +476,22 @@ completion barrier skips those paths while syncing unsynced ancestors, direct-
 mutation parents, and the sync base before state save. Metadata/removal-only phases
 never create a staging directory. On apply failure, best-effort cleanup performs no
 additional directory barrier and the durable recovery marker remains authoritative.
+Earlier complete batches may remain published if a later batch fails, but no
+snapshot is advanced and the marker records only publications completed in action
+order.
+Any streamed apply error permanently poisons that `DetailApplier`; later frames,
+byte chunks, and finish requests fail closed rather than returning partial state.
 `WritableDirGuard` can temporarily add owner write permission to an already-synced
-read-only destination directory and restore the original mode afterward. Metadata
-updates use Unix permission bits and symlink-aware file times.
+read-only destination directory during one publication and restore the original
+mode before the next publication. Metadata updates use Unix permission bits and
+symlink-aware file times.
+Permission bootstrap is descriptor-bound: Linux/Android retain the expected
+inode with `O_PATH`, verify it, chmod that descriptor, then open and compare the
+publication descriptor. Apple documents `O_EVTONLY`, but making it independent
+of read permission requires a private entitlement unavailable to normal Duet
+processes, so Duet fails closed for an already mode-000 destination parent there
+rather than chmod a pathname. Newly added directories can still finish as mode
+000 on Apple because child publication precedes the directory metadata pass.
 
 ## Concurrency Model
 
@@ -469,6 +506,8 @@ Important concurrent phases:
 - non-streamed local and remote apply phases run concurrently
 - streamed apply interleaves remote-to-local and local-to-remote batches in one
   loop
+- each apply side syncs one bounded batch of private output file handles through
+  scoped blocking workers, then publishes the successful batch serially
 - local and remote snapshot saves run concurrently
 
 Blocking filesystem work that can take time, such as signature generation,
@@ -488,6 +527,8 @@ Each worker reads in 1 MiB chunks, validates that the no-follow file handle stil
 matches the scan, and checks that its identity remains stable through hashing.
 `DUET_HASH_BUFFER_BYTES` can override the per-worker read size up to 4 MiB, for
 a maximum aggregate hash-buffer allocation of 256 MiB.
+Output sync worker panics are caught and returned as indexed batch errors, so the
+whole file-sync gate finishes deterministically without publishing that batch.
 
 ## Platform Assumptions
 
