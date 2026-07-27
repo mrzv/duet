@@ -430,14 +430,31 @@ symlinks, removals, replacements, metadata updates, and directory cleanup in a
 second reverse-order pass so child entries are processed before parent
 directories.
 
-Regular streamed file output uses `TempOutput`: data is written to a bounded
-`.duet-part-<pid>-<counter>` temporary basename in the destination directory and
-renamed into place on finish. Before rename, staged file output is flushed and
-verified with the expected BLAKE2b-256 digest (or Adler only in legacy mode) so mismatched content is rejected before
-the synchronized snapshot is recorded. `WritableDirGuard` can temporarily add
-owner write permission to an already-synced read-only destination directory and
-restore the original mode afterward. Metadata updates use Unix permission bits
-and symlink-aware file times.
+Regular file output in both apply paths uses a lazy, side-local `StagingArea`.
+The first output creates one mode-0700 `.duet-stage-*` directory in that output's
+destination parent and records the phase path once in the recovery marker. Any
+temporary permission change needed for stage creation is restored immediately;
+the phase retains only the parent and stage descriptors and their identities.
+Each `TempOutput` uses a unique mode-0600 component inside the shared directory,
+then applies final metadata while the output remains hidden. Before
+descriptor-relative publication, the output is flushed, verified with the
+expected BLAKE2b-256 digest (or Adler only in legacy mode), synced, and rechecked
+against the retained stage and destination-parent descriptors. Added files use
+no-clobber linking; replacements use descriptor-relative rename. Successful
+publication also records the destination parent's path, device, and inode.
+
+After all outputs have been published or removed, the apply phase syncs the shared
+source stage directory once and removes it descriptor-relatively. A short retained-
+descriptor guard permits removal when final parent metadata is restrictive and is
+restored before barriers continue. The phase then verifies and syncs the recorded
+destination parents, including the stage parent after stage removal. The existing
+completion barrier skips those paths while syncing unsynced ancestors, direct-
+mutation parents, and the sync base before state save. Metadata/removal-only phases
+never create a staging directory. On apply failure, best-effort cleanup performs no
+additional directory barrier and the durable recovery marker remains authoritative.
+`WritableDirGuard` can temporarily add owner write permission to an already-synced
+read-only destination directory and restore the original mode afterward. Metadata
+updates use Unix permission bits and symlink-aware file times.
 
 ## Concurrency Model
 

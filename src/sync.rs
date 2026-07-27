@@ -2,7 +2,7 @@ use super::scan::{Change, ContentDigest, DirEntryWithMeta as Entry};
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use crate::actions::Action;
@@ -1198,12 +1198,98 @@ pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+fn directory_identity(
+    directory: &fs::File,
+    path: &Path,
+    description: &str,
+) -> Result<DirectoryIdentity> {
+    let metadata = directory.metadata().wrap_err_with(|| {
+        format!("failed to inspect {} {}", description, path.display())
+    })?;
+    if !metadata.is_dir() {
+        return Err(eyre!("{} {} is not a directory", description, path.display()));
+    }
+    Ok(DirectoryIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+fn verify_directory_handle_identity(
+    directory: &fs::File,
+    expected: DirectoryIdentity,
+    path: &Path,
+    description: &str,
+) -> Result<()> {
+    let actual = directory_identity(directory, path, description)?;
+    if actual != expected {
+        return Err(eyre!(
+            "{} path {} no longer refers to the recorded directory",
+            description,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn sync_directory(path: &Path) -> Result<()> {
     let access = open_directory_for_access(path)
         .wrap_err_with(|| format!("unable to open directory for syncing {}", path.display()))?;
-    verify_path_identity(path, &access, "directory being synced")?;
+    sync_retained_directory(path, &access, None, "directory being synced")
+}
+
+fn sync_recorded_directory(path: &Path, expected: DirectoryIdentity) -> Result<()> {
+    let access = open_directory_for_access(path).wrap_err_with(|| {
+        format!(
+            "unable to reopen published destination parent {}",
+            path.display()
+        )
+    })?;
+    sync_retained_directory(
+        path,
+        &access,
+        Some(expected),
+        "published destination parent",
+    )
+}
+
+fn verify_recorded_directory_path(path: &Path, expected: DirectoryIdentity) -> Result<()> {
+    let actual = fs::symlink_metadata(path).wrap_err_with(|| {
+        format!(
+            "failed to inspect published destination parent path {}",
+            path.display()
+        )
+    })?;
+    if !actual.is_dir() || actual.dev() != expected.dev || actual.ino() != expected.ino {
+        return Err(eyre!(
+            "published destination parent path {} no longer refers to the recorded directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn sync_retained_directory(
+    path: &Path,
+    access: &fs::File,
+    expected: Option<DirectoryIdentity>,
+    description: &str,
+) -> Result<()> {
+    verify_path_identity(path, access, description)?;
+    if let Some(expected) = expected {
+        verify_directory_handle_identity(access, expected, path, description)?;
+    }
     match access.sync_all() {
-        Ok(()) => return Ok(()),
+        Ok(()) => {
+            verify_path_identity(path, access, description)?;
+            return Ok(());
+        }
         Err(error) if access_descriptor_needs_readable_sync(&error) => {}
         Err(error) => {
             return Err(error).wrap_err_with(|| format!("unable to sync directory {}", path.display()));
@@ -1216,8 +1302,8 @@ fn sync_directory(path: &Path) -> Result<()> {
         .permissions()
         .mode()
         & 0o7777;
-    verify_path_identity(path, &access, "directory being synced")?;
-    set_retained_directory_mode(&access, original_mode | 0o400, path).wrap_err_with(|| {
+    verify_path_identity(path, access, description)?;
+    set_retained_directory_mode(&access, original_mode | 0o500, path).wrap_err_with(|| {
         format!("unable to temporarily make directory readable for syncing {}", path.display())
     })?;
 
@@ -1253,17 +1339,18 @@ fn sync_directory(path: &Path) -> Result<()> {
         });
     }
     verify_same_directory_handles(&access, &readable, path, "directory being synced")?;
-    verify_path_identity(path, &readable, "directory being synced")?;
+    if let Some(expected) = expected {
+        verify_directory_handle_identity(&readable, expected, path, description)?;
+    }
+    verify_path_identity(path, &readable, description)?;
     readable
         .sync_all()
-        .wrap_err_with(|| format!("unable to sync directory {}", path.display()))
+        .wrap_err_with(|| format!("unable to sync directory {}", path.display()))?;
+    verify_path_identity(path, &readable, description)
 }
 
-fn complete_apply_phase(base: &Path, actions: &[Action], attempt_state: Option<&Path>) -> Result<()> {
-    // File publication syncs each private stage directory first. Parent directory
-    // durability is intentionally batched here, before the caller saves state;
-    // until these barriers complete, the durable apply marker remains authoritative.
-    let metadata_synced_directories: HashSet<_> = actions
+fn metadata_synced_directories(base: &Path, actions: &[Action]) -> HashSet<PathBuf> {
+    actions
         .iter()
         .filter_map(applied_change)
         .filter_map(|change| match change {
@@ -1272,16 +1359,31 @@ fn complete_apply_phase(base: &Path, actions: &[Action], attempt_state: Option<&
             }
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+fn complete_apply_phase(
+    base: &Path,
+    actions: &[Action],
+    attempt_state: Option<&Path>,
+    already_synced: &HashSet<PathBuf>,
+) -> Result<()> {
+    // Destination directory durability is intentionally batched here, before the
+    // caller saves state; until these barriers complete, the durable apply marker
+    // remains authoritative.
+    let metadata_synced_directories = metadata_synced_directories(base, actions);
     let mut directories = HashSet::new();
-    directories.insert(base.to_path_buf());
     for action in actions {
         let mut path = base.join(action.path());
         if path != base && !path.pop() {
             continue;
         }
         loop {
-            if !metadata_synced_directories.contains(&path)
+            if path == base {
+                break;
+            }
+            if !already_synced.contains(&path)
+                && !metadata_synced_directories.contains(&path)
                 && path.try_exists().wrap_err_with(|| format!(
                 "unable to check affected path {}", path.display()
             ))?
@@ -1299,6 +1401,9 @@ fn complete_apply_phase(base: &Path, actions: &[Action], attempt_state: Option<&
     directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for directory in directories {
         sync_directory(&directory)?;
+    }
+    if !already_synced.contains(base) {
+        sync_directory(&base.join("."))?;
     }
     if let Some(state_path) = attempt_state {
         let marker_path = apply_attempt_path(state_path)?;
@@ -2555,25 +2660,262 @@ fn stream_diff_frames(
     Ok(())
 }
 
+struct StagingState {
+    stage_parent_path: PathBuf,
+    stage_parent_identity: DirectoryIdentity,
+    path: PathBuf,
+    name: std::ffi::CString,
+    stage_parent_directory: fs::File,
+    directory: fs::File,
+    published_parents: Mutex<HashMap<PathBuf, DirectoryIdentity>>,
+}
+
+impl StagingState {
+    fn verify_stage_parent_identity(&self) -> Result<()> {
+        verify_path_identity(
+            &self.stage_parent_path,
+            &self.stage_parent_directory,
+            "temporary directory parent",
+        )?;
+        verify_directory_handle_identity(
+            &self.stage_parent_directory,
+            self.stage_parent_identity,
+            &self.stage_parent_path,
+            "temporary directory parent",
+        )
+    }
+
+    fn verify_stage_path_identity(&self) -> Result<()> {
+        verify_directory_at_identity(
+            &self.stage_parent_directory,
+            &self.name,
+            &self.directory,
+            &self.path,
+        )
+    }
+
+    fn verify_identity(&self) -> Result<()> {
+        self.verify_stage_parent_identity()?;
+        self.verify_stage_path_identity()
+    }
+
+    fn record_published_parent(&self, path: &Path, directory: &fs::File) -> Result<()> {
+        verify_path_identity(path, directory, "published destination parent")?;
+        let identity = directory_identity(directory, path, "published destination parent")?;
+        let mut parents = self
+            .published_parents
+            .lock()
+            .map_err(|_| eyre!("published destination parent identity lock was poisoned"))?;
+        if let Some(existing) = parents.get(path) {
+            if *existing != identity {
+                return Err(eyre!(
+                    "published destination parent path {} changed identity during apply",
+                    path.display()
+                ));
+            }
+        } else {
+            parents.insert(path.to_path_buf(), identity);
+        }
+        Ok(())
+    }
+
+    fn create_output(&self) -> Result<(PathBuf, std::ffi::CString, fs::File)> {
+        self.verify_identity()?;
+        for _ in 0..128 {
+            let component = format!(
+                "o-{:x}", TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+            );
+            let name = path_component_cstring(component.as_ref(), "temporary output name")?;
+            let path = self.path.join(&component);
+            let file = match openat_file(
+                self.directory.as_raw_fd(),
+                &name,
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC,
+                0o600,
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!("failed to create temporary file {}", path.display())
+                    });
+                }
+            };
+            let secure_result = (|| -> Result<()> {
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to normalize temporary file permissions {}",
+                            path.display()
+                        )
+                    })?;
+                let metadata = file.metadata().wrap_err_with(|| {
+                    format!("failed to inspect temporary file {}", path.display())
+                })?;
+                if !metadata.is_file() || metadata.mode() & 0o7777 != 0o600 {
+                    return Err(eyre!(
+                        "temporary file {} mode was not normalized to 0600",
+                        path.display()
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(error) = secure_result {
+                let _ = unlinkat(self.directory.as_raw_fd(), &name, 0);
+                return Err(error);
+            }
+            return Ok((path, name, file));
+        }
+
+        Err(eyre!(
+            "failed to create a unique temporary file in {}",
+            self.path.display()
+        ))
+    }
+}
+
+struct StagingArea {
+    shared: Arc<StagingState>,
+    finished: bool,
+}
+
+impl StagingArea {
+    fn new(stage_parent: &Path) -> Result<Self> {
+        let (stage_parent_directory, stage_parent_guard) = WritableDirGuard::new(stage_parent)?;
+        let stage_parent_identity = directory_identity(
+            &stage_parent_directory,
+            stage_parent,
+            "temporary directory parent",
+        )?;
+        let (path, name, directory) =
+            create_staging_directory(stage_parent, &stage_parent_directory)?;
+        let area = Self {
+            shared: Arc::new(StagingState {
+                stage_parent_path: stage_parent.to_path_buf(),
+                stage_parent_identity,
+                path,
+                name,
+                stage_parent_directory,
+                directory,
+                published_parents: Mutex::new(HashMap::new()),
+            }),
+            finished: false,
+        };
+        if let Some(guard) = stage_parent_guard {
+            guard.restore()?;
+        }
+        Ok(area)
+    }
+
+    fn path(&self) -> &Path {
+        &self.shared.path
+    }
+
+    fn shared(&self) -> Arc<StagingState> {
+        Arc::clone(&self.shared)
+    }
+
+    fn finish(
+        mut self,
+        metadata_synced: &HashSet<PathBuf>,
+    ) -> Result<HashSet<PathBuf>> {
+        self.shared.verify_stage_parent_identity()?;
+        let stage_parent_guard = WritableDirGuard::from_retained(
+            &self.shared.stage_parent_path,
+            &self.shared.stage_parent_directory,
+        )?;
+        self.shared.verify_stage_path_identity()?;
+        self.shared.directory.sync_all().wrap_err_with(|| {
+            format!(
+                "failed to sync temporary directory {}",
+                self.shared.path.display()
+            )
+        })?;
+        self.shared.verify_stage_parent_identity()?;
+        self.shared.verify_stage_path_identity()?;
+        unlinkat(
+            self.shared.stage_parent_directory.as_raw_fd(),
+            &self.shared.name,
+            libc::AT_REMOVEDIR,
+        )
+        .wrap_err_with(|| {
+            format!(
+                "failed to remove temporary directory {}",
+                self.shared.path.display()
+            )
+        })?;
+        self.finished = true;
+        if let Some(guard) = stage_parent_guard {
+            guard.restore()?;
+        }
+
+        let published_parents = self
+            .shared
+            .published_parents
+            .lock()
+            .map_err(|_| eyre!("published destination parent identity lock was poisoned"))?
+            .clone();
+        let mut synced = HashSet::new();
+        sync_retained_directory(
+            &self.shared.stage_parent_path,
+            &self.shared.stage_parent_directory,
+            Some(self.shared.stage_parent_identity),
+            "temporary directory parent",
+        )?;
+        synced.insert(self.shared.stage_parent_path.clone());
+        for (path, identity) in published_parents {
+            if path == self.shared.stage_parent_path {
+                continue;
+            }
+            if metadata_synced.contains(&path) {
+                // Directory metadata is applied and fsynced after child publication.
+                verify_recorded_directory_path(&path, identity)?;
+            } else {
+                sync_recorded_directory(&path, identity)?;
+            }
+            synced.insert(path);
+        }
+        Ok(synced)
+    }
+}
+
+impl Drop for StagingArea {
+    fn drop(&mut self) {
+        if !self.finished && self.shared.verify_identity().is_ok() {
+            let _ = unlinkat(
+                self.shared.stage_parent_directory.as_raw_fd(),
+                &self.shared.name,
+                libc::AT_REMOVEDIR,
+            );
+        }
+    }
+}
+
 struct TempOutput {
     final_path: PathBuf,
     parent_path: PathBuf,
-    stage_dir: PathBuf,
     temp_path: PathBuf,
     final_name: std::ffi::CString,
-    stage_name: std::ffi::CString,
+    output_name: std::ffi::CString,
     parent_directory: fs::File,
-    stage_directory: fs::File,
+    staging: Arc<StagingState>,
     file: Option<fs::File>,
     parent_guard: Option<WritableDirGuard>,
 }
 
+fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 impl TempOutput {
-    fn new(final_path: PathBuf) -> Result<Self> {
-        let parent = final_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+    fn new(final_path: PathBuf, staging: Arc<StagingState>) -> Result<Self> {
+        let parent = output_parent(&final_path);
         let parent_path = parent.to_path_buf();
         let (parent_directory, parent_guard) = WritableDirGuard::new(parent)?;
         let final_name = path_component_cstring(
@@ -2582,20 +2924,24 @@ impl TempOutput {
                 .ok_or_else(|| eyre!("output path {} has no file name", final_path.display()))?,
             "output file name",
         )?;
-        let (stage_dir, temp_path, stage_name, stage_directory, file) =
-            create_temp_output_file(&final_path, &parent_directory)?;
-        Ok(TempOutput {
+        let (temp_path, output_name, file) = staging.create_output()?;
+        let output = TempOutput {
             final_path,
             parent_path,
-            stage_dir,
             temp_path,
             final_name,
-            stage_name,
+            output_name,
             parent_directory,
-            stage_directory,
+            staging,
             file: Some(file),
             parent_guard,
-        })
+        };
+        output.verify_at_identity(
+            &output.staging.directory,
+            &output.output_name,
+            &output.temp_path,
+        )?;
+        Ok(output)
     }
 
     fn prepare_metadata(&mut self, entry: &Entry) -> Result<Entry> {
@@ -2687,15 +3033,17 @@ impl TempOutput {
     fn finish(mut self, entry: &Entry) -> Result<Entry> {
         let final_entry = self.prepare_metadata(entry)?;
         self.sync_all()?;
-        self.verify_at_identity(&self.stage_directory, output_name(), &self.temp_path)?;
-        // The stage entry must be durable before it is published. The affected
-        // parent chain is synced once at apply-phase completion.
-        self.sync_stage_directory()?;
+        self.verify_at_identity(
+            &self.staging.directory,
+            &self.output_name,
+            &self.temp_path,
+        )?;
         self.verify_parent_path_identity()?;
+        self.staging.verify_identity()?;
         cvt(unsafe {
             libc::renameat(
-                self.stage_directory.as_raw_fd(),
-                output_name().as_ptr(),
+                self.staging.directory.as_raw_fd(),
+                self.output_name.as_ptr(),
                 self.parent_directory.as_raw_fd(),
                 self.final_name.as_ptr(),
             )
@@ -2709,8 +3057,8 @@ impl TempOutput {
         })?;
         self.verify_parent_path_identity()?;
         self.verify_at_identity(&self.parent_directory, &self.final_name, &self.final_path)?;
-        self.sync_stage_directory()?;
-        self.remove_stage_dir()?;
+        self.staging
+            .record_published_parent(&self.parent_path, &self.parent_directory)?;
         self.restore_parent()?;
         Ok(final_entry)
     }
@@ -2718,15 +3066,17 @@ impl TempOutput {
     fn finish_without_replacing(mut self, description: &str, entry: &Entry) -> Result<Entry> {
         let final_entry = self.prepare_metadata(entry)?;
         self.sync_all()?;
-        self.verify_at_identity(&self.stage_directory, output_name(), &self.temp_path)?;
-        // The stage entry must be durable before it is published. The affected
-        // parent chain is synced once at apply-phase completion.
-        self.sync_stage_directory()?;
+        self.verify_at_identity(
+            &self.staging.directory,
+            &self.output_name,
+            &self.temp_path,
+        )?;
         self.verify_parent_path_identity()?;
+        self.staging.verify_identity()?;
         match cvt(unsafe {
             libc::linkat(
-                self.stage_directory.as_raw_fd(),
-                output_name().as_ptr(),
+                self.staging.directory.as_raw_fd(),
+                self.output_name.as_ptr(),
                 self.parent_directory.as_raw_fd(),
                 self.final_name.as_ptr(),
                 0,
@@ -2752,11 +3102,11 @@ impl TempOutput {
         }
         self.verify_parent_path_identity()?;
         self.verify_at_identity(&self.parent_directory, &self.final_name, &self.final_path)?;
-        unlinkat(self.stage_directory.as_raw_fd(), output_name(), 0).wrap_err_with(|| {
+        self.staging
+            .record_published_parent(&self.parent_path, &self.parent_directory)?;
+        unlinkat(self.staging.directory.as_raw_fd(), &self.output_name, 0).wrap_err_with(|| {
             format!("failed to remove temporary file {}", self.temp_path.display())
         })?;
-        self.sync_stage_directory()?;
-        self.remove_stage_dir()?;
         self.restore_parent()?;
         Ok(final_entry)
     }
@@ -2766,8 +3116,9 @@ impl TempOutput {
         &self.temp_path
     }
 
+    #[cfg(test)]
     fn stage_path(&self) -> &Path {
-        &self.stage_dir
+        &self.staging.path
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -2789,15 +3140,6 @@ impl TempOutput {
             ))
     }
 
-    fn sync_stage_directory(&self) -> Result<()> {
-        self.stage_directory.sync_all().wrap_err_with(|| {
-            format!(
-                "failed to sync temporary directory {}",
-                self.stage_dir.display()
-            )
-        })
-    }
-
     fn verify_parent_path_identity(&self) -> Result<()> {
         verify_path_identity(
             &self.parent_path,
@@ -2812,38 +3154,12 @@ impl TempOutput {
         }
         Ok(())
     }
-
-    fn remove_stage_dir(&mut self) -> Result<()> {
-        verify_directory_at_identity(
-            &self.parent_directory,
-            &self.stage_name,
-            &self.stage_directory,
-            &self.stage_dir,
-        )?;
-        unlinkat(
-            self.parent_directory.as_raw_fd(),
-            &self.stage_name,
-            libc::AT_REMOVEDIR,
-        )
-        .wrap_err_with(|| {
-            format!(
-                "failed to remove temporary directory {}",
-                self.stage_dir.display()
-            )
-        })?;
-        self.stage_dir.clear();
-        Ok(())
-    }
 }
 
-fn create_temp_output_file(
-    final_path: &Path,
-    parent_directory: &fs::File,
-) -> Result<(PathBuf, PathBuf, std::ffi::CString, fs::File, fs::File)> {
-    let parent = final_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+fn create_staging_directory(
+    stage_parent: &Path,
+    stage_parent_directory: &fs::File,
+) -> Result<(PathBuf, std::ffi::CString, fs::File)> {
     for _ in 0..128 {
         let stage_component = format!(
             ".duet-stage-{}-{:016x}-{}",
@@ -2852,9 +3168,9 @@ fn create_temp_output_file(
             TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
         );
         let stage_name = path_component_cstring(stage_component.as_ref(), "stage directory name")?;
-        let stage_dir = parent.join(&stage_component);
+        let stage_dir = stage_parent.join(&stage_component);
         match cvt(unsafe {
-            libc::mkdirat(parent_directory.as_raw_fd(), stage_name.as_ptr(), 0o700)
+            libc::mkdirat(stage_parent_directory.as_raw_fd(), stage_name.as_ptr(), 0o700)
         }) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -2864,16 +3180,16 @@ fn create_temp_output_file(
                 });
             }
         }
-        let created_stat = match fstatat_nofollow(parent_directory.as_raw_fd(), &stage_name) {
+        let created_stat = match fstatat_nofollow(stage_parent_directory.as_raw_fd(), &stage_name) {
             Ok(stat) => stat,
             Err(error) => {
                 if let Ok(directory) = openat_file(
-                    parent_directory.as_raw_fd(),
+                    stage_parent_directory.as_raw_fd(),
                     &stage_name,
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     0,
                 ) {
-                    cleanup_stage_at(parent_directory, &stage_name, &directory);
+                    cleanup_stage_at(stage_parent_directory, &stage_name, &directory);
                 }
                 return Err(error).wrap_err_with(|| {
                     format!(
@@ -2886,56 +3202,56 @@ fn create_temp_output_file(
         if created_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
             || created_stat.st_uid != unsafe { libc::geteuid() }
         {
-            cleanup_unopened_stage_at(parent_directory, &stage_name, &created_stat);
+            cleanup_unopened_stage_at(stage_parent_directory, &stage_name, &created_stat);
             return Err(eyre!(
                 "new temporary directory path {} was replaced before it could be opened",
                 stage_dir.display()
             ));
         }
         let access_directory = match open_new_stage_for_access(
-            parent_directory,
+            stage_parent_directory,
             &stage_name,
             &created_stat,
             &stage_dir,
         ) {
             Ok(directory) => directory,
             Err(error) => {
-                cleanup_unopened_stage_at(parent_directory, &stage_name, &created_stat);
+                cleanup_unopened_stage_at(stage_parent_directory, &stage_name, &created_stat);
                 return Err(error).wrap_err_with(|| {
                     format!("failed to retain temporary directory {}", stage_dir.display())
                 });
             }
         };
         if let Err(error) = verify_retained_directory_at_identity(
-            parent_directory,
+            stage_parent_directory,
             &stage_name,
             &access_directory,
             &created_stat,
             &stage_dir,
             "new temporary directory",
         ) {
-            cleanup_stage_at(parent_directory, &stage_name, &access_directory);
+            cleanup_stage_at(stage_parent_directory, &stage_name, &access_directory);
             return Err(error);
         }
         if let Err(error) = normalize_stage_directory_mode(
-            parent_directory,
+            stage_parent_directory,
             &stage_name,
             &access_directory,
             &created_stat,
             &stage_dir,
         ) {
-            cleanup_stage_at(parent_directory, &stage_name, &access_directory);
+            cleanup_stage_at(stage_parent_directory, &stage_name, &access_directory);
             return Err(error);
         }
         let directory = match openat_file(
-            parent_directory.as_raw_fd(),
+            stage_parent_directory.as_raw_fd(),
             &stage_name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         ) {
             Ok(directory) => directory,
             Err(e) => {
-                cleanup_unopened_stage_at(parent_directory, &stage_name, &created_stat);
+                cleanup_unopened_stage_at(stage_parent_directory, &stage_name, &created_stat);
                 return Err(e).wrap_err_with(|| {
                     format!("failed to open temporary directory {}", stage_dir.display())
                 });
@@ -2943,7 +3259,7 @@ fn create_temp_output_file(
         };
         let secure_result = (|| -> Result<()> {
             verify_directory_at_identity(
-                parent_directory,
+                stage_parent_directory,
                 &stage_name,
                 &directory,
                 &stage_dir,
@@ -2968,47 +3284,15 @@ fn create_temp_output_file(
             Ok(())
         })();
         if let Err(error) = secure_result {
-            cleanup_stage_at(parent_directory, &stage_name, &directory);
+            cleanup_stage_at(stage_parent_directory, &stage_name, &directory);
             return Err(error);
         }
-        let temp_path = stage_dir.join("output");
-        match openat_file(
-            directory.as_raw_fd(),
-            output_name(),
-            libc::O_RDWR
-                | libc::O_CREAT
-                | libc::O_EXCL
-                | libc::O_NOFOLLOW
-                | libc::O_CLOEXEC,
-            0o600,
-        ) {
-            Ok(file) => {
-                if let Err(error) = file
-                    .set_permissions(fs::Permissions::from_mode(0o600))
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to normalize temporary file permissions {}",
-                            temp_path.display()
-                        )
-                    })
-                {
-                    cleanup_stage_at(parent_directory, &stage_name, &directory);
-                    return Err(error);
-                }
-                return Ok((stage_dir, temp_path, stage_name, directory, file));
-            }
-            Err(e) => {
-                cleanup_stage_at(parent_directory, &stage_name, &directory);
-                return Err(e).wrap_err_with(|| {
-                    format!("failed to create temporary file {}", temp_path.display())
-                });
-            }
-        }
+        return Ok((stage_dir, stage_name, directory));
     }
 
     Err(eyre!(
-        "failed to create a unique temporary file next to {}",
-        final_path.display()
+        "failed to create a unique temporary directory in {}",
+        stage_parent.display()
     ))
 }
 
@@ -3025,10 +3309,6 @@ fn path_component_cstring(
     }
     std::ffi::CString::new(component.as_bytes())
         .map_err(|_| eyre!("{} contains an interior NUL byte", description))
-}
-
-fn output_name() -> &'static std::ffi::CStr {
-    unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"output\0") }
 }
 
 fn cvt(result: libc::c_int) -> io::Result<()> {
@@ -3227,8 +3507,6 @@ fn cleanup_stage_at(
     {
         return;
     }
-    let _ = unlinkat(directory.as_raw_fd(), output_name(), 0);
-    let _ = directory.sync_all();
     if verify_directory_at_identity(
         parent,
         stage_name,
@@ -3329,8 +3607,34 @@ impl WritableDirGuard {
         })))
     }
 
+    fn from_retained(path: &Path, directory: &fs::File) -> Result<Option<Self>> {
+        verify_path_identity(path, directory, "temporary directory parent")?;
+        let metadata = directory.metadata().wrap_err_with(|| {
+            format!("failed to inspect directory permissions for {}", path.display())
+        })?;
+        let original_mode = metadata.permissions().mode() & 0o7777;
+        if owner_write_execute(original_mode) {
+            return Ok(None);
+        }
+        let guard_directory = directory.try_clone().wrap_err_with(|| {
+            format!("failed to retain directory handle for {}", path.display())
+        })?;
+        set_retained_directory_mode(directory, original_mode | 0o700, path).wrap_err_with(|| {
+            format!("failed to make directory writable for sync {}", path.display())
+        })?;
+        if let Err(error) = verify_path_identity(path, directory, "temporary directory parent") {
+            let _ = set_retained_directory_mode(directory, original_mode, path);
+            return Err(error);
+        }
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            directory: guard_directory,
+            original_mode,
+        }))
+    }
+
     fn restore(mut self) -> Result<()> {
-        self.directory.set_permissions(fs::Permissions::from_mode(self.original_mode))
+        set_retained_directory_mode(&self.directory, self.original_mode, &self.path)
             .wrap_err_with(|| format!(
                 "failed to restore directory permissions after sync {}", self.path.display()
             ))?;
@@ -3479,32 +3783,26 @@ fn set_retained_directory_mode(directory: &fs::File, mode: u32, _path: &Path) ->
 impl Drop for WritableDirGuard {
     fn drop(&mut self) {
         if !self.path.as_os_str().is_empty() {
-            let _ = self
-                .directory
-                .set_permissions(fs::Permissions::from_mode(self.original_mode));
+            let _ = set_retained_directory_mode(
+                &self.directory,
+                self.original_mode,
+                &self.path,
+            );
         }
     }
 }
 
 impl Drop for TempOutput {
     fn drop(&mut self) {
-        let _ = unlinkat(self.stage_directory.as_raw_fd(), output_name(), 0);
-        let _ = self.stage_directory.sync_all();
-        if !self.stage_dir.as_os_str().is_empty() {
-            if verify_directory_at_identity(
-                &self.parent_directory,
-                &self.stage_name,
-                &self.stage_directory,
-                &self.stage_dir,
+        if self
+            .verify_at_identity(
+                &self.staging.directory,
+                &self.output_name,
+                &self.temp_path,
             )
             .is_ok()
-            {
-                let _ = unlinkat(
-                    self.parent_directory.as_raw_fd(),
-                    &self.stage_name,
-                    libc::AT_REMOVEDIR,
-                );
-            }
+        {
+            let _ = unlinkat(self.staging.directory.as_raw_fd(), &self.output_name, 0);
         }
     }
 }
@@ -3662,6 +3960,7 @@ pub struct DetailApplier {
     action_index: usize,
     new_entries: Vec<Entry>,
     state: Option<ApplyState>,
+    staging: Option<StagingArea>,
 }
 
 impl DetailApplier {
@@ -3702,6 +4001,7 @@ impl DetailApplier {
             action_index: 0,
             new_entries: Vec::new(),
             state: None,
+            staging: None,
         }
     }
 
@@ -3816,7 +4116,17 @@ impl DetailApplier {
             self.new_entries.push(e.clone());
         }
         self.new_entries.sort();
-        complete_apply_phase(&self.base, &self.actions, self.attempt_state.as_deref())?;
+        let metadata_synced = metadata_synced_directories(&self.base, &self.actions);
+        let already_synced = match self.staging.take() {
+            Some(staging) => staging.finish(&metadata_synced)?,
+            None => HashSet::new(),
+        };
+        complete_apply_phase(
+            &self.base,
+            &self.actions,
+            self.attempt_state.as_deref(),
+            &already_synced,
+        )?;
         Ok(self.new_entries)
     }
 
@@ -4024,8 +4334,7 @@ impl DetailApplier {
         self.prepare_action(action_index);
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         ensure_parent_directory(&filename)?;
-        let output = TempOutput::new(filename)?;
-        self.recorder.record_staged_file(output.stage_path())?;
+        let output = self.new_output(filename)?;
         self.state = Some(ApplyState::File {
             action_index,
             output,
@@ -4043,14 +4352,28 @@ impl DetailApplier {
         };
         verify_file_matches_entry(&filename, old_entry, "diff source")?;
         let source = fs::File::open(&filename)?;
-        let output = TempOutput::new(filename)?;
-        self.recorder.record_staged_file(output.stage_path())?;
+        let output = self.new_output(filename)?;
         self.state = Some(ApplyState::Diff {
             action_index,
             source,
             output,
         });
         Ok(())
+    }
+
+    fn new_output(&mut self, final_path: PathBuf) -> Result<TempOutput> {
+        if self.staging.is_none() {
+            let staging = StagingArea::new(output_parent(&final_path))?;
+            self.recorder.record_staged_file(staging.path())?;
+            self.staging = Some(staging);
+        }
+        TempOutput::new(
+            final_path,
+            self.staging
+                .as_ref()
+                .expect("staging area is initialized")
+                .shared(),
+        )
     }
 
     fn finish_file_detail(&mut self) -> Result<()> {
@@ -4268,6 +4591,7 @@ pub fn apply_detailed_changes_with_policy(
     let mut new_entries: Vec<Entry> = Vec::new();
     let mut old_iter = all_old.iter().peekable();
     let mut leftover_details: Vec<&ChangeDetails> = Vec::new();
+    let mut staging = None;
 
     for action in actions {
         let path = action.path();
@@ -4334,7 +4658,13 @@ pub fn apply_detailed_changes_with_policy(
                         } else {
                             log::debug!("Adding {}", e.path().display());
                             let detail = next_detail(&mut details_iter, e.path())?;
-                            new_entries.push(create_file(&filename, detail, e, attempt_state)?);
+                            new_entries.push(create_file(
+                                &filename,
+                                detail,
+                                e,
+                                &mut staging,
+                                attempt_state,
+                            )?);
                             record_committed_step(attempt_state, "update-metadata", e.path())?;
                         }
                     }
@@ -4351,6 +4681,7 @@ pub fn apply_detailed_changes_with_policy(
                                                 e1,
                                                 e2,
                                                 delta,
+                                                &mut staging,
                                                 attempt_state,
                                             )?);
                                         }
@@ -4426,6 +4757,7 @@ pub fn apply_detailed_changes_with_policy(
                                     &filename,
                                     detail,
                                     e2,
+                                    &mut staging,
                                     attempt_state,
                                 )?);
                                 record_committed_step(
@@ -4565,8 +4897,13 @@ pub fn apply_detailed_changes_with_policy(
                                 let detail = details_iter.next().ok_or_else(|| {
                                     eyre!("missing detail for {}", e2.path().display())
                                 })?;
-                                prepared_entry =
-                                    Some(create_file(&dirname, detail, e2, attempt_state)?);
+                                prepared_entry = Some(create_file(
+                                    &dirname,
+                                    detail,
+                                    e2,
+                                    &mut staging,
+                                    attempt_state,
+                                )?);
                             }
                         }
                         if e1.is_dir() && e2.is_dir() {
@@ -4593,19 +4930,46 @@ pub fn apply_detailed_changes_with_policy(
 
     std::mem::swap(all_old, &mut new_entries);
 
-    complete_apply_phase(base, actions, attempt_state)?;
+    let metadata_synced = metadata_synced_directories(base, actions);
+    let already_synced = match staging {
+        Some(staging) => staging.finish(&metadata_synced)?,
+        None => HashSet::new(),
+    };
+    complete_apply_phase(base, actions, attempt_state, &already_synced)?;
 
     Ok(())
+}
+
+fn fallback_output(
+    staging: &mut Option<StagingArea>,
+    final_path: PathBuf,
+    attempt_state: Option<&Path>,
+) -> Result<TempOutput> {
+    if staging.is_none() {
+        let area = StagingArea::new(output_parent(&final_path))?;
+        record_staged_file(attempt_state, area.path())?;
+        *staging = Some(area);
+    }
+    TempOutput::new(
+        final_path,
+        staging
+            .as_ref()
+            .expect("staging area is initialized")
+            .shared(),
+    )
 }
 
 fn create_file(
     filename: &Path,
     detail: &ChangeDetails,
     entry: &Entry,
+    staging: &mut Option<StagingArea>,
     attempt_state: Option<&Path>,
 ) -> Result<Entry> {
     match detail {
-        ChangeDetails::Contents(v) => create_file_with_contents(filename, v, entry, attempt_state),
+        ChangeDetails::Contents(v) => {
+            create_file_with_contents(filename, v, entry, staging, attempt_state)
+        }
         _ => Err(eyre!(
             "mismatch when adding {}, expected Contents, but not found",
             filename.display()
@@ -4617,6 +4981,7 @@ fn create_file_with_contents(
     filename: &Path,
     data: &[u8],
     entry: &Entry,
+    staging: &mut Option<StagingArea>,
     attempt_state: Option<&Path>,
 ) -> Result<Entry> {
     if data.len() as u64 != entry.size() {
@@ -4641,8 +5006,7 @@ fn create_file_with_contents(
     }
 
     ensure_parent_directory(filename)?;
-    let mut output = TempOutput::new(filename.to_path_buf())?;
-    record_staged_file(attempt_state, output.stage_path())?;
+    let mut output = fallback_output(staging, filename.to_path_buf(), attempt_state)?;
     output
         .file
         .as_mut()
@@ -4800,14 +5164,14 @@ fn update_file_with_diff(
     old_entry: &Entry,
     new_entry: &Entry,
     delta: &Delta,
+    staging: &mut Option<StagingArea>,
     attempt_state: Option<&Path>,
 ) -> Result<Entry> {
     validate_delta(delta)?;
     verify_file_matches_entry(filename, old_entry, "diff source")?;
     let source = fs::File::open(filename)
         .wrap_err_with(|| format!("failed to open file {}", filename.display()))?;
-    let mut output = TempOutput::new(filename.to_path_buf())?;
-    record_staged_file(attempt_state, output.stage_path())?;
+    let mut output = fallback_output(staging, filename.to_path_buf(), attempt_state)?;
     let output_file = output
         .file
         .as_mut()
@@ -4935,6 +5299,28 @@ mod tests {
         fs::symlink_metadata(path).unwrap().mode() & SYNCED_MODE_MASK
     }
 
+    fn marker_staged_paths(state: &Path) -> Vec<PathBuf> {
+        fs::read_to_string(apply_attempt_path(state).unwrap())
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("staged-file: "))
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    fn stage_directories(base: &Path) -> Vec<PathBuf> {
+        fs::read_dir(base)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".duet-stage-")
+            })
+            .collect()
+    }
+
     fn synced_existing_file_entry(base: &Path, path: &str, contents: &[u8]) -> Entry {
         let filename = base.join(path);
         fs::write(&filename, contents).unwrap();
@@ -4986,7 +5372,7 @@ mod tests {
             Action::Local(Change::Added(child)),
         ];
 
-        complete_apply_phase(base.path(), &actions, None).unwrap();
+        complete_apply_phase(base.path(), &actions, None, &HashSet::new()).unwrap();
 
         assert_eq!(mode(&directory_path), 0o300);
         fs::set_permissions(&directory_path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4995,7 +5381,8 @@ mod tests {
     #[test]
     fn temp_output_is_private_and_readable_through_its_handle() {
         let dir = tempfile::tempdir().unwrap();
-        let mut output = TempOutput::new(dir.path().join("out.txt")).unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let mut output = TempOutput::new(dir.path().join("out.txt"), staging.shared()).unwrap();
 
         assert_eq!(mode(output.temp_path().parent().unwrap()) & 0o777, 0o700);
         assert_eq!(mode(output.temp_path()), 0o600);
@@ -5012,7 +5399,8 @@ mod tests {
     fn temp_output_stays_hidden_after_final_mode_is_applied() {
         let dir = tempfile::tempdir().unwrap();
         let final_path = dir.path().join("out.txt");
-        let mut output = TempOutput::new(final_path.clone()).unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let mut output = TempOutput::new(final_path.clone(), staging.shared()).unwrap();
         let stage_dir = output.temp_path().parent().unwrap().to_path_buf();
         output.file.as_mut().unwrap().write_all(b"public").unwrap();
         let entry = test_file_entry_with_mode("out.txt", b"public", 0o644);
@@ -5023,17 +5411,30 @@ mod tests {
         assert_eq!(mode(&stage_dir) & 0o777, 0o700);
         output.finish(&entry).unwrap();
         assert_eq!(mode(&final_path), 0o644);
+        assert!(stage_dir.exists());
+        staging.finish(&HashSet::new()).unwrap();
         assert!(!stage_dir.exists());
     }
 
     #[test]
-    fn temp_output_drop_removes_stage_directory() {
+    fn temp_output_drop_removes_only_its_staged_file() {
         let dir = tempfile::tempdir().unwrap();
-        let stage_dir = {
-            let output = TempOutput::new(dir.path().join("out.txt")).unwrap();
-            output.stage_path().to_path_buf()
-        };
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let stage_dir = staging.path().to_path_buf();
+        let first = TempOutput::new(dir.path().join("first.txt"), staging.shared()).unwrap();
+        let first_path = first.temp_path().to_path_buf();
+        let second = TempOutput::new(dir.path().join("second.txt"), staging.shared()).unwrap();
+        let second_path = second.temp_path().to_path_buf();
+        assert_ne!(first_path, second_path);
 
+        drop(first);
+
+        assert!(stage_dir.exists());
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        drop(second);
+        assert!(stage_dir.exists());
+        staging.finish(&HashSet::new()).unwrap();
         assert!(!stage_dir.exists());
     }
 
@@ -5042,7 +5443,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let final_path = dir.path().join("out.txt");
         fs::write(&final_path, b"existing").unwrap();
-        let mut output = TempOutput::new(final_path.clone()).unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let mut output = TempOutput::new(final_path.clone(), staging.shared()).unwrap();
         let stage_dir = output.stage_path().to_path_buf();
         output.file.as_mut().unwrap().write_all(b"new").unwrap();
         let entry = test_file_entry("out.txt", b"new");
@@ -5053,6 +5455,8 @@ mod tests {
 
         assert!(error.to_string().contains("already exists"), "{}", error);
         assert_eq!(fs::read(&final_path).unwrap(), b"existing");
+        assert!(stage_dir.exists());
+        staging.finish(&HashSet::new()).unwrap();
         assert!(!stage_dir.exists());
     }
 
@@ -5060,11 +5464,13 @@ mod tests {
     fn temp_output_verifies_mode_zero_final_inode_relative_to_parent() {
         let dir = tempfile::tempdir().unwrap();
         let final_path = dir.path().join("out.txt");
-        let mut output = TempOutput::new(final_path.clone()).unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let mut output = TempOutput::new(final_path.clone(), staging.shared()).unwrap();
         output.file.as_mut().unwrap().write_all(b"private").unwrap();
         let entry = test_file_entry_with_mode("out.txt", b"private", 0o000);
 
         output.finish(&entry).unwrap();
+        staging.finish(&HashSet::new()).unwrap();
 
         assert_eq!(mode(&final_path), 0o000);
     }
@@ -5077,10 +5483,12 @@ mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).unwrap();
 
         let result = (|| -> Result<()> {
+            let staging = StagingArea::new(dir.path())?;
             let final_path = parent.join("out.txt");
-            let mut output = TempOutput::new(final_path.clone())?;
+            let mut output = TempOutput::new(final_path.clone(), staging.shared())?;
             output.file.as_mut().unwrap().write_all(b"contents")?;
             output.finish(&test_file_entry("out.txt", b"contents"))?;
+            staging.finish(&HashSet::new())?;
             assert_eq!(fs::read(final_path)?, b"contents");
             Ok(())
         })();
@@ -5121,6 +5529,22 @@ mod tests {
     }
 
     #[test]
+    fn stage_parent_permissions_are_restored_immediately_after_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let staging = StagingArea::new(&parent).unwrap();
+
+        assert_eq!(mode(&parent), 0o500);
+        assert!(staging.path().exists());
+        staging.finish(&HashSet::new()).unwrap();
+        assert_eq!(mode(&parent), 0o500);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
     fn complete_apply_phase_syncs_existing_writable_unreadable_parent() {
         let base = tempfile::tempdir().unwrap();
         let parent = base.path().join("parent");
@@ -5132,9 +5556,28 @@ mod tests {
             b"contents",
         )))];
 
-        let result = complete_apply_phase(base.path(), &actions, None);
+        let result = complete_apply_phase(base.path(), &actions, None, &HashSet::new());
 
         assert_eq!(mode(&parent), 0o300);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn complete_apply_phase_skips_already_synced_destination_parent() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+        let actions = vec![Action::Local(Change::Added(test_file_entry(
+            "parent/child",
+            b"contents",
+        )))];
+        let already_synced = HashSet::from([parent.clone()]);
+
+        let result = complete_apply_phase(base.path(), &actions, None, &already_synced);
+
+        assert_eq!(mode(&parent), 0o000);
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         result.unwrap();
     }
@@ -5193,16 +5636,87 @@ mod tests {
     }
 
     #[test]
+    fn published_parent_swap_before_phase_finish_keeps_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let stable_parent = base.join("stable");
+        let swapped_parent = base.join("swapped");
+        let moved_parent = base.join("moved-swapped");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir_all(&stable_parent).unwrap();
+        fs::create_dir(&swapped_parent).unwrap();
+        let entries = [
+            test_file_entry("stable/first.txt", b"first"),
+            test_file_entry("swapped/second.txt", b"second"),
+        ];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        start_apply_attempt("local", &state, &base, &actions, None).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(
+            base.clone(),
+            actions,
+            Vec::new(),
+            Some(state.clone()),
+        );
+        for (index, contents) in [b"first".as_slice(), b"second".as_slice()]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: index as u32,
+                    payload: DetailPayload::FileBegin,
+                })
+                .unwrap();
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: index as u32,
+                    payload: DetailPayload::FileBytes(contents.to_vec()),
+                })
+                .unwrap();
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: index as u32,
+                    payload: DetailPayload::FileEnd,
+                })
+                .unwrap();
+        }
+        fs::rename(&swapped_parent, &moved_parent).unwrap();
+        fs::create_dir(&swapped_parent).unwrap();
+
+        let error = applier.finish().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("published destination parent"),
+            "{}",
+            error
+        );
+        assert_eq!(fs::read(moved_parent.join("second.txt")).unwrap(), b"second");
+        assert!(!swapped_parent.join("second.txt").exists());
+        assert!(apply_attempt_path(&state).unwrap().exists());
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert!(marker.contains("staged-file: "), "{}", marker);
+    }
+
+    #[test]
     fn temp_output_does_not_follow_swapped_stage_path() {
         let dir = tempfile::tempdir().unwrap();
         let final_path = dir.path().join("out.txt");
-        let mut output = TempOutput::new(final_path.clone()).unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let mut output = TempOutput::new(final_path.clone(), staging.shared()).unwrap();
         let stage_dir = output.stage_path().to_path_buf();
+        let output_name = output.temp_path().file_name().unwrap().to_owned();
         let moved_stage = dir.path().join("moved-stage");
         output.file.as_mut().unwrap().write_all(b"retained").unwrap();
         fs::rename(&stage_dir, &moved_stage).unwrap();
         fs::create_dir(&stage_dir).unwrap();
-        fs::write(stage_dir.join("output"), b"substitute").unwrap();
+        fs::write(stage_dir.join(&output_name), b"substitute").unwrap();
         let entry = test_file_entry("out.txt", b"retained");
 
         let error = output.finish(&entry).unwrap_err();
@@ -5212,9 +5726,66 @@ mod tests {
             "{}",
             error
         );
-        assert_eq!(fs::read(&final_path).unwrap(), b"retained");
-        assert_eq!(fs::read(stage_dir.join("output")).unwrap(), b"substitute");
+        assert!(!final_path.exists());
+        assert_eq!(fs::read(stage_dir.join(&output_name)).unwrap(), b"substitute");
+        drop(staging);
         fs::remove_dir(&moved_stage).unwrap();
+        fs::remove_file(stage_dir.join(output_name)).unwrap();
+        fs::remove_dir(stage_dir).unwrap();
+    }
+
+    #[test]
+    fn streamed_stage_path_swap_rejects_publication_and_keeps_phase_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entry = test_file_entry("out.txt", b"contents");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        start_apply_attempt("local", &state, &base, &actions, None).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(
+            base.clone(),
+            actions,
+            Vec::new(),
+            Some(state.clone()),
+        );
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBytes(b"contents".to_vec()),
+            })
+            .unwrap();
+        let stage_path = applier.staging.as_ref().unwrap().path().to_path_buf();
+        let moved_stage = base.join("moved-stage");
+        fs::rename(&stage_path, &moved_stage).unwrap();
+        fs::create_dir(&stage_path).unwrap();
+
+        let error = applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileEnd,
+            })
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("no longer refers to the retained directory"),
+            "{}",
+            error
+        );
+        assert!(!base.join("out.txt").exists());
+        assert_eq!(marker_staged_paths(&state), vec![stage_path.clone()]);
+        let recovery = describe_apply_attempt(&state).unwrap().unwrap();
+        assert!(recovery.contains(&stage_path.display().to_string()), "{}", recovery);
+        drop(applier);
+        assert!(apply_attempt_path(&state).unwrap().exists());
+        fs::remove_dir(moved_stage).unwrap();
+        fs::remove_dir(stage_path).unwrap();
     }
 
     #[test]
@@ -5316,6 +5887,130 @@ mod tests {
     }
 
     #[test]
+    fn streamed_files_share_one_stage_until_phase_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entries = vec![
+            test_file_entry_with_mode("first.txt", b"first", 0o644),
+            test_file_entry_with_mode("second.txt", b"second", 0o644),
+        ];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        start_apply_attempt("local", &state, &base, &actions, None).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(
+            base.clone(),
+            actions,
+            Vec::new(),
+            Some(state.clone()),
+        );
+        let mut stage_path = None;
+
+        for (index, contents) in [b"first".as_slice(), b"second".as_slice()]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: index as u32,
+                    payload: DetailPayload::FileBegin,
+                })
+                .unwrap();
+            let output = match applier.state.as_ref().unwrap() {
+                ApplyState::File { output, .. } => output,
+                _ => panic!("expected streamed file state"),
+            };
+            assert_eq!(mode(output.temp_path()), 0o600);
+            assert_eq!(mode(output.stage_path()), 0o700);
+            match &stage_path {
+                Some(stage_path) => assert_eq!(output.stage_path(), stage_path),
+                None => stage_path = Some(output.stage_path().to_path_buf()),
+            }
+            assert_eq!(marker_staged_paths(&state), vec![stage_path.clone().unwrap()]);
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: index as u32,
+                    payload: DetailPayload::FileBytes(contents.to_vec()),
+                })
+                .unwrap();
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: index as u32,
+                    payload: DetailPayload::FileEnd,
+                })
+                .unwrap();
+            assert!(stage_path.as_ref().unwrap().exists());
+            assert_eq!(mode(&base.join(entries[index].path())), 0o644);
+        }
+
+        let stage_path = stage_path.unwrap();
+        let final_entries = applier.finish().unwrap();
+
+        assert!(!stage_path.exists());
+        assert_eq!(marker_staged_paths(&state), vec![stage_path]);
+        for entry in final_entries {
+            assert_eq!(
+                entry.ino(),
+                fs::symlink_metadata(base.join(entry.path())).unwrap().ino()
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_stage_cleanup_preserves_restrictive_parent_modes() {
+        for requested_mode in [0o000, 0o300] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("base");
+            fs::create_dir(&base).unwrap();
+            let mut parent_entry = Entry::test_dir(PathBuf::from("parent"));
+            parent_entry.set_mode(requested_mode);
+            let file_entry = test_file_entry("parent/file.txt", b"contents");
+            let actions = vec![
+                Action::Local(Change::Added(parent_entry)),
+                Action::Local(Change::Added(file_entry)),
+            ];
+            let mut applier = DetailApplier::new_with_attempt(
+                base.clone(),
+                actions,
+                Vec::new(),
+                None,
+            );
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: 1,
+                    payload: DetailPayload::FileBegin,
+                })
+                .unwrap();
+            let stage_path = applier.staging.as_ref().unwrap().path().to_path_buf();
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: 1,
+                    payload: DetailPayload::FileBytes(b"contents".to_vec()),
+                })
+                .unwrap();
+            applier
+                .apply_frame(DetailFrame {
+                    action_index: 1,
+                    payload: DetailPayload::FileEnd,
+                })
+                .unwrap();
+
+            applier.finish().unwrap();
+
+            let parent = base.join("parent");
+            assert_eq!(mode(&parent), requested_mode);
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!stage_path.exists());
+            assert_eq!(fs::read(parent.join("file.txt")).unwrap(), b"contents");
+        }
+    }
+
+    #[test]
     fn streamed_diff_stays_private_until_final_metadata_is_ready() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().to_path_buf();
@@ -5369,6 +6064,148 @@ mod tests {
             assert_eq!(fs::metadata(base.join("file.txt")).unwrap().mtime(), 0);
             assert_ne!(fs::metadata(base.join("file.txt")).unwrap().ino(), 0);
         }
+    }
+
+    #[test]
+    fn nested_writable_destination_does_not_broaden_nonwritable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let nested = base.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o500)).unwrap();
+        let entry = test_file_entry("nested/file.txt", b"contents");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        let details = vec![ChangeDetails::Contents(b"contents".to_vec())];
+        let mut all_old = Vec::new();
+
+        let result = apply_detailed_changes(&base, &actions, &details, &mut all_old, None);
+
+        assert_eq!(mode(&base), 0o500);
+        assert_eq!(fs::read(nested.join("file.txt")).unwrap(), b"contents");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn nested_destination_under_symlink_root_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_base = dir.path().join("real-base");
+        let base = dir.path().join("base-link");
+        fs::create_dir_all(real_base.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&real_base, &base).unwrap();
+        let entry = test_file_entry("nested/file.txt", b"contents");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        let details = vec![ChangeDetails::Contents(b"contents".to_vec())];
+        let mut all_old = Vec::new();
+
+        apply_detailed_changes(&base, &actions, &details, &mut all_old, None).unwrap();
+
+        assert_eq!(
+            fs::read(real_base.join("nested/file.txt")).unwrap(),
+            b"contents"
+        );
+        assert!(fs::symlink_metadata(&base).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn fallback_files_share_one_phase_stage_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entries = vec![
+            test_file_entry_with_mode("first.txt", b"first", 0o644),
+            test_file_entry_with_mode("second.txt", b"second", 0o644),
+        ];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        let details = vec![
+            ChangeDetails::Contents(b"first".to_vec()),
+            ChangeDetails::Contents(b"second".to_vec()),
+        ];
+        let mut all_old = Vec::new();
+        start_apply_attempt("local", &state, &base, &actions, None).unwrap();
+
+        apply_detailed_changes(
+            &base,
+            &actions,
+            &details,
+            &mut all_old,
+            Some(&state),
+        )
+        .unwrap();
+
+        let staged_paths = marker_staged_paths(&state);
+        assert_eq!(staged_paths.len(), 1);
+        assert!(!staged_paths[0].exists());
+        for entry in all_old {
+            let metadata = fs::symlink_metadata(base.join(entry.path())).unwrap();
+            assert_eq!(entry.ino(), metadata.ino());
+            assert_eq!(metadata.mode() & SYNCED_MODE_MASK, 0o644);
+        }
+    }
+
+    #[test]
+    fn content_free_apply_paths_create_no_stage() {
+        let streamed_dir = tempfile::tempdir().unwrap();
+        let streamed_base = streamed_dir.path().join("base");
+        let streamed_state = streamed_dir.path().join("profile.snp");
+        fs::create_dir(&streamed_base).unwrap();
+        let old = synced_existing_file_entry(&streamed_base, "removed.txt", b"old");
+        let actions = vec![Action::Local(Change::Removed(old.clone()))];
+        start_apply_attempt(
+            "local",
+            &streamed_state,
+            &streamed_base,
+            &actions,
+            None,
+        )
+        .unwrap();
+
+        DetailApplier::new_with_attempt(
+            streamed_base.clone(),
+            actions,
+            vec![old],
+            Some(streamed_state.clone()),
+        )
+        .finish()
+        .unwrap();
+
+        assert!(marker_staged_paths(&streamed_state).is_empty());
+        assert!(stage_directories(&streamed_base).is_empty());
+
+        let fallback_dir = tempfile::tempdir().unwrap();
+        let fallback_base = fallback_dir.path().join("base");
+        let fallback_state = fallback_dir.path().join("profile.snp");
+        fs::create_dir(&fallback_base).unwrap();
+        let old = synced_existing_file_entry(&fallback_base, "metadata.txt", b"old");
+        let mut new = old.clone();
+        new.set_mode(0o600);
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let mut all_old = vec![old];
+        start_apply_attempt(
+            "local",
+            &fallback_state,
+            &fallback_base,
+            &actions,
+            None,
+        )
+        .unwrap();
+
+        apply_detailed_changes(
+            &fallback_base,
+            &actions,
+            &Vec::new(),
+            &mut all_old,
+            Some(&fallback_state),
+        )
+        .unwrap();
+
+        assert!(marker_staged_paths(&fallback_state).is_empty());
+        assert!(stage_directories(&fallback_base).is_empty());
     }
 
     #[test]
@@ -5878,8 +6715,9 @@ mod tests {
     fn temp_output_name_stays_short_for_long_destination_names() {
         let dir = tempfile::tempdir().unwrap();
         let final_path = dir.path().join(format!("{}.txt", "a".repeat(250)));
+        let staging = StagingArea::new(dir.path()).unwrap();
 
-        let output = TempOutput::new(final_path.clone()).unwrap();
+        let output = TempOutput::new(final_path.clone(), staging.shared()).unwrap();
         let temp_name = output.temp_path.file_name().unwrap().to_string_lossy();
 
         assert!(temp_name.len() < 64, "temp name was {}", temp_name);
@@ -5891,6 +6729,7 @@ mod tests {
                 b"",
             ))
             .unwrap();
+        staging.finish(&HashSet::new()).unwrap();
         assert!(final_path.exists());
     }
 
@@ -5903,8 +6742,9 @@ mod tests {
             std::process::id()
         ));
         fs::write(&old_predictable, b"do not touch").unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
 
-        let output = TempOutput::new(final_path).unwrap();
+        let output = TempOutput::new(final_path, staging.shared()).unwrap();
 
         assert_ne!(output.temp_path, old_predictable);
         assert_eq!(fs::read(&old_predictable).unwrap(), b"do not touch");

@@ -14,6 +14,7 @@
 - Snapshot maintenance now hashes complete file contents and writes the current version atomically.
 - Expanded `--dry-run` to run the full non-mutating preflight checks, including local and remote directory removal blocker reports.
 - Bounded directory scanning globally to 64 concurrent reads and made content hashing CPU-parallel across files, defaulting to up to one whole-file worker per available CPU (maximum 64) while preserving deterministic results.
+- Reused one private staging directory in the first output parent per side-local apply phase, verified published parent identities, and batched source-stage and destination-parent durability barriers while retaining per-file output durability.
 
 ### Fixed
 - Made scan cancellation own and stop in-flight work, and prevented scan failures from exposing partial entries.
