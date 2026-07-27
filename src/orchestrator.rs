@@ -12,6 +12,7 @@ use crate::actions::{num_identical, num_unresolved_conflicts, reverse, Action, A
 use crate::cli::SyncOptions;
 use crate::performance::{PerformanceProfile, StreamingProfile};
 use crate::profile::{self, ProfileSource};
+use crate::progress;
 use crate::remote;
 use crate::resolution::{self, AllResolution};
 use crate::rpc::{self, DuetServerAsync};
@@ -1184,17 +1185,11 @@ fn should_apply_file_bytes_as_chunk(len: usize) -> bool {
 }
 
 fn stream_progress_bar(total_transfer_bytes: u64) -> Result<indicatif::ProgressBar> {
-    let progress = indicatif::ProgressBar::new(total_transfer_bytes);
-    let style = indicatif::ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] {bar:40.cyan/blue} {wide_msg}")?
-        .progress_chars("##-");
-    progress.set_style(style);
-    progress.set_message(format!(
+    progress::bytes_bar(total_transfer_bytes, format!(
         "streaming changes {} / {}",
         indicatif::HumanBytes(0),
         indicatif::HumanBytes(total_transfer_bytes)
-    ));
-    Ok(progress)
+    ))
 }
 
 fn preflight_non_streamed_detail_size(actions: &[Action], _remote_actions: &[Action]) -> Result<()> {

@@ -6,6 +6,7 @@ mod commands;
 mod io_wrappers;
 mod orchestrator;
 mod performance;
+mod progress;
 mod profile;
 mod remote;
 mod resolution;

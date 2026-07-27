@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::profile;
+use crate::progress;
 use crate::scan::change::LegacyChange;
 use crate::scan::location::Locations;
 use crate::scan::{self, Change, DirEntryWithMeta, LegacyEntry};
@@ -150,10 +151,7 @@ where
     F: std::future::Future<Output = Result<()>>,
 {
     tokio::pin!(scanner);
-    let pb = indicatif::ProgressBar::new(1);
-    pb.set_style(
-        indicatif::ProgressStyle::default_spinner().template("[{elapsed_precise}] {wide_msg}")?,
-    );
+    let pb = progress::spinner("scanning")?;
     let mut entries = Entries::new();
 
     loop {
@@ -164,14 +162,16 @@ where
                     return Err(error).wrap_err("scanner failed");
                 }
                 while let Some(entry) = rx.recv().await {
-                    pb.set_message(entry.path().display().to_string());
+                    pb.inc(1);
+                    pb.set_message(format!("scanning {}", entry.path().display()));
                     entries.push(entry);
                 }
                 break;
             }
             entry = rx.recv() => match entry {
                 Some(entry) => {
-                    pb.set_message(entry.path().display().to_string());
+                    pb.inc(1);
+                    pb.set_message(format!("scanning {}", entry.path().display()));
                     entries.push(entry);
                 }
                 None => {
@@ -370,7 +370,7 @@ async fn hash_work_with_limit(
 ) -> Result<Vec<(usize, DirEntryWithMeta)>> {
     assert!(limit > 0, "checksum concurrency limit must be nonzero");
     work.sort_by(|(_, a), (_, b)| a.path().cmp(b.path()));
-    let pb = indicatif::ProgressBar::new(work.len() as u64);
+    let pb = progress::count_bar(work.len() as u64, "hashing content")?;
     let base = Arc::new(base.clone());
     let buffer_size = hash_buffer_size();
     let worker_pb = pb.clone();
