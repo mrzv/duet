@@ -142,8 +142,7 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
         .filter(|a| verbose || !a.is_identical())
         .collect();
 
-    let capacity = height as usize - 3;
-    let pages = (actions.len() as f64 / capacity as f64).ceil() as usize;
+    let capacity = (height as usize).saturating_sub(3).max(1);
 
     let mut sel = 0;
     let mut height = 0;
@@ -152,7 +151,7 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
     let resolution = loop {
         term.write_line(
             format!(
-                "{}, n/a = abort, f = force{} [{}]",
+                "{}, PgUp/PgDn = page, n/a = abort, f = force{} [{}]",
                 if num_conflicts == 0 {
                     "y/g = proceed".bright_green()
                 } else {
@@ -247,22 +246,10 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
                 sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
             }
             Key::PageUp => {
-                if page == 0 {
-                    page = pages - 1;
-                } else {
-                    page -= 1;
-                }
-
-                sel = page * capacity;
+                sel = page_selection(sel, capacity, actions.len(), -1);
             }
             Key::PageDown => {
-                if page == pages - 1 {
-                    page = 0;
-                } else {
-                    page += 1;
-                }
-
-                sel = page * capacity;
+                sel = page_selection(sel, capacity, actions.len(), 1);
             }
 
             Key::Char('y') | Key::Char('g') if num_conflicts == 0 => {
@@ -293,6 +280,15 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
     term.flush()?;
 
     Ok(resolution)
+}
+
+fn page_selection(sel: usize, capacity: usize, len: usize, step: isize) -> usize {
+    let pages = (len + capacity - 1) / capacity;
+    let page = sel / capacity;
+    let row = sel % capacity;
+    let next_page = (page as isize + step).rem_euclid(pages as isize) as usize;
+
+    (next_page * capacity + row).min(len - 1)
 }
 
 fn next_conflict_index(actions: &[&mut Action], sel: usize, step: isize) -> Option<usize> {
@@ -387,5 +383,18 @@ mod tests {
         assert_eq!(next_conflict_index(&actions, 0, 1), Some(1));
         assert_eq!(next_conflict_index(&actions, 2, 1), Some(1));
         assert_eq!(next_conflict_index(&actions, 0, -1), Some(1));
+    }
+
+    #[test]
+    fn page_selection_moves_by_a_page_and_preserves_the_row() {
+        assert_eq!(page_selection(2, 5, 14, 1), 7);
+        assert_eq!(page_selection(7, 5, 14, -1), 2);
+    }
+
+    #[test]
+    fn page_selection_wraps_and_clamps_partial_pages() {
+        assert_eq!(page_selection(2, 5, 14, -1), 12);
+        assert_eq!(page_selection(12, 5, 14, 1), 2);
+        assert_eq!(page_selection(9, 5, 12, 1), 11);
     }
 }
