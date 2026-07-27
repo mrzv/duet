@@ -10,6 +10,7 @@
 - Added profile-aware `duet recover <profile>` and `duet recover --remote <profile>` recovery marker inspection and clearing.
 
 ### Changed
+- Removed duplicated byte counts from the streamed SSH transfer progress message.
 - Normalized progress display styling across scanning, content hashing, and streamed transfer.
 - Interactive mode now uses Shift+Up/Shift+Down page navigation and preserves the selected row when moving a page at a time.
 - Strong-capable peers now use BLAKE2b-256 for cross-side equivalence, stale file checks, and final output verification while retaining Adler-32 only for negotiated compatibility and rustsync rolling blocks.

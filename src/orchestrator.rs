@@ -1185,11 +1185,7 @@ fn should_apply_file_bytes_as_chunk(len: usize) -> bool {
 }
 
 fn stream_progress_bar(total_transfer_bytes: u64) -> Result<indicatif::ProgressBar> {
-    progress::bytes_bar(total_transfer_bytes, format!(
-        "streaming changes {} / {}",
-        indicatif::HumanBytes(0),
-        indicatif::HumanBytes(total_transfer_bytes)
-    ))
+    progress::bytes_bar(total_transfer_bytes, "streaming changes")
 }
 
 fn preflight_non_streamed_detail_size(actions: &[Action], _remote_actions: &[Action]) -> Result<()> {
@@ -1220,11 +1216,7 @@ fn advance_stream_progress(
     }
 
     progress.set_position(*position);
-    progress.set_message(format!(
-        "streaming changes {} / {}",
-        indicatif::HumanBytes(*position),
-        indicatif::HumanBytes(total_transfer_bytes)
-    ));
+    progress.set_message("streaming changes");
 }
 
 fn has_remote_capability(info: &rpc::ServerInfo, capability: &str) -> bool {
@@ -1782,6 +1774,16 @@ mod tests {
         assert!(locations[0].path().as_os_str().is_empty());
         assert!(locations[1].is_exclude());
         assert_eq!(locations[1].path(), Path::new("dir/nested"));
+    }
+
+    #[test]
+    fn stream_progress_message_does_not_duplicate_byte_counts() {
+        let progress = stream_progress_bar(1024).unwrap();
+        assert_eq!(progress.message(), "streaming changes");
+
+        let mut position = 0;
+        advance_stream_progress(&progress, &mut position, 1024, 512);
+        assert_eq!(progress.message(), "streaming changes");
     }
 
     #[test]
