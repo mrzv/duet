@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.0 - 2026-07-28
+
 ### Added
 - Added BLAKE2b-256 content identity and verification, versioned V2 snapshots, append-only V2 RPC methods, and automatic scope-aware migration from legacy state.
 - Added `--prune-ignored` to explicitly delete ignored files or directories that block removal of a synced parent directory.
