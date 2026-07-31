@@ -1524,7 +1524,7 @@ fn parse_marker_path_identity(value: &str) -> Result<(&str, DirectoryIdentity)> 
     }
 }
 
-fn append_v2_marker_line(state_path: &Path, attempt_id: &str, line: &str) -> Result<()> {
+fn append_v2_marker_line_durable(state_path: &Path, attempt_id: &str, line: &str) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
     let contents = fs::read_to_string(&marker_path)?;
     let marker = parse_v2_apply_attempt(&contents)?;
@@ -1539,10 +1539,33 @@ fn append_v2_marker_line(state_path: &Path, attempt_id: &str, line: &str) -> Res
     Ok(())
 }
 
+fn append_v2_marker_line(state_path: &Path, line: &str) -> Result<()> {
+    let marker_path = apply_attempt_path(state_path)?;
+    let mut file = fs::OpenOptions::new().append(true).open(&marker_path)?;
+    file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+fn sync_v2_marker_entries(state_path: &Path, attempt_id: &str) -> Result<()> {
+    let marker_path = apply_attempt_path(state_path)?;
+    let contents = fs::read_to_string(&marker_path)?;
+    let marker = parse_v2_apply_attempt(&contents)?;
+    if marker.attempt_id != attempt_id || marker.phase != ApplyAttemptPhase::Preparing {
+        return Err(eyre!(
+            "staged apply marker does not match active preparing attempt"
+        ));
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&marker_path)?
+        .sync_all()?;
+    Ok(())
+}
+
 fn record_v2_stage(state_path: &Path, attempt_id: &str, staging: &StagingArea) -> Result<()> {
     let shared = &staging.shared;
     let metadata = shared.directory.metadata()?;
-    append_v2_marker_line(
+    append_v2_marker_line_durable(
         state_path,
         attempt_id,
         &format!(
@@ -1557,7 +1580,7 @@ fn record_v2_stage(state_path: &Path, attempt_id: &str, staging: &StagingArea) -
     )
 }
 
-fn record_v2_stage_entry(state_path: &Path, attempt_id: &str, output: &TempOutput) -> Result<()> {
+fn record_v2_stage_entry(state_path: &Path, output: &TempOutput) -> Result<()> {
     let metadata = output
         .file
         .as_ref()
@@ -1565,7 +1588,6 @@ fn record_v2_stage_entry(state_path: &Path, attempt_id: &str, output: &TempOutpu
         .metadata()?;
     append_v2_marker_line(
         state_path,
-        attempt_id,
         &format!(
             "stage-entry: {} {} {}\n",
             output.output_name.to_string_lossy(),
@@ -4247,7 +4269,11 @@ impl FilePublicationBatch {
         Ok(())
     }
 
-    fn seal_into(&mut self, prepared_outputs: &mut [Option<PreparedOutput>]) -> Result<()> {
+    fn seal_into(
+        &mut self,
+        prepared_outputs: &mut [Option<PreparedOutput>],
+        recovery_attempt: Option<(&Path, &str)>,
+    ) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -4314,7 +4340,13 @@ impl FilePublicationBatch {
                 }
             }
         }
+        if let Some((state_path, attempt_id)) = recovery_attempt {
+            sync_v2_marker_entries(state_path, attempt_id)?;
+        }
         for mut item in pending {
+            if recovery_attempt.is_some() {
+                item.prepared.output.cleanup_on_drop = false;
+            }
             item.prepared.output.close_after_sync()?;
             if prepared_outputs[item.action_index]
                 .replace(item.prepared)
@@ -5363,12 +5395,83 @@ enum ApplyState {
     File {
         action_index: usize,
         output: TempOutput,
+        verifier: StreamedOutputVerifier,
     },
     Diff {
         action_index: usize,
         source: fs::File,
         output: TempOutput,
+        verifier: StreamedOutputVerifier,
     },
+}
+
+struct StreamedOutputVerifier {
+    bytes: u64,
+    checksum: Option<adler32::RollingAdler32>,
+    digest: Option<blake2_rfc::blake2b::Blake2b>,
+}
+
+impl StreamedOutputVerifier {
+    fn new(entry: &Entry) -> Self {
+        let strong = entry.digest().is_some();
+        Self {
+            bytes: 0,
+            checksum: (!strong).then(adler32::RollingAdler32::new),
+            digest: strong.then(|| blake2_rfc::blake2b::Blake2b::new(32)),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+        if let Some(checksum) = &mut self.checksum {
+            checksum.update_buffer(bytes);
+        }
+        if let Some(digest) = &mut self.digest {
+            digest.update(bytes);
+        }
+    }
+
+    fn verify(self, entry: &Entry) -> Result<()> {
+        if self.bytes != entry.size() {
+            return Err(eyre!(
+                "file output {} size mismatch: expected {}, got {}",
+                entry.path().display(),
+                entry.size(),
+                self.bytes
+            ));
+        }
+        if let Some(expected) = entry.digest() {
+            let digest = self
+                .digest
+                .ok_or_else(|| eyre!("file output verifier did not compute a strong digest"))?
+                .finalize();
+            let mut bytes = [0; 32];
+            bytes.copy_from_slice(digest.as_bytes());
+            let actual = ContentDigest(bytes);
+            if actual != expected {
+                return Err(eyre!(
+                    "file output {} strong digest mismatch: expected {}, got {}",
+                    entry.path().display(),
+                    expected,
+                    actual
+                ));
+            }
+        } else {
+            let actual = self
+                .checksum
+                .ok_or_else(|| eyre!("file output verifier did not compute a legacy checksum"))?
+                .hash();
+            if actual != entry.checksum() {
+                return Err(eyre!(
+                    "file output {} legacy checksum mismatch: expected {}, got {}",
+                    entry.path().display(),
+                    entry.checksum(),
+                    actual
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct DetailApplier {
@@ -5497,6 +5600,7 @@ impl DetailApplier {
             Some(ApplyState::File {
                 action_index,
                 output,
+                verifier,
             }) => {
                 if *action_index != frame_index {
                     return Err(eyre!(
@@ -5506,11 +5610,14 @@ impl DetailApplier {
                     ));
                 }
                 match frame.payload {
-                    DetailPayload::FileBytes(bytes) => output
-                        .file
-                        .as_mut()
-                        .ok_or_else(|| eyre!("temporary output is closed"))?
-                        .write_all(&bytes)?,
+                    DetailPayload::FileBytes(bytes) => {
+                        output
+                            .file
+                            .as_mut()
+                            .ok_or_else(|| eyre!("temporary output is closed"))?
+                            .write_all(&bytes)?;
+                        verifier.update(&bytes);
+                    }
                     DetailPayload::FileEnd => self.finish_file_detail()?,
                     _ => return Err(eyre!("unexpected file detail frame")),
                 }
@@ -5520,6 +5627,7 @@ impl DetailApplier {
                 action_index,
                 source,
                 output,
+                verifier,
             }) => {
                 if *action_index != frame_index {
                     return Err(eyre!(
@@ -5534,13 +5642,16 @@ impl DetailApplier {
                             .file
                             .as_mut()
                             .ok_or_else(|| eyre!("temporary output is closed"))?;
-                        copy_from_source(source, output_file, offset, len)?;
+                        copy_from_source(source, output_file, verifier, offset, len)?;
                     }
-                    DetailPayload::DiffBytes(bytes) => output
-                        .file
-                        .as_mut()
-                        .ok_or_else(|| eyre!("temporary output is closed"))?
-                        .write_all(&bytes)?,
+                    DetailPayload::DiffBytes(bytes) => {
+                        output
+                            .file
+                            .as_mut()
+                            .ok_or_else(|| eyre!("temporary output is closed"))?
+                            .write_all(&bytes)?;
+                        verifier.update(&bytes);
+                    }
                     DetailPayload::DiffEnd => self.finish_file_detail()?,
                     _ => return Err(eyre!("unexpected diff detail frame")),
                 }
@@ -5818,19 +5929,24 @@ impl DetailApplier {
     }
 
     fn begin_file_detail(&mut self, action_index: usize) -> Result<()> {
-        let output_bytes = action_output_entry(&self.actions[action_index])?.size();
+        let entry = action_output_entry(&self.actions[action_index])?;
+        let output_bytes = entry.size();
+        let verifier = StreamedOutputVerifier::new(entry);
         self.flush_before_output(output_bytes)?;
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         let output = self.new_output(filename)?;
         self.state = Some(ApplyState::File {
             action_index,
             output,
+            verifier,
         });
         Ok(())
     }
 
     fn begin_diff_detail(&mut self, action_index: usize) -> Result<()> {
-        let output_bytes = action_output_entry(&self.actions[action_index])?.size();
+        let entry = action_output_entry(&self.actions[action_index])?;
+        let output_bytes = entry.size();
+        let verifier = StreamedOutputVerifier::new(entry);
         self.flush_before_output(output_bytes)?;
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
         let old_entry = match &self.actions[action_index] {
@@ -5845,6 +5961,7 @@ impl DetailApplier {
             action_index,
             source,
             output,
+            verifier,
         });
         Ok(())
     }
@@ -5862,18 +5979,17 @@ impl DetailApplier {
             }
             self.staging = Some(staging);
         }
-        let mut output = TempOutput::new(
+        let output = TempOutput::new(
             final_path,
             self.staging
                 .as_ref()
                 .expect("staging area is initialized")
                 .shared(),
         )?;
-        if let (Some(state_path), Some(attempt_id)) =
+        if let (Some(state_path), Some(_)) =
             (self.attempt_state.as_deref(), self.attempt_id.as_deref())
         {
-            record_v2_stage_entry(state_path, attempt_id, &output)?;
-            output.cleanup_on_drop = false;
+            record_v2_stage_entry(state_path, &output)?;
         }
         Ok(output)
     }
@@ -5883,16 +5999,18 @@ impl DetailApplier {
             .state
             .take()
             .ok_or_else(|| eyre!("no file detail in progress"))?;
-        let (action_index, mut output) = match state {
+        let (action_index, output, verifier) = match state {
             ApplyState::File {
                 action_index,
                 output,
-            } => (action_index, output),
+                verifier,
+            } => (action_index, output, verifier),
             ApplyState::Diff {
                 action_index,
                 output,
+                verifier,
                 ..
-            } => (action_index, output),
+            } => (action_index, output, verifier),
         };
         let entry = match &self.actions[action_index] {
             Action::Local(Change::Added(e))
@@ -5901,7 +6019,7 @@ impl DetailApplier {
             | Action::ResolvedLocal((_, _), Change::Modified(_, e)) => e,
             _ => return Err(eyre!("file detail finished for non-file action")),
         };
-        output.verify_contents(entry, "file output")?;
+        verifier.verify(entry)?;
         let publication =
             if let Some(old_entry) = replacement_old_entry(&self.actions[action_index]) {
                 OutputPublication::Replace {
@@ -5929,7 +6047,12 @@ impl DetailApplier {
     }
 
     fn seal_outputs(&mut self) -> Result<()> {
-        self.output_batch.seal_into(&mut self.prepared_outputs)
+        self.output_batch.seal_into(
+            &mut self.prepared_outputs,
+            self.attempt_state
+                .as_deref()
+                .zip(self.attempt_id.as_deref()),
+        )
     }
 
     fn publish_prepared_output(&mut self, action_index: usize) -> Result<()> {
@@ -6258,6 +6381,7 @@ fn fallback_action_can_follow_pending(action: &Action) -> bool {
 fn copy_from_source(
     source: &mut fs::File,
     output: &mut fs::File,
+    verifier: &mut StreamedOutputVerifier,
     offset: u64,
     len: u64,
 ) -> Result<()> {
@@ -6271,6 +6395,7 @@ fn copy_from_source(
             break;
         }
         output.write_all(&buf[..n])?;
+        verifier.update(&buf[..n]);
         remaining -= n as u64;
     }
     Ok(())

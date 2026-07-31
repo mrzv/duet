@@ -18,6 +18,8 @@
 - Added validation checkpoints that detect prepared output identity or content changes before the fence and immediately before publication.
 - Prevented precommit cancellation from orphaning recovery markers or staging, including retries after partially completed cleanup.
 - Corrected commit and state-save recovery guidance to require tree and snapshot reconciliation instead of rerunning against stale state.
+- Batched staged-output recovery-record durability at sealed-output boundaries instead of syncing and reparsing the growing marker for every file, avoiding a severe many-small-file performance regression.
+- Verified streamed output incrementally while writing full-file and delta data, avoiding an extra complete staged-file read while retaining commit-time validation.
 
 ## 0.9.0 - 2026-07-28
 
