@@ -84,6 +84,314 @@ pub struct StagingBudget {
     pub budget_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct StagingWave {
+    pub action_indices: Vec<usize>,
+    pub local_reconstructed_bytes: u64,
+    pub remote_reconstructed_bytes: u64,
+    pub local_staged_regular_outputs: usize,
+    pub remote_staged_regular_outputs: usize,
+    pub local_exceeds_budget: bool,
+    pub remote_exceeds_budget: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct StagingWavePlan {
+    pub waves: Vec<StagingWave>,
+    pub local_reconstructed_bytes: u64,
+    pub remote_reconstructed_bytes: u64,
+    pub local_staged_regular_outputs: usize,
+    pub remote_staged_regular_outputs: usize,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct StagingDependencyGroup {
+    action_indices: Vec<usize>,
+    local_reconstructed_bytes: u64,
+    remote_reconstructed_bytes: u64,
+    local_staged_regular_outputs: usize,
+    remote_staged_regular_outputs: usize,
+    isolated: bool,
+}
+
+#[allow(dead_code)]
+pub fn plan_staging_waves(
+    actions: &[Action],
+    local_budget: StagingBudget,
+    remote_budget: StagingBudget,
+) -> Result<StagingWavePlan> {
+    validate_staging_budget("local", local_budget)?;
+    validate_staging_budget("remote", remote_budget)?;
+    for (index, action) in actions.iter().enumerate() {
+        if index > 0 && actions[index - 1].path() >= action.path() {
+            return Err(eyre!(
+                "staging wave actions must be in strictly increasing path order: {} then {}",
+                actions[index - 1].path().display(),
+                action.path().display()
+            ));
+        }
+        if action.is_unresolved_conflict() {
+            return Err(eyre!(
+                "staging wave planner cannot plan unresolved conflict {}",
+                action.path().display()
+            ));
+        }
+        if action_has_directory_to_nondirectory_change(action) {
+            return Err(eyre!(
+                "staging wave planner does not support directory-to-nondirectory replacement {}",
+                action.path().display()
+            ));
+        }
+    }
+
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < actions.len() {
+        let mut end = start + 1;
+        if action_has_directory_change(&actions[start]) {
+            while end < actions.len() && actions[end].path().starts_with(actions[start].path()) {
+                end += 1;
+            }
+        }
+        groups.push(staging_dependency_group(
+            actions,
+            start,
+            end,
+            local_budget,
+            remote_budget,
+        )?);
+        start = end;
+    }
+
+    let mut plan = StagingWavePlan {
+        waves: Vec::new(),
+        local_reconstructed_bytes: 0,
+        remote_reconstructed_bytes: 0,
+        local_staged_regular_outputs: 0,
+        remote_staged_regular_outputs: 0,
+    };
+    let mut pending: Option<StagingWave> = None;
+    for group in groups {
+        plan.local_reconstructed_bytes = checked_staging_add(
+            plan.local_reconstructed_bytes,
+            group.local_reconstructed_bytes,
+            "local aggregate reconstructed bytes",
+        )?;
+        plan.remote_reconstructed_bytes = checked_staging_add(
+            plan.remote_reconstructed_bytes,
+            group.remote_reconstructed_bytes,
+            "remote aggregate reconstructed bytes",
+        )?;
+        plan.local_staged_regular_outputs = plan
+            .local_staged_regular_outputs
+            .checked_add(group.local_staged_regular_outputs)
+            .ok_or_else(|| eyre!("staging wave local aggregate output count overflow"))?;
+        plan.remote_staged_regular_outputs = plan
+            .remote_staged_regular_outputs
+            .checked_add(group.remote_staged_regular_outputs)
+            .ok_or_else(|| eyre!("staging wave remote aggregate output count overflow"))?;
+
+        if group.isolated {
+            if let Some(wave) = pending.take() {
+                plan.waves.push(wave);
+            }
+            plan.waves
+                .push(staging_wave_from_group(group, local_budget, remote_budget));
+            continue;
+        }
+
+        if let Some(wave) = pending.as_mut() {
+            let local_bytes = checked_staging_add(
+                wave.local_reconstructed_bytes,
+                group.local_reconstructed_bytes,
+                "local wave reconstructed bytes",
+            )?;
+            let remote_bytes = checked_staging_add(
+                wave.remote_reconstructed_bytes,
+                group.remote_reconstructed_bytes,
+                "remote wave reconstructed bytes",
+            )?;
+            if local_bytes <= local_budget.budget_bytes
+                && remote_bytes <= remote_budget.budget_bytes
+            {
+                wave.action_indices.extend(group.action_indices);
+                wave.local_reconstructed_bytes = local_bytes;
+                wave.remote_reconstructed_bytes = remote_bytes;
+                wave.local_staged_regular_outputs = wave
+                    .local_staged_regular_outputs
+                    .checked_add(group.local_staged_regular_outputs)
+                    .ok_or_else(|| eyre!("staging wave local output count overflow"))?;
+                wave.remote_staged_regular_outputs = wave
+                    .remote_staged_regular_outputs
+                    .checked_add(group.remote_staged_regular_outputs)
+                    .ok_or_else(|| eyre!("staging wave remote output count overflow"))?;
+                continue;
+            }
+            plan.waves.push(pending.take().unwrap());
+        }
+        pending = Some(staging_wave_from_group(group, local_budget, remote_budget));
+    }
+    if let Some(wave) = pending {
+        plan.waves.push(wave);
+    }
+    Ok(plan)
+}
+
+fn validate_staging_budget(side: &str, budget: StagingBudget) -> Result<()> {
+    if budget.budget_bytes > budget.usable_bytes {
+        return Err(eyre!(
+            "invalid {side} staging budget: target {} exceeds usable {} with reserve {}",
+            budget.budget_bytes,
+            budget.usable_bytes,
+            budget.reserve_bytes
+        ));
+    }
+    Ok(())
+}
+
+fn action_has_directory_change(action: &Action) -> bool {
+    match action {
+        Action::Identical(left, right) => left.is_dir() || right.is_dir(),
+        Action::ResolvedLocal((left, right), resolved)
+        | Action::ResolvedRemote((left, right), resolved) => {
+            left.is_dir() || right.is_dir() || resolved.is_dir()
+        }
+        _ => action_change(action).is_dir(),
+    }
+}
+
+fn action_has_directory_to_nondirectory_change(action: &Action) -> bool {
+    let is_replacement = |change: &Change| matches!(change, Change::Modified(old, new) if old.is_dir() && !new.is_dir());
+    match action {
+        Action::Identical(left, right) => is_replacement(left) || is_replacement(right),
+        Action::ResolvedLocal((left, right), resolved)
+        | Action::ResolvedRemote((left, right), resolved) => {
+            is_replacement(left) || is_replacement(right) || is_replacement(resolved)
+        }
+        _ => is_replacement(action_change(action)),
+    }
+}
+
+fn staging_dependency_group(
+    actions: &[Action],
+    start: usize,
+    end: usize,
+    local_budget: StagingBudget,
+    remote_budget: StagingBudget,
+) -> Result<StagingDependencyGroup> {
+    let mut group = StagingDependencyGroup {
+        action_indices: (start..end).collect(),
+        local_reconstructed_bytes: 0,
+        remote_reconstructed_bytes: 0,
+        local_staged_regular_outputs: 0,
+        remote_staged_regular_outputs: 0,
+        isolated: false,
+    };
+    for action in &actions[start..end] {
+        let (local, change) = match action {
+            Action::Local(change) | Action::ResolvedLocal((_, _), change) => (Some(true), change),
+            Action::Remote(change) | Action::ResolvedRemote((_, _), change) => {
+                (Some(false), change)
+            }
+            Action::Identical(_, _) => (None, action_change(action)),
+            Action::Conflict(_, _) => unreachable!("unresolved conflicts were rejected"),
+        };
+        if local.is_none() || apply_detail_kind_for_change(change).is_none() {
+            continue;
+        }
+        // Diff staging is planned pessimistically at the full reconstructed logical size.
+        let size = change_output_entry(change)?.size();
+        if local == Some(true) {
+            group.local_reconstructed_bytes = checked_staging_add(
+                group.local_reconstructed_bytes,
+                size,
+                "local dependency-group reconstructed bytes",
+            )?;
+            group.local_staged_regular_outputs = group
+                .local_staged_regular_outputs
+                .checked_add(1)
+                .ok_or_else(|| eyre!("staging wave local group output count overflow"))?;
+        } else {
+            group.remote_reconstructed_bytes = checked_staging_add(
+                group.remote_reconstructed_bytes,
+                size,
+                "remote dependency-group reconstructed bytes",
+            )?;
+            group.remote_staged_regular_outputs = group
+                .remote_staged_regular_outputs
+                .checked_add(1)
+                .ok_or_else(|| eyre!("staging wave remote group output count overflow"))?;
+        }
+    }
+    group.isolated |= validate_staging_group_side(
+        "local",
+        group.local_reconstructed_bytes,
+        group.local_staged_regular_outputs,
+        local_budget,
+        actions[start].path(),
+    )?;
+    group.isolated |= validate_staging_group_side(
+        "remote",
+        group.remote_reconstructed_bytes,
+        group.remote_staged_regular_outputs,
+        remote_budget,
+        actions[start].path(),
+    )?;
+    Ok(group)
+}
+
+fn validate_staging_group_side(
+    side: &str,
+    required: u64,
+    outputs: usize,
+    budget: StagingBudget,
+    path: &Path,
+) -> Result<bool> {
+    if required > budget.usable_bytes {
+        return Err(eyre!(
+            "{side} staging dependency group at {} requires {required} bytes, but only {} bytes are usable after reserving {} bytes",
+            path.display(),
+            budget.usable_bytes,
+            budget.reserve_bytes
+        ));
+    }
+    if required <= budget.budget_bytes {
+        return Ok(false);
+    }
+    if outputs != 1 {
+        return Err(eyre!(
+            "unsafe {side} staging dependency group at {} requires {required} bytes across {outputs} regular outputs, exceeding wave target {}",
+            path.display(),
+            budget.budget_bytes
+        ));
+    }
+    Ok(true)
+}
+
+fn staging_wave_from_group(
+    group: StagingDependencyGroup,
+    local_budget: StagingBudget,
+    remote_budget: StagingBudget,
+) -> StagingWave {
+    StagingWave {
+        action_indices: group.action_indices,
+        local_reconstructed_bytes: group.local_reconstructed_bytes,
+        remote_reconstructed_bytes: group.remote_reconstructed_bytes,
+        local_staged_regular_outputs: group.local_staged_regular_outputs,
+        remote_staged_regular_outputs: group.remote_staged_regular_outputs,
+        local_exceeds_budget: group.local_reconstructed_bytes > local_budget.budget_bytes,
+        remote_exceeds_budget: group.remote_reconstructed_bytes > remote_budget.budget_bytes,
+    }
+}
+
+fn checked_staging_add(left: u64, right: u64, context: &str) -> Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| eyre!("staging wave {context} overflow: {left} + {right}"))
+}
+
 impl StagingPolicy {
     #[allow(dead_code)]
     pub fn budget(self, filesystem: StagingFilesystemInfo) -> StagingBudget {
@@ -6837,6 +7145,10 @@ fn apply_detail_kind(action: &Action) -> Option<ApplyDetailKind> {
         _ => return None,
     };
 
+    apply_detail_kind_for_change(change)
+}
+
+fn apply_detail_kind_for_change(change: &Change) -> Option<ApplyDetailKind> {
     match change {
         Change::Removed(_) => None,
         Change::Added(e) => e.is_file().then_some(ApplyDetailKind::File),
@@ -6863,12 +7175,17 @@ fn detail_filename(base: &Path, action: &Action) -> Result<PathBuf> {
 }
 
 fn action_output_entry(action: &Action) -> Result<&Entry> {
-    let entry = match action {
-        Action::Local(Change::Added(entry))
-        | Action::ResolvedLocal((_, _), Change::Added(entry))
-        | Action::Local(Change::Modified(_, entry))
-        | Action::ResolvedLocal((_, _), Change::Modified(_, entry)) => entry,
+    let change = match action {
+        Action::Local(change) | Action::ResolvedLocal((_, _), change) => change,
         _ => return Err(eyre!("action has no regular file output")),
+    };
+    change_output_entry(change)
+}
+
+fn change_output_entry(change: &Change) -> Result<&Entry> {
+    let entry = match change {
+        Change::Added(entry) | Change::Modified(_, entry) => entry,
+        Change::Removed(_) => return Err(eyre!("action has no regular file output")),
     };
     if !entry.is_file() {
         return Err(eyre!("action has no regular file output"));
@@ -7868,6 +8185,348 @@ mod tests {
                 budget_bytes: 1_844_674_407_370_956,
             }
         );
+    }
+
+    fn staging_budget(target: u64, usable: u64) -> StagingBudget {
+        StagingBudget {
+            reserve_bytes: 7,
+            usable_bytes: usable,
+            budget_bytes: target,
+        }
+    }
+
+    fn local_file(path: &str, size: u64) -> Action {
+        Action::Local(Change::Added(Entry::test_file_with_size(
+            PathBuf::from(path),
+            size,
+            size as u32,
+        )))
+    }
+
+    fn remote_file(path: &str, size: u64) -> Action {
+        Action::Remote(Change::Added(Entry::test_file_with_size(
+            PathBuf::from(path),
+            size,
+            size as u32,
+        )))
+    }
+
+    fn removed_file(path: &str, size: u64) -> Action {
+        Action::Local(Change::Removed(Entry::test_file_with_size(
+            PathBuf::from(path),
+            size,
+            size as u32,
+        )))
+    }
+
+    #[test]
+    fn staging_waves_pack_asymmetric_directions_and_exact_boundaries() {
+        let actions = vec![
+            local_file("a", 4),
+            remote_file("b", 6),
+            remote_file("c", 4),
+            local_file("d", 7),
+        ];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(10, 20), staging_budget(10, 20)).unwrap();
+
+        assert_eq!(plan.waves.len(), 2);
+        assert_eq!(plan.waves[0].action_indices, vec![0, 1, 2]);
+        assert_eq!(plan.waves[0].local_reconstructed_bytes, 4);
+        assert_eq!(plan.waves[0].remote_reconstructed_bytes, 10);
+        assert_eq!(plan.waves[1].action_indices, vec![3]);
+        assert_eq!(plan.local_reconstructed_bytes, 11);
+        assert_eq!(plan.remote_reconstructed_bytes, 10);
+    }
+
+    #[test]
+    fn staging_waves_allow_one_isolated_oversized_file_within_usable_space() {
+        let actions = vec![local_file("a", 4), remote_file("b", 11), local_file("c", 4)];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(10, 20), staging_budget(10, 12)).unwrap();
+
+        assert_eq!(plan.waves.len(), 3);
+        assert_eq!(plan.waves[1].action_indices, vec![1]);
+        assert!(!plan.waves[1].local_exceeds_budget);
+        assert!(plan.waves[1].remote_exceeds_budget);
+        assert_eq!(plan.waves[1].remote_staged_regular_outputs, 1);
+    }
+
+    #[test]
+    fn staging_waves_reject_oversized_file_beyond_usable_space() {
+        let error = plan_staging_waves(
+            &[local_file("large", 13)],
+            staging_budget(10, 12),
+            staging_budget(10, 12),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("local"), "{}", message);
+        assert!(message.contains("requires 13"), "{}", message);
+        assert!(message.contains("usable after reserving 7"), "{}", message);
+    }
+
+    #[test]
+    fn staging_waves_reject_oversized_multifile_directory_group() {
+        let actions = vec![
+            Action::Local(Change::Added(Entry::test_dir(PathBuf::from("dir")))),
+            local_file("dir/a", 6),
+            local_file("dir/b", 6),
+        ];
+        let error = plan_staging_waves(&actions, staging_budget(10, 20), staging_budget(10, 20))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsafe local staging dependency group"));
+    }
+
+    #[test]
+    fn staging_waves_group_directory_add_remove_and_metadata_with_descendants() {
+        let old_meta = Entry::test_dir(PathBuf::from("b"));
+        let mut new_meta = old_meta.clone();
+        new_meta.set_mode(0o40700);
+        let actions = vec![
+            Action::Local(Change::Added(Entry::test_dir(PathBuf::from("a")))),
+            local_file("a/file", 5),
+            Action::Local(Change::Modified(old_meta, new_meta)),
+            local_file("b/file", 5),
+            Action::Local(Change::Removed(Entry::test_dir(PathBuf::from("c")))),
+            removed_file("c/file", 5),
+        ];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(5, 20), staging_budget(5, 20)).unwrap();
+
+        assert_eq!(
+            plan.waves
+                .iter()
+                .map(|wave| wave.action_indices.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1], vec![2, 3, 4, 5]]
+        );
+    }
+
+    #[test]
+    fn staging_waves_group_file_to_directory_and_nested_subtrees() {
+        let actions = vec![
+            Action::Local(Change::Modified(
+                Entry::test_file(PathBuf::from("a"), 1),
+                Entry::test_dir(PathBuf::from("a")),
+            )),
+            Action::Local(Change::Added(Entry::test_dir(PathBuf::from("a/b")))),
+            local_file("a/b/file", 3),
+            local_file("a/sibling", 2),
+            local_file("z", 2),
+        ];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(5, 20), staging_budget(5, 20)).unwrap();
+        assert_eq!(plan.waves[0].action_indices, vec![0, 1, 2, 3]);
+        assert_eq!(plan.waves[1].action_indices, vec![4]);
+    }
+
+    #[test]
+    fn staging_waves_inspect_both_identical_directory_forms() {
+        let actions = vec![
+            Action::Identical(
+                Change::Removed(Entry::test_file(PathBuf::from("a"), 1)),
+                Change::Removed(Entry::test_dir(PathBuf::from("a"))),
+            ),
+            removed_file("a/child", 0),
+            local_file("z", 2),
+        ];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(1, 10), staging_budget(1, 10)).unwrap();
+        assert_eq!(plan.waves[0].action_indices, vec![0, 1]);
+        assert_eq!(plan.waves[1].action_indices, vec![2]);
+
+        let replacement = Action::Identical(
+            Change::Removed(Entry::test_file(PathBuf::from("a"), 1)),
+            Change::Modified(
+                Entry::test_dir(PathBuf::from("a")),
+                Entry::test_file(PathBuf::from("a"), 2),
+            ),
+        );
+        assert!(plan_staging_waves(
+            &[replacement],
+            staging_budget(10, 10),
+            staging_budget(10, 10),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("directory-to-nondirectory"));
+    }
+
+    #[test]
+    fn staging_waves_split_independent_files_in_existing_directory() {
+        let actions = vec![local_file("dir/a", 6), local_file("dir/b", 6)];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(6, 20), staging_budget(6, 20)).unwrap();
+        assert_eq!(plan.waves[0].action_indices, vec![0]);
+        assert_eq!(plan.waves[1].action_indices, vec![1]);
+    }
+
+    #[test]
+    fn staging_waves_keep_bidirectional_directory_subtree_together() {
+        let actions = vec![
+            Action::Remote(Change::Added(Entry::test_dir(PathBuf::from("dir")))),
+            local_file("dir/from-remote", 5),
+            remote_file("dir/to-remote", 6),
+        ];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(5, 10), staging_budget(6, 10)).unwrap();
+        assert_eq!(plan.waves.len(), 1);
+        assert_eq!(plan.waves[0].action_indices, vec![0, 1, 2]);
+        assert_eq!(plan.waves[0].local_reconstructed_bytes, 5);
+        assert_eq!(plan.waves[0].remote_reconstructed_bytes, 6);
+    }
+
+    #[test]
+    fn staging_waves_count_only_reconstructed_regular_outputs() {
+        let old_file = Entry::test_file_with_size(PathBuf::from("a"), 9, 1);
+        let mut metadata_file = old_file.clone();
+        metadata_file.set_mode(0o100600);
+        let actions = vec![
+            Action::Local(Change::Modified(old_file, metadata_file)),
+            Action::Remote(Change::Removed(Entry::test_file_with_size(
+                PathBuf::from("b"),
+                20,
+                2,
+            ))),
+            Action::Identical(
+                Change::Added(Entry::test_file_with_size(PathBuf::from("c"), 30, 3)),
+                Change::Added(Entry::test_file_with_size(PathBuf::from("c"), 30, 3)),
+            ),
+        ];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(0, 0), staging_budget(0, 0)).unwrap();
+        assert_eq!(plan.waves.len(), 1);
+        assert_eq!(plan.waves[0].action_indices, vec![0, 1, 2]);
+        assert_eq!(plan.local_reconstructed_bytes, 0);
+        assert_eq!(plan.remote_reconstructed_bytes, 0);
+        assert_eq!(plan.local_staged_regular_outputs, 0);
+        assert_eq!(plan.remote_staged_regular_outputs, 0);
+    }
+
+    #[test]
+    fn staging_waves_use_full_reconstructed_sizes_for_modified_files() {
+        let actions = vec![
+            Action::Local(Change::Modified(
+                Entry::test_file_with_size(PathBuf::from("a"), 4, 1),
+                Entry::test_file_with_size(PathBuf::from("a"), 9, 2),
+            )),
+            Action::Remote(Change::Modified(
+                Entry::test_symlink(PathBuf::from("b"), PathBuf::from("target")),
+                Entry::test_file_with_size(PathBuf::from("b"), 11, 3),
+            )),
+        ];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(20, 20), staging_budget(20, 20)).unwrap();
+
+        assert_eq!(plan.local_reconstructed_bytes, 9);
+        assert_eq!(plan.remote_reconstructed_bytes, 11);
+        assert_eq!(plan.local_staged_regular_outputs, 1);
+        assert_eq!(plan.remote_staged_regular_outputs, 1);
+    }
+
+    #[test]
+    fn staging_waves_classify_resolved_directions_and_empty_outputs() {
+        let local_change = Change::Added(Entry::test_file_with_size(PathBuf::from("a"), 0, 0));
+        let remote_change = Change::Added(Entry::test_file_with_size(PathBuf::from("b"), 7, 7));
+        let actions = vec![
+            Action::ResolvedLocal((local_change.clone(), local_change.clone()), local_change),
+            Action::ResolvedRemote(
+                (remote_change.clone(), remote_change.clone()),
+                remote_change,
+            ),
+        ];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(7, 7), staging_budget(7, 7)).unwrap();
+        assert_eq!(plan.local_staged_regular_outputs, 1);
+        assert_eq!(plan.local_reconstructed_bytes, 0);
+        assert_eq!(plan.remote_staged_regular_outputs, 1);
+        assert_eq!(plan.remote_reconstructed_bytes, 7);
+    }
+
+    #[test]
+    fn staging_waves_keep_resolved_directory_history_with_descendants() {
+        let removed_dir = Change::Removed(Entry::test_dir(PathBuf::from("a")));
+        let resolved_file = Change::Added(Entry::test_file_with_size(PathBuf::from("a"), 11, 11));
+        let child_removed = Change::Removed(Entry::test_file(PathBuf::from("a/child"), 1));
+        let actions = vec![
+            Action::ResolvedLocal((removed_dir.clone(), removed_dir), resolved_file),
+            Action::Identical(child_removed.clone(), child_removed),
+            local_file("z", 1),
+        ];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(10, 20), staging_budget(10, 20)).unwrap();
+        assert_eq!(plan.waves[0].action_indices, vec![0, 1]);
+        assert!(plan.waves[0].local_exceeds_budget);
+        assert_eq!(plan.waves[1].action_indices, vec![2]);
+
+        let directory_to_file = Action::ResolvedRemote(
+            (
+                Change::Modified(
+                    Entry::test_dir(PathBuf::from("a")),
+                    Entry::test_file(PathBuf::from("a"), 2),
+                ),
+                Change::Removed(Entry::test_dir(PathBuf::from("a"))),
+            ),
+            Change::Added(Entry::test_file(PathBuf::from("a"), 2)),
+        );
+        assert!(plan_staging_waves(
+            &[directory_to_file],
+            staging_budget(10, 10),
+            staging_budget(10, 10),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("directory-to-nondirectory"));
+    }
+
+    #[test]
+    fn staging_waves_reject_invalid_action_sequences() {
+        let cases = [
+            vec![local_file("b", 1), local_file("a", 1)],
+            vec![local_file("a", 1), remote_file("a", 1)],
+            vec![Action::Conflict(
+                Change::Added(Entry::test_file(PathBuf::from("a"), 1)),
+                Change::Added(Entry::test_file(PathBuf::from("a"), 2)),
+            )],
+            vec![Action::Local(Change::Modified(
+                Entry::test_dir(PathBuf::from("a")),
+                Entry::test_symlink(PathBuf::from("a"), PathBuf::from("target")),
+            ))],
+        ];
+        let expected = [
+            "strictly increasing",
+            "strictly increasing",
+            "unresolved conflict",
+            "directory-to-nondirectory",
+        ];
+        for (actions, expected) in IntoIterator::into_iter(cases).zip(expected) {
+            let error = plan_staging_waves(
+                &actions,
+                staging_budget(u64::MAX, u64::MAX),
+                staging_budget(u64::MAX, u64::MAX),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{}", error);
+        }
+    }
+
+    #[test]
+    fn staging_waves_report_dependency_group_byte_overflow() {
+        let actions = vec![
+            Action::Local(Change::Added(Entry::test_dir(PathBuf::from("dir")))),
+            local_file("dir/a", u64::MAX),
+            local_file("dir/b", 1),
+        ];
+        let error = plan_staging_waves(
+            &actions,
+            staging_budget(u64::MAX, u64::MAX),
+            staging_budget(u64::MAX, u64::MAX),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("overflow"), "{}", error);
     }
 
     #[test]
