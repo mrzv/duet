@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added
+- Added the `staged-apply-v1` capability and append-only RPC methods for bilateral prepare, validation, commit, state save, and exact-attempt completion.
+- Added V2 apply recovery markers with durable prepare/commit phases and identity-checked, retry-safe cleanup of abandoned precommit staging.
+- Added subprocess SIGINT coverage for cancellation at the prepared barrier and deferred interruption after staged commit completes.
+
+### Changed
+- Changed supported streamed synchronization to reconstruct, verify, fsync, and seal every regular-file output before either side mutates synchronized targets, then validate both plans before crossing a shared commit fence.
+- Made the first Ctrl+C cooperatively abort before commit or defer through commit, state save, marker cleanup, and server shutdown after the fence; a second Ctrl+C still forces an immediate code-6 exit.
+- Kept legacy peers compatible by retaining their existing apply paths with an earlier non-cancellable boundary.
+- Switched SSH command execution to native multiplexing with a non-persistent control master and explicitly wait for local and remote server children during graceful shutdown.
+
+### Fixed
+- Fixed Ctrl+C only terminating the signal-handler thread while synchronization continued in the background.
+- Added validation checkpoints that detect prepared output identity or content changes before the fence and immediately before publication.
+- Prevented precommit cancellation from orphaning recovery markers or staging, including retries after partially completed cleanup.
+- Corrected commit and state-save recovery guidance to require tree and snapshot reconciliation instead of rerunning against stale state.
+
 ## 0.9.0 - 2026-07-28
 
 ### Added
