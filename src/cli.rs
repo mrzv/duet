@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use color_eyre::eyre::{eyre, Result};
 
 use crate::profile::ProfileSource;
+use crate::sync::{StagingPolicy, StagingReserve};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOptions {
@@ -16,6 +17,8 @@ pub struct SyncOptions {
     pub prune_ignored: bool,
     pub profile_performance: bool,
     pub profile_performance_json: Option<PathBuf>,
+    pub staging_policy: StagingPolicy,
+    pub staging_policy_explicit: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -85,7 +88,10 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
     let profile_file = pargs.opt_value_from_os_str("--profile-file", parse_path)?;
     let profile_performance_json =
         pargs.opt_value_from_os_str("--profile-performance-json", parse_path)?;
+    let staging_limit: Option<StagingLimit> = pargs.opt_value_from_str("--staging-limit")?;
+    let staging_reserve = pargs.opt_value_from_str("--staging-reserve")?;
 
+    let staging_policy_explicit = staging_limit.is_some() || staging_reserve.is_some();
     let options = SyncOptions {
         interactive: pargs.contains(["-i", "--interactive"]),
         yes: pargs.contains(["-y", "--yes"]),
@@ -97,6 +103,11 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         prune_ignored: pargs.contains("--prune-ignored"),
         profile_performance: pargs.contains("--profile-performance"),
         profile_performance_json,
+        staging_policy: StagingPolicy {
+            limit_bytes: staging_limit.map(|limit| limit.0),
+            reserve: staging_reserve.unwrap_or(StagingReserve::BasisPoints(500)),
+        },
+        staging_policy_explicit,
     };
 
     if let Some(profile_file) = profile_file {
@@ -191,6 +202,7 @@ fn reject_sync_options(options: &SyncOptions) -> Result<()> {
         || options.prune_ignored
         || options.profile_performance
         || options.profile_performance_json.is_some()
+        || options.staging_policy_explicit
     {
         Err(eyre!("sync options are not supported for this command"))
     } else {
@@ -208,6 +220,7 @@ fn reject_recover_options(options: &SyncOptions, clear: bool) -> Result<()> {
         || options.prune_ignored
         || options.profile_performance
         || options.profile_performance_json.is_some()
+        || options.staging_policy_explicit
         || (options.yes && !clear)
     {
         Err(eyre!(
@@ -253,6 +266,69 @@ fn parse_path(s: &std::ffi::OsStr) -> Result<PathBuf, &'static str> {
     Ok(s.into())
 }
 
+fn parse_size(value: &str) -> Result<u64, String> {
+    if value.is_empty() || value.trim() != value {
+        return Err("size must be a nonempty value without surrounding whitespace".to_string());
+    }
+    byte_unit::Byte::parse_str(value, true)
+        .map_err(|error| format!("invalid size: {error}"))?
+        .as_u64_checked()
+        .ok_or_else(|| "size exceeds the maximum supported value".to_string())
+}
+
+impl std::str::FromStr for StagingReserve {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let Some(percent) = value.strip_suffix('%') else {
+            return parse_size(value).map(StagingReserve::Bytes);
+        };
+        if percent.is_empty() || percent.trim() != percent {
+            return Err("percentage must be a number followed by %".to_string());
+        }
+        let split = percent.split_once('.');
+        let (whole, fraction) = split.unwrap_or((percent, ""));
+        if whole.is_empty()
+            || (split.is_some() && fraction.is_empty())
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || fraction.len() > 2
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err("percentage must have at most two decimal places".to_string());
+        }
+        let whole: u16 = whole
+            .parse()
+            .map_err(|_| "percentage is out of range".to_string())?;
+        let fraction: u16 = match fraction.len() {
+            0 => 0,
+            1 => fraction.parse::<u16>().unwrap() * 10,
+            _ => fraction.parse().unwrap(),
+        };
+        let basis_points = whole
+            .checked_mul(100)
+            .and_then(|value| value.checked_add(fraction))
+            .ok_or_else(|| "percentage is out of range".to_string())?;
+        if basis_points >= 10_000 {
+            return Err("percentage must be less than 100%".to_string());
+        }
+        Ok(StagingReserve::BasisPoints(basis_points))
+    }
+}
+
+struct StagingLimit(u64);
+
+impl std::str::FromStr for StagingLimit {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let bytes = parse_size(value)?;
+        if bytes == 0 {
+            return Err("size must be greater than zero".to_string());
+        }
+        Ok(Self(bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +361,8 @@ mod tests {
             prune_ignored: false,
             profile_performance: false,
             profile_performance_json: None,
+            staging_policy: StagingPolicy::default(),
+            staging_policy_explicit: false,
         }
     }
 
@@ -337,6 +415,8 @@ mod tests {
                     prune_ignored: true,
                     profile_performance: false,
                     profile_performance_json: None,
+                    staging_policy: StagingPolicy::default(),
+                    staging_policy_explicit: false,
                 },
             }
         );
@@ -360,6 +440,8 @@ mod tests {
                     prune_ignored: false,
                     profile_performance: false,
                     profile_performance_json: None,
+                    staging_policy: StagingPolicy::default(),
+                    staging_policy_explicit: false,
                 },
             }
         );
@@ -388,6 +470,8 @@ mod tests {
                     prune_ignored: false,
                     profile_performance: true,
                     profile_performance_json: Some(PathBuf::from("profile.json")),
+                    staging_policy: StagingPolicy::default(),
+                    staging_policy_explicit: false,
                 },
             }
         );
@@ -411,6 +495,8 @@ mod tests {
                     prune_ignored: false,
                     profile_performance: false,
                     profile_performance_json: None,
+                    staging_policy: StagingPolicy::default(),
+                    staging_policy_explicit: false,
                 },
             }
         );
@@ -421,6 +507,64 @@ mod tests {
                 path: Some(PathBuf::from("preflight")),
                 options: default_options(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_staging_policy() {
+        let command = parse_args(&[
+            "--staging-limit",
+            "1.5GiB",
+            "--staging-reserve",
+            "7.25%",
+            "work",
+        ]);
+        let Command::Sync { options, .. } = command else {
+            panic!("expected sync command");
+        };
+        assert_eq!(
+            options.staging_policy,
+            StagingPolicy {
+                limit_bytes: Some(1_610_612_736),
+                reserve: StagingReserve::BasisPoints(725),
+            }
+        );
+
+        let Command::Sync { options, .. } = parse_args(&["--staging-reserve", "250 MB", "work"])
+        else {
+            panic!("expected sync command");
+        };
+        assert_eq!(
+            options.staging_policy,
+            StagingPolicy {
+                limit_bytes: None,
+                reserve: StagingReserve::Bytes(250_000_000),
+            }
+        );
+        let Command::Sync { options, .. } = parse_args(&["work"]) else {
+            panic!("expected sync command");
+        };
+        assert_eq!(options.staging_policy, StagingPolicy::default());
+        assert!(!options.staging_policy_explicit);
+    }
+
+    #[test]
+    fn rejects_invalid_staging_policy() {
+        for value in ["0", "bogus", "auto", "unlimited", "18446744073709551616B"] {
+            let error = parse_args_error(&["--staging-limit", value, "work"]);
+            assert!(!error.is_empty(), "{} should be rejected", value);
+        }
+        for value in ["", "5.%", ".5%", "1.234%", "NaN%", "inf%", "100%", "101%"] {
+            let error = parse_args_error(&["--staging-reserve", value, "work"]);
+            assert!(!error.is_empty(), "{} should be rejected", value);
+        }
+        assert!(
+            parse_args_error(&["--staging-limit", "1GiB", "--staging-limit", "2GiB", "work",])
+                .contains("staging-limit")
+        );
+        assert!(
+            parse_args_error(&["--staging-reserve", "5%", "--staging-reserve", "6%", "work",])
+                .contains("staging-reserve")
         );
     }
 
@@ -506,6 +650,22 @@ mod tests {
         );
         assert!(parse_args_error(&["--help", "work"]).contains("unexpected argument"));
         assert!(parse_args_error(&["--dry-run", "_inspect", "state.bin"]).contains("sync options"));
+        assert!(
+            parse_args_error(&["--staging-limit", "1GiB", "_inspect", "state.bin"])
+                .contains("sync options")
+        );
+        assert!(
+            parse_args_error(&["--staging-reserve", "5GiB", "recover", "state.bin"])
+                .contains("only --clear")
+        );
+        assert!(
+            parse_args_error(&["--staging-reserve", "5%", "_inspect", "state.bin"])
+                .contains("sync options")
+        );
+        assert!(
+            parse_args_error(&["--staging-reserve", "5.00%", "recover", "state.bin"])
+                .contains("only --clear")
+        );
         assert!(
             parse_args_error(&["--yes", "recover", "state.bin"]).contains("--yes requires --clear")
         );

@@ -33,6 +33,10 @@ FLAGS:
                          print sync phase timings and transfer counters
         --profile-performance-json <file>
                          write sync phase timings and transfer counters as JSON
+        --staging-limit <size>
+                         cap one staging wave (for example, 4GiB); unlimited by default
+        --staging-reserve <size|percent>
+                         preserve free staging space on each host; defaults to 5%
 
         --profile-file <file>
                          read profile from a local file and keep state next to it

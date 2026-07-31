@@ -2329,6 +2329,7 @@ fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllRes
         prune_ignored: _,
         profile_performance: _,
         profile_performance_json: _,
+        ..
     } = options;
 
     if actions.is_empty() {

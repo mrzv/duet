@@ -41,6 +41,7 @@ pub(crate) const CAPABILITY_REMOVAL_BLOCKER_REPORT: &str = "removal-blocker-repo
 pub(crate) const CAPABILITY_CONTENT_DIGEST_BLAKE2B256: &str = "content-digest-blake2b256-v1";
 pub(crate) const CAPABILITY_COORDINATED_MARKER_CLEANUP: &str = "coordinated-marker-cleanup-v1";
 pub(crate) const CAPABILITY_STAGED_APPLY: &str = "staged-apply-v1";
+pub(crate) const CAPABILITY_STAGING_CAPACITY: &str = "staging-capacity-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -61,6 +62,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_CONTENT_DIGEST_BLAKE2B256,
     CAPABILITY_COORDINATED_MARKER_CLEANUP,
     CAPABILITY_STAGED_APPLY,
+    CAPABILITY_STAGING_CAPACITY,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -205,6 +207,7 @@ pub trait DuetServer {
     ) -> Result<(), RPCError>;
     fn complete_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError>;
     fn validate_staged_apply(&self, attempt_id: String) -> Result<(), RPCError>;
+    fn staging_filesystem_info(&self) -> Result<sync::StagingFilesystemInfo, RPCError>;
 }
 
 enum ApplyStream {
@@ -1382,6 +1385,23 @@ impl DuetServer for DuetServerImpl {
         self.staged_apply = None;
         Ok(())
     }
+
+    fn staging_filesystem_info(&self) -> Result<sync::StagingFilesystemInfo, RPCError> {
+        if self.base.as_os_str().is_empty() {
+            return Err(rpc_error(
+                "report staging filesystem capacity",
+                None,
+                "synchronization base is not initialized",
+            ));
+        }
+        sync::staging_filesystem_info(&self.base).map_err(|error| {
+            rpc_report_error(
+                "report staging filesystem capacity",
+                Some(&self.base),
+                error,
+            )
+        })
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -1571,6 +1591,7 @@ mod tests {
             .is_err());
         assert!(client.complete_staged_apply("attempt".to_string()).is_err());
         assert!(client.validate_staged_apply("attempt".to_string()).is_err());
+        assert!(client.staging_filesystem_info().is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -1603,6 +1624,7 @@ mod tests {
                 ("save_staged_state_pending", 42),
                 ("complete_staged_apply", 43),
                 ("validate_staged_apply", 44),
+                ("staging_filesystem_info", 45),
             ]
         );
     }
@@ -1642,8 +1664,31 @@ mod tests {
                 CAPABILITY_CONTENT_DIGEST_BLAKE2B256.to_string(),
                 CAPABILITY_COORDINATED_MARKER_CLEANUP.to_string(),
                 CAPABILITY_STAGED_APPLY.to_string(),
+                CAPABILITY_STAGING_CAPACITY.to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn staging_capacity_requires_an_initialized_base() {
+        let server = DuetServerImpl::new().unwrap();
+        let error = server.staging_filesystem_info().unwrap_err();
+
+        assert!(error.to_string().contains("base is not initialized"));
+    }
+
+    #[test]
+    fn staging_capacity_reports_the_server_base_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = DuetServerImpl::new().unwrap();
+        server
+            .set_base(dir.path().to_string_lossy().into_owned())
+            .unwrap();
+
+        let info = server.staging_filesystem_info().unwrap();
+        assert!(info.total_bytes > 0);
+        assert!(info.block_size > 0);
+        assert!(info.available_bytes <= info.total_bytes);
     }
 
     fn staged_server(dir: &tempfile::TempDir) -> DuetServerImpl {

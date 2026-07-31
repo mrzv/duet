@@ -1,6 +1,6 @@
 use super::scan::{Change, ContentDigest, DirEntryWithMeta as Entry};
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -19,6 +19,144 @@ use crate::scan::location::{Location, Locations};
 
 use crate::rustsync::{compare, compare_stream, restore_seek, signature, DeltaOp};
 pub use crate::rustsync::{Delta, Signature};
+
+#[allow(dead_code)]
+const STAGING_RESERVE_BASIS_POINTS: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum StagingReserve {
+    Bytes(u64),
+    BasisPoints(u16),
+}
+
+impl<'de> Deserialize<'de> for StagingReserve {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum WireReserve {
+            Bytes(u64),
+            BasisPoints(u16),
+        }
+
+        match WireReserve::deserialize(deserializer)? {
+            WireReserve::Bytes(bytes) => Ok(Self::Bytes(bytes)),
+            WireReserve::BasisPoints(basis_points) if basis_points < 10_000 => {
+                Ok(Self::BasisPoints(basis_points))
+            }
+            WireReserve::BasisPoints(_) => Err(serde::de::Error::custom(
+                "staging reserve percentage must be less than 100%",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingPolicy {
+    pub limit_bytes: Option<u64>,
+    pub reserve: StagingReserve,
+}
+
+impl Default for StagingPolicy {
+    fn default() -> Self {
+        Self {
+            limit_bytes: None,
+            reserve: StagingReserve::BasisPoints(500),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingFilesystemInfo {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub available_inodes: u64,
+    pub block_size: u64,
+    pub cow_clone_supported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct StagingBudget {
+    pub reserve_bytes: u64,
+    pub usable_bytes: u64,
+    pub budget_bytes: u64,
+}
+
+impl StagingPolicy {
+    #[allow(dead_code)]
+    pub fn budget(self, filesystem: StagingFilesystemInfo) -> StagingBudget {
+        let reserve_bytes = match self.reserve {
+            StagingReserve::Bytes(bytes) => bytes,
+            StagingReserve::BasisPoints(basis_points) => {
+                ((filesystem.total_bytes as u128 * basis_points as u128)
+                    / STAGING_RESERVE_BASIS_POINTS as u128) as u64
+            }
+        };
+        let usable_bytes = filesystem.available_bytes.saturating_sub(reserve_bytes);
+        let budget_bytes = self
+            .limit_bytes
+            .map_or(usable_bytes, |limit| limit.min(usable_bytes));
+        StagingBudget {
+            reserve_bytes,
+            usable_bytes,
+            budget_bytes,
+        }
+    }
+}
+
+pub fn staging_filesystem_info(base: &Path) -> Result<StagingFilesystemInfo> {
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(base)
+        .wrap_err_with(|| format!("open synchronization base {}", base.display()))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error())
+            .wrap_err_with(|| format!("read filesystem capacity for {}", base.display()));
+    }
+    let stats = unsafe { stats.assume_init() };
+    staging_filesystem_info_from_counts(
+        stats.f_blocks as u64,
+        stats.f_bavail as u64,
+        stats.f_favail as u64,
+        stats.f_frsize as u64,
+        stats.f_bsize as u64,
+        base,
+    )
+}
+
+fn staging_filesystem_info_from_counts(
+    blocks: u64,
+    available_blocks: u64,
+    available_inodes: u64,
+    fragment_size: u64,
+    block_size_fallback: u64,
+    base: &Path,
+) -> Result<StagingFilesystemInfo> {
+    let block_size = if fragment_size != 0 {
+        fragment_size
+    } else {
+        block_size_fallback
+    };
+    if block_size == 0 {
+        return Err(eyre!(
+            "filesystem capacity for {} reported a zero block size",
+            base.display()
+        ));
+    }
+
+    Ok(StagingFilesystemInfo {
+        total_bytes: blocks.saturating_mul(block_size),
+        available_bytes: available_blocks.saturating_mul(block_size),
+        available_inodes,
+        block_size,
+        // A trustworthy clone-capability check requires creating files on the target filesystem.
+        cow_clone_supported: false,
+    })
+}
 
 pub const LEGACY_SIGNATURE_WINDOW: usize = 1024;
 pub const DEFAULT_SIGNATURE_WINDOW_MIN: usize = LEGACY_SIGNATURE_WINDOW;
@@ -7669,6 +7807,117 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Condvar;
     use std::time::{Duration, Instant};
+
+    fn filesystem_info(total_bytes: u64, available_bytes: u64) -> StagingFilesystemInfo {
+        StagingFilesystemInfo {
+            total_bytes,
+            available_bytes,
+            available_inodes: 0,
+            block_size: 4096,
+            cow_clone_supported: false,
+        }
+    }
+
+    #[test]
+    fn staging_budget_applies_reserve_and_limit() {
+        assert_eq!(
+            StagingPolicy::default().budget(filesystem_info(1_000, 800)),
+            StagingBudget {
+                reserve_bytes: 50,
+                usable_bytes: 750,
+                budget_bytes: 750,
+            }
+        );
+        assert_eq!(
+            StagingPolicy {
+                limit_bytes: Some(200),
+                reserve: StagingReserve::Bytes(300),
+            }
+            .budget(filesystem_info(2_000, 1_000)),
+            StagingBudget {
+                reserve_bytes: 300,
+                usable_bytes: 700,
+                budget_bytes: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn staging_budget_saturates_at_boundaries() {
+        assert_eq!(
+            StagingPolicy {
+                limit_bytes: Some(u64::MAX),
+                reserve: StagingReserve::Bytes(u64::MAX),
+            }
+            .budget(filesystem_info(u64::MAX, u64::MAX - 1)),
+            StagingBudget {
+                reserve_bytes: u64::MAX,
+                usable_bytes: 0,
+                budget_bytes: 0,
+            }
+        );
+        assert_eq!(
+            StagingPolicy {
+                limit_bytes: None,
+                reserve: StagingReserve::BasisPoints(9_999),
+            }
+            .budget(filesystem_info(u64::MAX, u64::MAX)),
+            StagingBudget {
+                reserve_bytes: 18_444_899_399_302_180_659,
+                usable_bytes: 1_844_674_407_370_956,
+                budget_bytes: 1_844_674_407_370_956,
+            }
+        );
+    }
+
+    #[test]
+    fn staging_reserve_rejects_invalid_serialized_percentage() {
+        let error = serde_json::from_str::<StagingReserve>(r#"{"BasisPoints":10000}"#).unwrap_err();
+        assert!(error.to_string().contains("less than 100%"));
+
+        let reserve = StagingReserve::BasisPoints(725);
+        let encoded = bincode::serde::encode_to_vec(reserve, bincode::config::standard()).unwrap();
+        let (decoded, consumed): (StagingReserve, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, reserve);
+        assert_eq!(consumed, encoded.len());
+    }
+
+    #[test]
+    fn staging_filesystem_count_conversion_falls_back_and_saturates() {
+        let info =
+            staging_filesystem_info_from_counts(u64::MAX, u64::MAX, 17, 0, 4096, Path::new("base"))
+                .unwrap();
+        assert_eq!(info.block_size, 4096);
+        assert_eq!(info.total_bytes, u64::MAX);
+        assert_eq!(info.available_bytes, u64::MAX);
+        assert_eq!(info.available_inodes, 17);
+    }
+
+    #[test]
+    fn reports_staging_filesystem_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = staging_filesystem_info(dir.path()).unwrap();
+
+        assert!(info.block_size > 0);
+        assert!(info.total_bytes > 0);
+        assert!(info.available_bytes <= info.total_bytes);
+        assert!(!info.cow_clone_supported);
+    }
+
+    #[test]
+    fn reports_staging_capacity_through_symlink_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let target_info = staging_filesystem_info(&target).unwrap();
+        let link_info = staging_filesystem_info(&link).unwrap();
+        assert_eq!(link_info.block_size, target_info.block_size);
+        assert_eq!(link_info.total_bytes, target_info.total_bytes);
+    }
 
     fn test_file_entry(path: &str, contents: &[u8]) -> Entry {
         Entry::test_file_with_size(
