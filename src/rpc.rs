@@ -40,6 +40,7 @@ pub(crate) const CAPABILITY_PREFLIGHT_APPLY: &str = "preflight-apply-v1";
 pub(crate) const CAPABILITY_REMOVAL_BLOCKER_REPORT: &str = "removal-blocker-report-v1";
 pub(crate) const CAPABILITY_CONTENT_DIGEST_BLAKE2B256: &str = "content-digest-blake2b256-v1";
 pub(crate) const CAPABILITY_COORDINATED_MARKER_CLEANUP: &str = "coordinated-marker-cleanup-v1";
+pub(crate) const CAPABILITY_STAGED_APPLY: &str = "staged-apply-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -59,6 +60,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_REMOVAL_BLOCKER_REPORT,
     CAPABILITY_CONTENT_DIGEST_BLAKE2B256,
     CAPABILITY_COORDINATED_MARKER_CLEANUP,
+    CAPABILITY_STAGED_APPLY,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -188,6 +190,61 @@ pub trait DuetServer {
     fn save_state_v2(&self) -> Result<(), RPCError>;
     fn prepare_migration_v2(&mut self) -> Result<(), RPCError>;
     fn save_state_pending(&self, strong: bool) -> Result<(), RPCError>;
+    fn begin_staged_apply(&mut self, attempt_id: String) -> Result<ApplyStreamId, RPCError>;
+    fn finish_staged_prepare(
+        &mut self,
+        stream_id: ApplyStreamId,
+        attempt_id: String,
+    ) -> Result<sync::PreparedApplyReport, RPCError>;
+    fn abort_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError>;
+    fn commit_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError>;
+    fn save_staged_state_pending(
+        &mut self,
+        attempt_id: String,
+        strong: bool,
+    ) -> Result<(), RPCError>;
+    fn complete_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError>;
+    fn validate_staged_apply(&self, attempt_id: String) -> Result<(), RPCError>;
+}
+
+enum ApplyStream {
+    Legacy(sync::DetailApplier),
+    Staged(sync::DetailApplier),
+}
+
+impl ApplyStream {
+    fn applier_mut(&mut self) -> &mut sync::DetailApplier {
+        match self {
+            Self::Legacy(applier) | Self::Staged(applier) => applier,
+        }
+    }
+}
+
+enum StagedApplyState {
+    Preparing {
+        attempt_id: String,
+        state_path: PathBuf,
+        stream_id: Option<ApplyStreamId>,
+    },
+    Prepared {
+        attempt_id: String,
+        state_path: PathBuf,
+        prepared: sync::PreparedApply,
+    },
+    Committing {
+        attempt_id: String,
+        state_path: PathBuf,
+    },
+    Committed {
+        attempt_id: String,
+        state_path: PathBuf,
+        state_save_started: bool,
+        state_saved: bool,
+    },
+    Aborted {
+        attempt_id: String,
+        state_path: PathBuf,
+    },
 }
 
 struct DuetServerImpl {
@@ -203,7 +260,8 @@ struct DuetServerImpl {
     apply_options: sync::ApplyOptions,
     apply_attempt_id: Option<String>,
     detail_streams: HashMap<DetailStreamId, DetailProducer>,
-    apply_streams: HashMap<ApplyStreamId, sync::DetailApplier>,
+    apply_streams: HashMap<ApplyStreamId, ApplyStream>,
+    staged_apply: Option<StagedApplyState>,
     next_stream_id: u64,
     tuning: sync::SyncTuning,
     stream_performance: RemoteStreamProfile,
@@ -227,6 +285,7 @@ impl DuetServerImpl {
             apply_attempt_id: None,
             detail_streams: HashMap::new(),
             apply_streams: HashMap::new(),
+            staged_apply: None,
             next_stream_id: 1,
             tuning: sync::SyncTuning::legacy(),
             stream_performance: RemoteStreamProfile::default(),
@@ -266,7 +325,8 @@ impl DuetServerImpl {
         self.actions.clear();
         self.apply_attempt_id = None;
         self.detail_streams.clear();
-        self.apply_streams.clear();
+        self.apply_streams
+            .retain(|_, stream| matches!(stream, ApplyStream::Staged(_)));
         self.stream_performance = RemoteStreamProfile::default();
     }
 
@@ -336,7 +396,11 @@ impl DuetServerImpl {
                 if context.migration_needed {
                     crate::state::replace_scope(&mut self.all_old, &path, &context.current);
                 }
-                self.scan_policy = Some(sync::ScanPolicy::with_prune(locations, ignore, self.prune.clone()));
+                self.scan_policy = Some(sync::ScanPolicy::with_prune(
+                    locations,
+                    ignore,
+                    self.prune.clone(),
+                ));
                 self.current_scan = context.current.clone();
                 self.restrict = path.clone();
                 self.changes_ready = true;
@@ -346,7 +410,11 @@ impl DuetServerImpl {
                     migration_needed: context.migration_needed,
                 })
             }
-            Err(e) => Err(rpc_report_error("scan changes", Some(&self.base.join(path)), e)),
+            Err(e) => Err(rpc_report_error(
+                "scan changes",
+                Some(&self.base.join(path)),
+                e,
+            )),
         }
     }
 
@@ -358,8 +426,13 @@ impl DuetServerImpl {
         let remote_state = self.initialized_remote_state("set actions")?;
         sync::preflight_state_save(&remote_state)
             .map_err(|e| rpc_report_error("preflight state save", Some(&remote_state), e))?;
-        sync::preflight_apply_with_policy(&self.base, &actions, self.scan_policy.as_ref(), self.apply_options)
-            .map_err(|e| rpc_report_error("preflight apply", Some(&self.base), e))?;
+        sync::preflight_apply_with_policy(
+            &self.base,
+            &actions,
+            self.scan_policy.as_ref(),
+            self.apply_options,
+        )
+        .map_err(|e| rpc_report_error("preflight apply", Some(&self.base), e))?;
         self.actions = actions;
         self.actions_ready = true;
         self.stream_performance = RemoteStreamProfile::default();
@@ -401,10 +474,7 @@ fn clamp_rpc_limit(requested: u32, max: usize) -> usize {
 fn validate_locations(locations: &Locations) -> Result<(), Report> {
     for location in locations {
         sync::validate_scan_path(location.path()).wrap_err_with(|| {
-            format!(
-                "invalid scan location path {}",
-                location.path().display()
-            )
+            format!("invalid scan location path {}", location.path().display())
         })?;
     }
     Ok(())
@@ -482,7 +552,7 @@ impl DuetServer for DuetServerImpl {
             self.scan_policy.as_ref(),
             self.apply_options,
         )
-            .map_err(|e| rpc_report_error("preflight apply details", Some(&self.base), e))?;
+        .map_err(|e| rpc_report_error("preflight apply details", Some(&self.base), e))?;
         sync::start_apply_attempt(
             "remote",
             &remote_state,
@@ -592,7 +662,7 @@ impl DuetServer for DuetServerImpl {
             self.scan_policy.as_ref(),
             self.apply_options,
         )
-            .map_err(|e| rpc_report_error("preflight apply stream", Some(&self.base), e))?;
+        .map_err(|e| rpc_report_error("preflight apply stream", Some(&self.base), e))?;
         sync::start_apply_attempt(
             "remote",
             &remote_state,
@@ -610,7 +680,7 @@ impl DuetServer for DuetServerImpl {
             self.scan_policy.clone(),
             self.apply_options,
         );
-        self.apply_streams.insert(id, applier);
+        self.apply_streams.insert(id, ApplyStream::Legacy(applier));
         Ok(id)
     }
 
@@ -625,16 +695,29 @@ impl DuetServer for DuetServerImpl {
             .get_mut(&stream_id)
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
         applier
+            .applier_mut()
             .apply_frame(frame)
             .map_err(|e| rpc_report_error("apply detail stream", Some(&base), e))
     }
 
     fn finish_apply_stream(&mut self, stream_id: ApplyStreamId) -> Result<(), RPCError> {
         let start = Instant::now();
+        if matches!(
+            self.apply_streams.get(&stream_id),
+            Some(ApplyStream::Staged(_))
+        ) {
+            return Err(RPCError::new(
+                RPCErrorKind::Other,
+                "staged apply stream must use finish_staged_prepare",
+            ));
+        }
         let applier = self
             .apply_streams
             .remove(&stream_id)
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
+        let ApplyStream::Legacy(applier) = applier else {
+            unreachable!();
+        };
         self.all_old = applier
             .finish()
             .map_err(|e| rpc_report_error("finish apply stream", Some(&self.base), e))?;
@@ -698,6 +781,7 @@ impl DuetServer for DuetServerImpl {
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
         for frame in frames {
             applier
+                .applier_mut()
                 .apply_frame(frame)
                 .map_err(|e| rpc_report_error("apply detail stream", Some(&base), e))?;
         }
@@ -765,6 +849,7 @@ impl DuetServer for DuetServerImpl {
             .get_mut(&stream_id)
             .ok_or_else(|| RPCError::new(RPCErrorKind::Other, "apply stream does not exist"))?;
         applier
+            .applier_mut()
             .apply_file_byte_chunk(chunk)
             .map_err(|e| rpc_report_error("apply file byte stream", Some(&base), e))?;
         self.stream_performance.apply_frames_ms += duration_ms(start.elapsed());
@@ -931,8 +1016,371 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn save_state_pending(&self, strong: bool) -> Result<(), RPCError> {
-        let format = if strong { SnapshotFormat::V2 } else { SnapshotFormat::LegacyV1 };
+        let format = if strong {
+            SnapshotFormat::V2
+        } else {
+            SnapshotFormat::LegacyV1
+        };
         self.save_state_as(format, false)
+    }
+
+    fn begin_staged_apply(&mut self, attempt_id: String) -> Result<ApplyStreamId, RPCError> {
+        if attempt_id.is_empty() || attempt_id.contains(['\n', '\r']) {
+            return Err(rpc_error(
+                "begin staged apply",
+                None,
+                "staged apply attempt ID must be non-empty and single-line",
+            ));
+        }
+        let remote_state = self.initialized_remote_state("begin staged apply")?;
+        self.accepted_actions("begin staged apply")?;
+        if let Some(state) = &self.staged_apply {
+            if !matches!(state, StagedApplyState::Aborted { .. }) {
+                return Err(rpc_error(
+                    "begin staged apply",
+                    Some(&remote_state),
+                    "a staged apply attempt is already active",
+                ));
+            }
+        }
+        sync::validate_actions(&self.actions)
+            .map_err(|e| rpc_report_error("validate staged actions", Some(&self.base), e))?;
+        sync::preflight_apply_with_policy(
+            &self.base,
+            &self.actions,
+            self.scan_policy.as_ref(),
+            self.apply_options,
+        )
+        .map_err(|e| rpc_report_error("preflight staged apply", Some(&self.base), e))?;
+        sync::start_staged_apply_attempt(
+            "remote",
+            &remote_state,
+            &self.base,
+            &self.actions,
+            &attempt_id,
+        )
+        .map_err(|e| rpc_report_error("start staged apply", Some(&remote_state), e))?;
+
+        let id = self.next_apply_stream_id();
+        let applier = sync::DetailApplier::new_staged_with_attempt_and_policy(
+            self.base.clone(),
+            self.actions.clone(),
+            self.all_old.clone(),
+            remote_state.clone(),
+            attempt_id.clone(),
+            self.scan_policy.clone(),
+            self.apply_options,
+        );
+        self.apply_streams.insert(id, ApplyStream::Staged(applier));
+        self.staged_apply = Some(StagedApplyState::Preparing {
+            attempt_id,
+            state_path: remote_state,
+            stream_id: Some(id),
+        });
+        Ok(id)
+    }
+
+    fn finish_staged_prepare(
+        &mut self,
+        stream_id: ApplyStreamId,
+        attempt_id: String,
+    ) -> Result<sync::PreparedApplyReport, RPCError> {
+        let state_path = match &self.staged_apply {
+            Some(StagedApplyState::Preparing {
+                attempt_id: active_id,
+                state_path,
+                stream_id: Some(active_stream),
+            }) if active_id == &attempt_id && active_stream == &stream_id => state_path.clone(),
+            Some(StagedApplyState::Preparing {
+                attempt_id: active_id,
+                ..
+            }) => {
+                return Err(rpc_error(
+                    "finish staged prepare",
+                    None,
+                    format!(
+                        "staged apply attempt or stream mismatch; active attempt is {active_id}"
+                    ),
+                ));
+            }
+            _ => {
+                return Err(rpc_error(
+                    "finish staged prepare",
+                    None,
+                    "staged apply attempt is not preparing",
+                ));
+            }
+        };
+        let stream = self.apply_streams.remove(&stream_id).ok_or_else(|| {
+            rpc_error(
+                "finish staged prepare",
+                Some(&state_path),
+                "staged apply stream does not exist",
+            )
+        })?;
+        let ApplyStream::Staged(applier) = stream else {
+            self.apply_streams.insert(stream_id, stream);
+            return Err(rpc_error(
+                "finish staged prepare",
+                Some(&state_path),
+                "apply stream is not staged",
+            ));
+        };
+        self.staged_apply = Some(StagedApplyState::Preparing {
+            attempt_id: attempt_id.clone(),
+            state_path: state_path.clone(),
+            stream_id: None,
+        });
+        let prepared = applier
+            .finish_preparation()
+            .map_err(|e| rpc_report_error("finish staged preparation", Some(&state_path), e))?;
+        let report = prepared.report();
+        self.staged_apply = Some(StagedApplyState::Prepared {
+            attempt_id,
+            state_path,
+            prepared,
+        });
+        Ok(report)
+    }
+
+    fn abort_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError> {
+        let state = self.staged_apply.take().ok_or_else(|| {
+            rpc_error(
+                "abort staged apply",
+                None,
+                "no staged apply attempt is active",
+            )
+        })?;
+        match state {
+            StagedApplyState::Preparing {
+                attempt_id: active_id,
+                state_path,
+                stream_id,
+            } if active_id == attempt_id => {
+                if let Some(stream_id) = stream_id {
+                    self.apply_streams.remove(&stream_id);
+                }
+                if let Err(error) = sync::abort_staged_apply_attempt(&state_path, &attempt_id) {
+                    self.staged_apply = Some(StagedApplyState::Preparing {
+                        attempt_id,
+                        state_path: state_path.clone(),
+                        stream_id: None,
+                    });
+                    return Err(rpc_report_error(
+                        "abort staged apply",
+                        Some(&state_path),
+                        error,
+                    ));
+                }
+                self.staged_apply = Some(StagedApplyState::Aborted {
+                    attempt_id,
+                    state_path,
+                });
+                Ok(())
+            }
+            StagedApplyState::Prepared {
+                attempt_id: active_id,
+                state_path,
+                prepared,
+            } if active_id == attempt_id => {
+                if let Err(error) = prepared.abort() {
+                    self.staged_apply = Some(StagedApplyState::Preparing {
+                        attempt_id,
+                        state_path: state_path.clone(),
+                        stream_id: None,
+                    });
+                    return Err(rpc_report_error(
+                        "abort staged apply",
+                        Some(&state_path),
+                        error,
+                    ));
+                }
+                self.staged_apply = Some(StagedApplyState::Aborted {
+                    attempt_id,
+                    state_path,
+                });
+                Ok(())
+            }
+            StagedApplyState::Aborted {
+                attempt_id: active_id,
+                state_path,
+            } if active_id == attempt_id => {
+                let marker = sync::describe_apply_attempt(&state_path).map_err(|e| {
+                    rpc_report_error("check aborted staged apply", Some(&state_path), e)
+                })?;
+                self.staged_apply = Some(StagedApplyState::Aborted {
+                    attempt_id,
+                    state_path: state_path.clone(),
+                });
+                if marker.is_some() {
+                    Err(rpc_error(
+                        "abort staged apply",
+                        Some(&state_path),
+                        "aborted staged apply still has a recovery marker",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            StagedApplyState::Committing {
+                attempt_id: active_id,
+                state_path,
+            } => {
+                self.staged_apply = Some(StagedApplyState::Committing {
+                    attempt_id: active_id,
+                    state_path: state_path.clone(),
+                });
+                Err(rpc_error(
+                    "abort staged apply",
+                    Some(&state_path),
+                    "cannot abort a staged apply after commit starts",
+                ))
+            }
+            other => {
+                self.staged_apply = Some(other);
+                Err(rpc_error(
+                    "abort staged apply",
+                    None,
+                    "staged apply attempt ID mismatch or commit has started",
+                ))
+            }
+        }
+    }
+
+    fn commit_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError> {
+        let state = self.staged_apply.take().ok_or_else(|| {
+            rpc_error(
+                "commit staged apply",
+                None,
+                "no staged apply attempt is active",
+            )
+        })?;
+        let (state_path, prepared) = match state {
+            StagedApplyState::Prepared {
+                attempt_id: active_id,
+                state_path,
+                prepared,
+            } if active_id == attempt_id => (state_path, prepared),
+            other => {
+                self.staged_apply = Some(other);
+                return Err(rpc_error(
+                    "commit staged apply",
+                    None,
+                    "staged apply attempt ID mismatch or attempt is not prepared",
+                ));
+            }
+        };
+        self.staged_apply = Some(StagedApplyState::Committing {
+            attempt_id: attempt_id.clone(),
+            state_path: state_path.clone(),
+        });
+        match prepared.commit() {
+            Ok(all_old) => {
+                self.all_old = all_old;
+                self.staged_apply = Some(StagedApplyState::Committed {
+                    attempt_id,
+                    state_path,
+                    state_save_started: false,
+                    state_saved: false,
+                });
+                Ok(())
+            }
+            Err(error) => Err(rpc_report_error(
+                "commit staged apply",
+                Some(&state_path),
+                error,
+            )),
+        }
+    }
+
+    fn validate_staged_apply(&self, attempt_id: String) -> Result<(), RPCError> {
+        let (state_path, prepared) = match &self.staged_apply {
+            Some(StagedApplyState::Prepared {
+                attempt_id: active_id,
+                state_path,
+                prepared,
+            }) if active_id == &attempt_id => (state_path, prepared),
+            _ => {
+                return Err(rpc_error(
+                    "validate staged apply",
+                    None,
+                    "staged apply attempt ID mismatch or attempt is not prepared",
+                ));
+            }
+        };
+        prepared
+            .validate_commit()
+            .map_err(|e| rpc_report_error("validate staged apply", Some(state_path), e))
+    }
+
+    fn save_staged_state_pending(
+        &mut self,
+        attempt_id: String,
+        strong: bool,
+    ) -> Result<(), RPCError> {
+        let (state_path, state_save_started, state_saved) = match &self.staged_apply {
+            Some(StagedApplyState::Committed {
+                attempt_id: active_id,
+                state_path,
+                state_save_started,
+                state_saved,
+            }) if active_id == &attempt_id => {
+                (state_path.clone(), *state_save_started, *state_saved)
+            }
+            _ => {
+                return Err(rpc_error(
+                    "save staged state",
+                    None,
+                    "staged apply attempt ID mismatch or attempt is not committed",
+                ));
+            }
+        };
+        if state_saved {
+            return Ok(());
+        }
+        if !state_save_started {
+            sync::mark_staged_apply_attempt_state_save(&state_path, &attempt_id)
+                .map_err(|e| rpc_report_error("mark staged state save", Some(&state_path), e))?;
+            if let Some(StagedApplyState::Committed {
+                state_save_started, ..
+            }) = &mut self.staged_apply
+            {
+                *state_save_started = true;
+            }
+        }
+        let format = if strong {
+            SnapshotFormat::V2
+        } else {
+            SnapshotFormat::LegacyV1
+        };
+        crate::state::save_entries_as(&state_path, &self.all_old, format)
+            .map_err(|e| rpc_report_error("save staged state", Some(&state_path), e))?;
+        if let Some(StagedApplyState::Committed { state_saved, .. }) = &mut self.staged_apply {
+            *state_saved = true;
+        }
+        Ok(())
+    }
+
+    fn complete_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError> {
+        let state_path = match &self.staged_apply {
+            Some(StagedApplyState::Committed {
+                attempt_id: active_id,
+                state_path,
+                state_saved: true,
+                ..
+            }) if active_id == &attempt_id => state_path.clone(),
+            _ => {
+                return Err(rpc_error(
+                    "complete staged apply",
+                    None,
+                    "staged apply attempt ID mismatch or state save is incomplete",
+                ));
+            }
+        };
+        sync::finish_staged_apply_attempt(&state_path, &attempt_id)
+            .map_err(|e| rpc_report_error("complete staged apply", Some(&state_path), e))?;
+        self.staged_apply = None;
+        Ok(())
     }
 }
 
@@ -1096,14 +1544,33 @@ mod tests {
         assert!(client
             .removal_blocker_report(Vec::new(), sync::ApplyOptions::default())
             .is_err());
-        assert!(client.changes_v2(PathBuf::new(), Vec::new(), Vec::new(), "id".into()).is_err());
+        assert!(client
+            .changes_v2(PathBuf::new(), Vec::new(), Vec::new(), "id".into())
+            .is_err());
         assert!(client.set_actions_v2(Vec::new()).is_err());
-        assert!(client.preflight_apply_report_v2(Vec::new(), sync::ApplyOptions::default()).is_err());
-        assert!(client.preflight_apply_v2(Vec::new(), sync::ApplyOptions::default()).is_err());
-        assert!(client.removal_blocker_report_v2(Vec::new(), sync::ApplyOptions::default()).is_err());
+        assert!(client
+            .preflight_apply_report_v2(Vec::new(), sync::ApplyOptions::default())
+            .is_err());
+        assert!(client
+            .preflight_apply_v2(Vec::new(), sync::ApplyOptions::default())
+            .is_err());
+        assert!(client
+            .removal_blocker_report_v2(Vec::new(), sync::ApplyOptions::default())
+            .is_err());
         assert!(client.save_state_v2().is_err());
         assert!(client.prepare_migration_v2().is_err());
         assert!(client.save_state_pending(true).is_err());
+        assert!(client.begin_staged_apply("attempt".to_string()).is_err());
+        assert!(client
+            .finish_staged_prepare(ApplyStreamId(1), "attempt".to_string())
+            .is_err());
+        assert!(client.abort_staged_apply("attempt".to_string()).is_err());
+        assert!(client.commit_staged_apply("attempt".to_string()).is_err());
+        assert!(client
+            .save_staged_state_pending("attempt".to_string(), true)
+            .is_err());
+        assert!(client.complete_staged_apply("attempt".to_string()).is_err());
+        assert!(client.validate_staged_apply("attempt".to_string()).is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -1129,6 +1596,13 @@ mod tests {
                 ("save_state_v2", 35),
                 ("prepare_migration_v2", 36),
                 ("save_state_pending", 37),
+                ("begin_staged_apply", 38),
+                ("finish_staged_prepare", 39),
+                ("abort_staged_apply", 40),
+                ("commit_staged_apply", 41),
+                ("save_staged_state_pending", 42),
+                ("complete_staged_apply", 43),
+                ("validate_staged_apply", 44),
             ]
         );
     }
@@ -1167,8 +1641,167 @@ mod tests {
                 CAPABILITY_REMOVAL_BLOCKER_REPORT.to_string(),
                 CAPABILITY_CONTENT_DIGEST_BLAKE2B256.to_string(),
                 CAPABILITY_COORDINATED_MARKER_CLEANUP.to_string(),
+                CAPABILITY_STAGED_APPLY.to_string(),
             ]
         );
+    }
+
+    fn staged_server(dir: &tempfile::TempDir) -> DuetServerImpl {
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let mut server = DuetServerImpl::new().unwrap();
+        server.base = base;
+        server.remote_id = "peer".to_string();
+        server.remote_state_dir = dir.path().join("state");
+        server.changes_ready = true;
+        server.actions_ready = true;
+        server
+    }
+
+    #[test]
+    fn staged_prepare_rejects_wrong_ids_and_does_not_mutate_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = staged_server(&dir);
+        std::fs::write(server.base.join("sentinel"), b"unchanged").unwrap();
+
+        assert!(server.begin_staged_apply(String::new()).is_err());
+        let stream = server.begin_staged_apply("attempt-1".to_string()).unwrap();
+        assert!(server
+            .finish_staged_prepare(stream, "wrong-attempt".to_string())
+            .is_err());
+        assert!(server
+            .abort_staged_apply("wrong-attempt".to_string())
+            .is_err());
+        let report = server
+            .finish_staged_prepare(stream, "attempt-1".to_string())
+            .unwrap();
+
+        assert_eq!(report.action_count, 0);
+        assert!(server
+            .validate_staged_apply("wrong-attempt".to_string())
+            .is_err());
+        server
+            .validate_staged_apply("attempt-1".to_string())
+            .unwrap();
+        assert_eq!(
+            std::fs::read(server.base.join("sentinel")).unwrap(),
+            b"unchanged"
+        );
+        let state = server.remote_state_for_id("peer").unwrap();
+        let marker = sync::describe_apply_attempt(&state).unwrap().unwrap();
+        assert!(marker.contains("phase: prepared"), "{}", marker);
+    }
+
+    #[test]
+    fn staged_abort_cleans_marker_and_is_safely_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = staged_server(&dir);
+        let contents = b"staged payload";
+        let checksum = adler32::adler32(&contents[..]).unwrap();
+        server.actions = vec![Action::Local(Change::Added(
+            scan::DirEntryWithMeta::test_file_with_size(
+                PathBuf::from("staged.txt"),
+                contents.len() as u64,
+                checksum,
+            ),
+        ))];
+        let stream = server.begin_staged_apply("attempt-1".to_string()).unwrap();
+        server
+            .apply_detail_chunk(
+                stream,
+                DetailFrame {
+                    action_index: 0,
+                    payload: sync::DetailPayload::FileBegin,
+                },
+            )
+            .unwrap();
+        server
+            .apply_file_byte_chunk(stream, sync::FileByteChunk::new(0, contents.to_vec()))
+            .unwrap();
+        server
+            .apply_detail_chunks(
+                stream,
+                vec![DetailFrame {
+                    action_index: 0,
+                    payload: sync::DetailPayload::FileEnd,
+                }],
+            )
+            .unwrap();
+        server
+            .finish_staged_prepare(stream, "attempt-1".to_string())
+            .unwrap();
+        let state = server.remote_state_for_id("peer").unwrap();
+        assert!(!server.base.join("staged.txt").exists());
+        assert!(std::fs::read_dir(&server.base).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".duet-stage-")));
+
+        std::fs::write(server.base.join("staged.txt"), b"race").unwrap();
+        assert!(server
+            .validate_staged_apply("attempt-1".to_string())
+            .is_err());
+        std::fs::remove_file(server.base.join("staged.txt")).unwrap();
+        server
+            .validate_staged_apply("attempt-1".to_string())
+            .unwrap();
+
+        server.abort_staged_apply("attempt-1".to_string()).unwrap();
+        assert!(sync::describe_apply_attempt(&state).unwrap().is_none());
+        assert!(!std::fs::read_dir(&server.base).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".duet-stage-")));
+        server.abort_staged_apply("attempt-1".to_string()).unwrap();
+        assert!(server
+            .abort_staged_apply("wrong-attempt".to_string())
+            .is_err());
+    }
+
+    #[test]
+    fn staged_commit_saves_state_and_requires_completion_preconditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = staged_server(&dir);
+        let retained = scan::DirEntryWithMeta::test_file(PathBuf::from("retained"), 7);
+        server.all_old = vec![retained.clone()];
+        let stream = server.begin_staged_apply("attempt-1".to_string()).unwrap();
+        server
+            .finish_staged_prepare(stream, "attempt-1".to_string())
+            .unwrap();
+        server.reset_actions_context();
+        server.all_old.clear();
+
+        assert!(server
+            .commit_staged_apply("wrong-attempt".to_string())
+            .is_err());
+        server.commit_staged_apply("attempt-1".to_string()).unwrap();
+        assert_eq!(server.all_old, vec![retained]);
+        assert!(server.abort_staged_apply("attempt-1".to_string()).is_err());
+        assert!(server
+            .complete_staged_apply("attempt-1".to_string())
+            .is_err());
+
+        server
+            .save_staged_state_pending("attempt-1".to_string(), true)
+            .unwrap();
+        let state = server.remote_state_for_id("peer").unwrap();
+        assert!(sync::describe_apply_attempt(&state).unwrap().is_some());
+        assert_eq!(
+            crate::state::load_entries_with_format(&state)
+                .unwrap()
+                .format,
+            SnapshotFormat::V2
+        );
+        assert!(server
+            .complete_staged_apply("wrong-attempt".to_string())
+            .is_err());
+        server
+            .complete_staged_apply("attempt-1".to_string())
+            .unwrap();
+        assert!(sync::describe_apply_attempt(&state).unwrap().is_none());
+        assert!(server.staged_apply.is_none());
     }
 
     #[test]
@@ -1191,9 +1824,15 @@ mod tests {
             .describe_apply_attempt("remote-peer".to_string())
             .unwrap()
             .unwrap();
-        assert!(description.contains(&state.display().to_string()), "{}", description);
+        assert!(
+            description.contains(&state.display().to_string()),
+            "{}",
+            description
+        );
 
-        server.clear_apply_attempt("remote-peer".to_string()).unwrap();
+        server
+            .clear_apply_attempt("remote-peer".to_string())
+            .unwrap();
 
         assert!(!marker.exists());
     }
@@ -1266,7 +1905,12 @@ mod tests {
         server.save_state_pending(true).unwrap();
 
         assert!(marker.exists());
-        assert_eq!(crate::state::load_entries_with_format(&remote_state).unwrap().format, SnapshotFormat::V2);
+        assert_eq!(
+            crate::state::load_entries_with_format(&remote_state)
+                .unwrap()
+                .format,
+            SnapshotFormat::V2
+        );
         server.clear_apply_attempt("peer".to_string()).unwrap();
         assert!(!marker.exists());
     }
@@ -1320,7 +1964,10 @@ mod tests {
         let actions = vec![Action::Local(Change::Added(
             scan::DirEntryWithMeta::test_file(PathBuf::from("a.txt"), 0),
         ))];
-        let error = server.set_actions(actions::to_legacy(actions)).unwrap_err().to_string();
+        let error = server
+            .set_actions(actions::to_legacy(actions))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("changes must be requested"), "{}", error);
         assert!(server.actions.is_empty());
 
@@ -1331,7 +1978,10 @@ mod tests {
         assert!(error.contains("changes must be requested"), "{}", error);
         assert!(server.apply_attempt_id.is_none());
 
-        let error = server.apply_detailed_changes(Vec::new()).unwrap_err().to_string();
+        let error = server
+            .apply_detailed_changes(Vec::new())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("changes must be requested"), "{}", error);
 
         let error = server.begin_apply_stream().unwrap_err().to_string();
@@ -1358,7 +2008,9 @@ mod tests {
             scan::DirEntryWithMeta::test_file(PathBuf::from("a.txt"), 0),
         ))];
 
-        server.set_base(other_base.to_string_lossy().into()).unwrap();
+        server
+            .set_base(other_base.to_string_lossy().into())
+            .unwrap();
 
         assert!(!server.changes_ready);
         assert!(!server.actions_ready);
@@ -1371,7 +2023,9 @@ mod tests {
             scan::DirEntryWithMeta::test_file(PathBuf::from("b.txt"), 0),
         ))];
 
-        server.set_remote_state_dir(dir.path().join("state")).unwrap();
+        server
+            .set_remote_state_dir(dir.path().join("state"))
+            .unwrap();
 
         assert!(!server.changes_ready);
         assert!(!server.actions_ready);
@@ -1391,7 +2045,10 @@ mod tests {
         server.changes_ready = true;
         server.remote_state_dir = dir.path().join("state");
 
-        let error = server.apply_detailed_changes(Vec::new()).unwrap_err().to_string();
+        let error = server
+            .apply_detailed_changes(Vec::new())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("actions must be set"), "{}", error);
 
         let error = server.begin_apply_stream().unwrap_err().to_string();

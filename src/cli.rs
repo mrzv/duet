@@ -21,7 +21,9 @@ pub struct SyncOptions {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
-    Version { verbose: bool },
+    Version {
+        verbose: bool,
+    },
     License,
     Server,
     Snapshot {
@@ -102,8 +104,7 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         let path_is_recover = path
             .as_deref()
             .map(|path| {
-                path == std::path::Path::new("recover")
-                    || path == std::path::Path::new("_recover")
+                path == std::path::Path::new("recover") || path == std::path::Path::new("_recover")
             })
             .unwrap_or(false);
         if path_is_recover {
@@ -222,7 +223,10 @@ fn ensure_no_args(pargs: pico_args::Arguments) -> Result<()> {
     if remaining.is_empty() {
         Ok(())
     } else {
-        Err(eyre!("unexpected argument: {}", remaining[0].to_string_lossy()))
+        Err(eyre!(
+            "unexpected argument: {}",
+            remaining[0].to_string_lossy()
+        ))
     }
 }
 
@@ -496,23 +500,31 @@ mod tests {
     fn rejects_unknown_flags_and_extra_arguments() {
         assert!(parse_args_error(&["--dryrun", "work"]).contains("unexpected argument"));
         assert!(parse_args_error(&["work", "path1", "path2"]).contains("unexpected argument"));
-        assert!(parse_args_error(&["--profile-file", "profile.prf", "path1", "path2"])
-            .contains("unexpected argument"));
-        assert!(parse_args_error(&["--help", "work"]).contains("unexpected argument"));
-        assert!(parse_args_error(&["--dry-run", "_inspect", "state.bin"])
-            .contains("sync options"));
         assert!(
-            parse_args_error(&["--yes", "recover", "state.bin"])
-                .contains("--yes requires --clear")
+            parse_args_error(&["--profile-file", "profile.prf", "path1", "path2"])
+                .contains("unexpected argument")
         );
-        assert!(parse_args_error(&["recover", "--profile-file", "profile.prf"])
-            .contains("recover is a subcommand"));
-        assert!(parse_args_error(&["recover", "--profile-file", "profile.prf", "state.bin"])
-            .contains("recover is a subcommand"));
-        assert!(parse_args_error(&["_recover", "--profile-file", "profile.prf"])
-            .contains("recover is a subcommand"));
-        assert!(parse_args_error(&["--profile-file", "profile.prf", "_recover"])
-            .contains("recover is a subcommand"));
+        assert!(parse_args_error(&["--help", "work"]).contains("unexpected argument"));
+        assert!(parse_args_error(&["--dry-run", "_inspect", "state.bin"]).contains("sync options"));
+        assert!(
+            parse_args_error(&["--yes", "recover", "state.bin"]).contains("--yes requires --clear")
+        );
+        assert!(
+            parse_args_error(&["recover", "--profile-file", "profile.prf"])
+                .contains("recover is a subcommand")
+        );
+        assert!(
+            parse_args_error(&["recover", "--profile-file", "profile.prf", "state.bin"])
+                .contains("recover is a subcommand")
+        );
+        assert!(
+            parse_args_error(&["_recover", "--profile-file", "profile.prf"])
+                .contains("recover is a subcommand")
+        );
+        assert!(
+            parse_args_error(&["--profile-file", "profile.prf", "_recover"])
+                .contains("recover is a subcommand")
+        );
         assert!(parse_args_error(&["preflight", "work", "path1", "path2"])
             .contains("unexpected argument"));
     }

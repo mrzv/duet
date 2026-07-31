@@ -344,7 +344,10 @@ impl DirEntryWithMeta {
             .metadata()
             .wrap_err_with(|| format!("unable to re-read metadata for {}", filename.display()))?;
         if HashSourceIdentity::from(&before) != HashSourceIdentity::from(&after) {
-            return Err(eyre!("file changed while computing checksum: {}", filename.display()));
+            return Err(eyre!(
+                "file changed while computing checksum: {}",
+                filename.display()
+            ));
         }
         self.checksum = hash.hash();
         let digest = strong.finalize();
@@ -386,11 +389,18 @@ fn open_hash_source(base: &Path, relative: &Path) -> Result<std::fs::File> {
         let last = components.peek().is_none();
         let flags = libc::O_CLOEXEC
             | libc::O_NOFOLLOW
-            | if last { libc::O_RDONLY } else { libc::O_RDONLY | libc::O_DIRECTORY };
+            | if last {
+                libc::O_RDONLY
+            } else {
+                libc::O_RDONLY | libc::O_DIRECTORY
+            };
         let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).wrap_err_with(|| {
-                format!("unable to open checksum path component in {}", relative.display())
+                format!(
+                    "unable to open checksum path component in {}",
+                    relative.display()
+                )
             });
         }
         let opened = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -525,7 +535,11 @@ async fn scan_one_directory(context: Arc<ScanContext>, job: ScanJob) -> Result<V
 
     // check the restriction
     if !path.starts_with(&*context.restrict) && !context.restrict.starts_with(&path) {
-        log::trace!("Skipping (restriction): {:?} vs {:?}", path, context.restrict);
+        log::trace!(
+            "Skipping (restriction): {:?} vs {:?}",
+            path,
+            context.restrict
+        );
         return Ok(Vec::new());
     }
 
@@ -940,7 +954,9 @@ mod tests {
         let error = changed
             .compute_content_hashes(temp.path(), 1024, || false)
             .unwrap_err();
-        assert!(error.to_string().contains("changed between scan and checksum"));
+        assert!(error
+            .to_string()
+            .contains("changed between scan and checksum"));
         assert_eq!(changed.digest(), None);
 
         std::fs::remove_file(&path).unwrap();
@@ -984,8 +1000,14 @@ mod tests {
         );
         let a = [10, 10, 10, 10];
         let b = [11, 9, 9, 11];
-        assert_eq!(adler32::adler32(&a[..]).unwrap(), adler32::adler32(&b[..]).unwrap());
-        assert_ne!(crate::sync::content_digest(&a), crate::sync::content_digest(&b));
+        assert_eq!(
+            adler32::adler32(&a[..]).unwrap(),
+            adler32::adler32(&b[..]).unwrap()
+        );
+        assert_ne!(
+            crate::sync::content_digest(&a),
+            crate::sync::content_digest(&b)
+        );
     }
 
     #[test]

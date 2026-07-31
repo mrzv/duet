@@ -1,5 +1,7 @@
+#[cfg(unix)]
+use std::convert::TryFrom;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use essrpc::transports::BincodeAsyncClientTransport;
@@ -45,6 +47,29 @@ pub(crate) enum Server<'a> {
     Remote(RemoteChild<'a>),
 }
 
+impl Server<'_> {
+    #[cfg(unix)]
+    pub(crate) fn local_process_group(&self) -> Option<i32> {
+        match self {
+            Server::Local(server) => server.id().and_then(|id| i32::try_from(id).ok()),
+            Server::Remote(_) => None,
+        }
+    }
+
+    pub(crate) async fn wait(self) -> Result<ExitStatus> {
+        match self {
+            Server::Local(mut server) => server
+                .wait()
+                .await
+                .wrap_err("failed to wait for local duet server"),
+            Server::Remote(server) => server
+                .wait()
+                .await
+                .wrap_err("failed to wait for remote duet server over SSH"),
+        }
+    }
+}
+
 pub(crate) async fn launch_server<'a>(
     session: &'a Option<Session>,
     cmd: String,
@@ -69,20 +94,23 @@ pub(crate) async fn launch_server<'a>(
             .map_err(|e| eyre!("failed to expand local server command {}: {}", cmd, e))?
             .to_string_lossy()
             .to_string();
-        let server = TokioCommand::new(&cmd)
+        let mut command = TokioCommand::new(&cmd);
+        command
             .arg("--server")
             .env(crate::rpc::SERVER_LOG_ENV, server_log)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to launch local duet server `{}`; server log: {}",
-                    cmd,
-                    server_log.display()
-                )
-            })?;
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let server = command.spawn().wrap_err_with(|| {
+            format!(
+                "failed to launch local duet server `{}`; server log: {}",
+                cmd,
+                server_log.display()
+            )
+        })?;
 
         log::trace!("launched local server");
 
@@ -181,5 +209,36 @@ mod tests {
             .to_string();
 
         assert!(error.contains("ssh <server>"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_server_has_its_own_process_group_and_can_be_waited_on() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut command = tempfile::NamedTempFile::new().unwrap();
+        command
+            .write_all(b"#!/bin/sh\nread ignored || true\n")
+            .unwrap();
+        command.flush().unwrap();
+        command
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let command = command.path().to_string_lossy().to_string();
+        let mut server = launch_server(&None, command, Path::new("/dev/null"))
+            .await
+            .unwrap();
+
+        let child_pid = match &mut server {
+            Server::Local(child) => child.id().unwrap() as libc::pid_t,
+            Server::Remote(_) => unreachable!(),
+        };
+        assert_eq!(unsafe { libc::getpgid(child_pid) }, child_pid);
+        assert_ne!(unsafe { libc::getpgrp() }, child_pid);
+
+        let status = server.wait().await.unwrap();
+        assert!(status.success());
     }
 }

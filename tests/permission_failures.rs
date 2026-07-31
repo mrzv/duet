@@ -58,12 +58,16 @@ impl SyncCase {
     }
 
     fn sync_child(&self) -> Child {
+        self.sync_child_with_pause("DUET_TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS")
+    }
+
+    fn sync_child_with_pause(&self, variable: &str) -> Child {
         Command::new(duet_bin())
             .arg("--profile-file")
             .arg(&self.profile)
             .arg("-b")
             .env("NO_COLOR", "1")
-            .env("DUET_TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS", "500")
+            .env(variable, "30000")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -152,6 +156,59 @@ fn wait_for_path_while_child_runs(path: &Path, child: &mut Child) {
     panic!("timed out waiting for {}", path.display());
 }
 
+fn wait_for_marker_phase_while_child_runs(path: &Path, phase: &str, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if fs::read_to_string(path)
+            .map(|contents| contents.contains(&format!("phase: {phase}")))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "child exited with {} before {} reached phase {}",
+                status,
+                path.display(),
+                phase
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "timed out waiting for {} to reach phase {}",
+        path.display(),
+        phase
+    );
+}
+
+fn send_sigint(child: &Child) {
+    let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    assert_eq!(
+        result,
+        0,
+        "failed to send SIGINT: {}",
+        io::Error::last_os_error()
+    );
+}
+
+fn assert_no_staging_directory(path: &Path) {
+    let staged = fs::read_dir(path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".duet-stage-")
+        });
+    assert!(
+        !staged,
+        "unexpected staging directory under {}",
+        path.display()
+    );
+}
+
 struct PermissionGuard {
     path: PathBuf,
     mode: u32,
@@ -213,7 +270,11 @@ fn assert_permission_denied(result: io::Result<()>, path: &Path, operation: &str
 
 #[test]
 fn local_added_file_modes_propagate_to_remote() {
-    let files = [("private.txt", 0o600), ("readonly.txt", 0o400), ("normal.txt", 0o644)];
+    let files = [
+        ("private.txt", 0o600),
+        ("readonly.txt", 0o400),
+        ("normal.txt", 0o644),
+    ];
     let case = SyncCase::new(&["+private.txt", "+readonly.txt", "+normal.txt"]);
     for (name, requested_mode) in files {
         let local_file = case.local.join(name);
@@ -448,7 +509,7 @@ fn unfinished_remote_apply_marker_blocks_next_sync() {
 }
 
 #[test]
-fn post_preflight_remote_permission_race_leaves_recovery_marker() {
+fn staged_validation_catches_remote_permission_race_before_commit() {
     let case = SyncCase::new(&["+link"]);
     let local_link = case.local.join("link");
     let remote_link = case.remote.join("link");
@@ -468,31 +529,77 @@ fn post_preflight_remote_permission_race_leaves_recovery_marker() {
 
     assert_failure(&output);
     assert!(
-        marker.exists(),
-        "expected recovery marker at {}",
+        !marker.exists(),
+        "unexpected recovery marker at {}",
         marker.display()
     );
-    let marker_contents = read(&marker);
-    assert!(
-        marker_contents.contains("phase: apply"),
-        "{}",
-        marker_contents
-    );
-    assert!(
-        marker_contents.contains("operation: replace link"),
-        "{}",
-        marker_contents
-    );
     assert_eq!(read(&remote_link), "initial");
-    let recovery_output = case.sync();
-    assert_failure(&recovery_output);
-    let stderr = String::from_utf8_lossy(&recovery_output.stderr);
-    assert!(
-        stderr.contains("previous Duet apply attempt did not finish")
-            && stderr.contains("Recovery:"),
-        "expected recovery context\nstderr:\n{}",
-        stderr
+    assert_success(case.sync());
+    assert_eq!(
+        fs::read_link(&remote_link).unwrap(),
+        PathBuf::from("target.txt")
     );
+}
+
+#[test]
+fn sigint_after_staged_prepare_aborts_without_mutating_targets() {
+    let case = SyncCase::new(&["+file.txt"]);
+    let local_file = case.local.join("file.txt");
+    let remote_file = case.remote.join("file.txt");
+    write(&local_file, "initial");
+    assert_success(case.sync());
+
+    let local_state = case.local_state();
+    let remote_state = remote_state_file(&case);
+    let local_marker = apply_marker_for(&local_state);
+    let remote_marker = apply_marker_for(&remote_state);
+    let local_snapshot = fs::read(&local_state).unwrap();
+    let remote_snapshot = fs::read(&remote_state).unwrap();
+    write(&local_file, "updated");
+
+    let mut child = case.sync_child_with_pause("DUET_TEST_PAUSE_AFTER_STAGED_PREPARE_MS");
+    wait_for_marker_phase_while_child_runs(&remote_marker, "prepared", &mut child);
+    send_sigint(&child);
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(&remote_file), "initial");
+    assert_eq!(fs::read(&local_state).unwrap(), local_snapshot);
+    assert_eq!(fs::read(&remote_state).unwrap(), remote_snapshot);
+    assert!(!local_marker.exists());
+    assert!(!remote_marker.exists());
+    assert_no_staging_directory(&case.local);
+    assert_no_staging_directory(&case.remote);
+}
+
+#[test]
+fn sigint_after_staged_commit_finishes_state_and_exits_successfully() {
+    let case = SyncCase::new(&["+file.txt"]);
+    let local_file = case.local.join("file.txt");
+    let remote_file = case.remote.join("file.txt");
+    write(&local_file, "initial");
+    assert_success(case.sync());
+
+    let local_marker = apply_marker_for(&case.local_state());
+    let remote_marker = apply_marker_for(&remote_state_file(&case));
+    write(&local_file, "updated");
+
+    let mut child = case.sync_child_with_pause("DUET_TEST_PAUSE_AFTER_STAGED_COMMIT_MS");
+    wait_for_marker_phase_while_child_runs(&remote_marker, "committed", &mut child);
+    send_sigint(&child);
+    let output = child.wait_with_output().unwrap();
+
+    assert_success(output);
+    assert_eq!(read(&remote_file), "updated");
+    assert!(!local_marker.exists());
+    assert!(!remote_marker.exists());
+    assert_no_staging_directory(&case.local);
+    assert_no_staging_directory(&case.remote);
 }
 
 #[test]

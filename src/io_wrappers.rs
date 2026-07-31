@@ -16,9 +16,9 @@ pub enum StdinWrapper {
 // Asynchronous Write implementation
 impl AsyncWrite for StdinWrapper {
     fn poll_write(
-        self: Pin<&mut Self>, 
-        _cx: &mut Context<'_>, 
-        buf: &[u8]
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         // We need to get a mutable reference to self
         let this = self.get_mut();
@@ -27,36 +27,30 @@ impl AsyncWrite for StdinWrapper {
             StdinWrapper::OpensshStdin(stdin) => {
                 // Similar to std stdin
                 Pin::new(stdin).poll_write(_cx, buf)
-            },
+            }
             StdinWrapper::TokioStdin(stdin) => {
                 // Similar to std stdin
                 Pin::new(stdin).poll_write(_cx, buf)
-            },
+            }
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>, 
-        _cx: &mut Context<'_>
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
         match this {
             StdinWrapper::OpensshStdin(stdin) => {
                 //stdin.poll_flush()
                 Pin::new(stdin).poll_flush(_cx)
-            },
+            }
             StdinWrapper::TokioStdin(stdin) => {
                 //stdin.poll_flush()
                 Pin::new(stdin).poll_flush(_cx)
-            },
+            }
         }
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>, 
-        _cx: &mut Context<'_>
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Standard stdin doesn't have a shutdown method, so we just return Ok
         let this = self.get_mut();
 
@@ -64,11 +58,11 @@ impl AsyncWrite for StdinWrapper {
             StdinWrapper::OpensshStdin(stdin) => {
                 //stdin.poll_flush()
                 Pin::new(stdin).poll_shutdown(_cx)
-            },
+            }
             StdinWrapper::TokioStdin(stdin) => {
                 //stdin.poll_flush()
                 Pin::new(stdin).poll_shutdown(_cx)
-            },
+            }
         }
     }
 }
@@ -99,7 +93,7 @@ impl AsyncRead for StdoutWrapper {
     fn poll_read(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
@@ -107,11 +101,11 @@ impl AsyncRead for StdoutWrapper {
             StdoutWrapper::OpensshStdout(stdout) => {
                 // Similar to std stdout
                 Pin::new(stdout).poll_read(_cx, buf)
-            },
+            }
             StdoutWrapper::TokioStdout(stdout) => {
                 // Similar to std stdout
                 Pin::new(stdout).poll_read(_cx, buf)
-            },
+            }
         }
     }
 }

@@ -403,16 +403,17 @@ signatures and either sends full contents or an rsync-like delta:
 Duet has two detail/apply paths:
 
 - streamed path: `DetailProducer` emits `DetailFrame` values containing file or
-  diff payload chunks; `DetailApplier` consumes frames and mutates the
-  destination incrementally.
+  diff payload chunks. For staged peers, `DetailApplier` prepares private output
+  without target mutation; legacy peers retain incremental apply behavior.
 - non-streamed fallback: `get_detailed_changes()` returns a vector of
   `ChangeDetails`, and `apply_detailed_changes()` applies that vector.
 
-The streamed path is preferred when both sides advertise batched streaming and
-`sync::can_stream_details()` says the selected actions are supported. The
-orchestrator interleaves the two directions: it reads remote detail batches and
-feeds the local applier, then produces local detail batches and sends them to the
-remote applier.
+The staged streamed path is preferred when both sides advertise batched
+streaming and `staged-apply-v1`, and `sync::can_stream_details()` says the
+selected actions are supported. The orchestrator interleaves the two directions:
+it reads remote detail batches and feeds the local preparer, then produces local
+detail batches and sends them to the remote preparer. Older peers and unsupported
+plans retain the legacy immediate-apply path.
 
 When both sides advertise file-byte chunks, local-to-remote streamed apply routes
 large `FileBytes` payloads through `apply_file_byte_chunk()`. Smaller file-byte
@@ -425,25 +426,26 @@ payloads at or above it use the dedicated file-byte RPC.
 mutation. The RPC server also runs preflight before non-streamed apply and before
 starting a streamed apply.
 
-`DetailApplier` and `apply_detailed_changes()` handle files, directories,
-symlinks, removals, replacements, metadata updates, and directory cleanup in a
-second reverse-order pass so child entries are processed before parent
-directories.
+`DetailApplier` stages regular outputs and constructs an action-indexed
+`PreparedApply`. It defers publications, directories, symlinks, removals,
+replacements, metadata updates, and pruning. `PreparedApply::commit()` applies
+forward operations in action order and directory cleanup in a second
+reverse-order pass so child entries are processed before parent directories.
 
-Regular file output in both apply paths uses a lazy, side-local `StagingArea`.
-The first output creates one mode-0700 `.duet-stage-*` directory in that output's
-destination parent and records the phase path once in the recovery marker. Any
-temporary permission change needed for stage creation is restored immediately;
-the phase retains only the parent and stage descriptors and their identities.
+Regular file output uses a lazy, side-local `StagingArea`. The first output
+creates one mode-0700 `.duet-stage-*` directory under the synchronization base,
+on the destination filesystem, and records its parent, component, and identity
+in the V2 recovery marker. Preparation does not create missing destination
+parents or otherwise mutate synchronized target paths.
 Each `TempOutput` uses a unique mode-0600 component inside the shared directory,
 then flushes, verifies the expected BLAKE2b-256 digest (or Adler only in legacy
 mode), and applies final metadata while the output remains hidden. Completed
-outputs collect into bounded pre-publication batches. Each batch syncs output
-file handles concurrently with a bounded blocking worker set; no output in the
-batch is published unless every file sync succeeds. Successful batches publish
-descriptor-relatively in original action order, revalidating the target, stage,
-and destination-parent identities immediately before each publication. Added
-files use no-clobber linking and replacements use descriptor-relative rename.
+outputs collect into bounded preparation batches. Each batch syncs output file
+handles concurrently with a bounded blocking worker set, captures device/inode
+identity, and closes the files without publishing them. At commit, Duet reopens
+each sealed output descriptor-relatively with `O_NOFOLLOW`, verifies its recorded
+identity, and publishes in original action order. Added files use no-clobber
+linking and replacements use descriptor-relative rename.
 Immediately after each successful `renameat`/`linkat`, Duet appends that output's
 committed-step/action recovery records and updates phase-local reconstructed
 state before post-publication checks, cleanup, parent-mode restoration, or the
@@ -457,28 +459,25 @@ identity; they do not retain a destination-parent descriptor or widen its mode.
 The saved parent identity is checked before publication-time widening and again
 against the opened descriptor.
 
-Batches flush before adding an output that would exceed the count or aggregate
-content-byte limit, when either limit is reached, before a later conflicting
-non-file operation, and at phase end. Defaults are 256 files, 64 MiB, and one
-sync worker per available CPU capped at 64. Hidden benchmark overrides are
+Batches seal before adding an output that would exceed the count or aggregate
+content-byte limit, when either limit is reached, and at preparation end.
+Defaults are 256 files, 64 MiB, and one sync worker per available CPU capped at
+64. Hidden benchmark overrides are
 `DUET_SYNC_OUTPUT_BATCH_FILES`, `DUET_SYNC_OUTPUT_BATCH_BYTES`, and
 `DUET_SYNC_OUTPUT_SYNC_WORKERS`; hard caps are 512 files, 1 GiB, and 64 workers,
 with every setting clamped to at least one. The effective file cap is reduced
 further when `RLIMIT_NOFILE` minus 64 reserved descriptors is lower. A single
 file may exceed the byte limit, but it is isolated from other pending outputs.
 
-After all outputs have been published or removed, the apply phase syncs the shared
-source stage directory once and removes it descriptor-relatively. A short retained-
-descriptor guard permits removal when final parent metadata is restrictive and is
-restored before barriers continue. The phase then verifies and syncs the recorded
-destination parents, including the stage parent after stage removal. The existing
-completion barrier skips those paths while syncing unsynced ancestors, direct-
-mutation parents, and the sync base before state save. Metadata/removal-only phases
-never create a staging directory. On apply failure, best-effort cleanup performs no
-additional directory barrier and the durable recovery marker remains authoritative.
-Earlier complete batches may remain published if a later batch fails, but no
-snapshot is advanced and the marker records only publications completed in action
-order.
+After all outputs have been sealed, both sides durably transition their V2 marker
+to `prepared`. The client validates both complete plans and every staged identity
+while both sides are still abortable, then atomically chooses cancellation or
+commit. Each commit validates again, durably transitions to `committing`, and only
+then begins target mutation. On successful commit it syncs affected directories,
+transitions to `committed`, saves both snapshots while both markers remain, and
+clears the exact-ID markers only after both saves succeed. A commit failure can
+still leave a partial multi-path result and keeps the recovery marker
+authoritative.
 Any streamed apply error permanently poisons that `DetailApplier`; later frames,
 byte chunks, and finish requests fail closed rather than returning partial state.
 `WritableDirGuard` can temporarily add owner write permission to an already-synced
@@ -503,11 +502,13 @@ Important concurrent phases:
 - local state load and local scan run concurrently inside `state::old_and_changes()`
 - local and remote signatures are collected concurrently
 - non-streamed local and remote detailed changes are created concurrently
-- non-streamed local and remote apply phases run concurrently
-- streamed apply interleaves remote-to-local and local-to-remote batches in one
-  loop
-- each apply side syncs one bounded batch of private output file handles through
-  scoped blocking workers, then publishes the successful batch serially
+- legacy non-streamed local and remote apply phases run concurrently
+- staged streaming interleaves remote-to-local and local-to-remote preparation
+  batches in one loop
+- each staged side syncs bounded batches of private output file handles through
+  scoped blocking workers, then publishes all sealed outputs during commit
+- local and remote staged commits run concurrently after the bilateral prepared
+  barrier
 - local and remote snapshot saves run concurrently
 
 Blocking filesystem work that can take time, such as signature generation,
@@ -541,20 +542,32 @@ The implementation is Unix-oriented:
 - it avoids crossing filesystem device boundaries during scans
 
 SSH support depends on the `openssh` crate and assumes passwordless
-authentication with strict known-hosts checking.
+authentication with strict known-hosts checking. Remote commands use the native
+multiplexing client so a terminal SIGINT cannot kill a per-command SSH helper.
+The control master closes with the initial connection instead of persisting after
+an abrupt client exit.
 
 ## Failure Boundaries
 
 The main synchronization flow only persists snapshots after both sides have
-applied their changes. If a failure occurs before state save, a later run should
-rescan and compare against the previous remembered state.
+applied their changes. A precommit failure aborts private staging and leaves the
+previous snapshots valid. A commit-or-later failure keeps recovery markers;
+users must inspect and reconcile both trees and snapshots before explicitly
+clearing those markers rather than rerunning against potentially stale state.
 
 Permission handling is fail-fast. Scanner errors are propagated through
 `state::scan_entries()`, state file existence checks use `try_exists()`, local
 and remote state save errors are reported, and apply operations return
 path-aware errors instead of panicking for expected filesystem failures.
 
-The apply phase performs real filesystem mutations on both sides. File content
-writes and snapshot writes use temporary/atomic output where practical, and
-preflight catches known unsafe destination cases, but larger multi-entry
-synchronizations are not transactional as a whole.
+For staged peers, the first SIGINT before commit is a cancellation request checked
+between completed RPC/batch operations. It aborts private staging and leaves
+targets and snapshots unchanged. Once commit starts, cancellation is deferred
+through commit, state save, marker cleanup, RPC EOF, and child reaping. A second
+SIGINT kills an isolated local server process group, if present, then forces an
+immediate exit and can leave recovery artifacts. Legacy peers move the
+non-cancellable boundary to immediately before their existing apply sequence.
+
+The commit phase performs real filesystem mutations on both sides. File content
+writes and snapshot writes use temporary/atomic output where practical, but the
+two hosts and a larger multi-entry synchronization are not globally atomic.

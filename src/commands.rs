@@ -108,8 +108,13 @@ pub(crate) async fn snapshot(name: String, statefile: Option<PathBuf>) -> Result
     let local_base = full(&prf.local)?;
     let scan_ignore = prf.scan_ignore();
 
-    let mut current_entries =
-        state::scan_entries(&local_base, &PathBuf::from(""), &prf.locations, &scan_ignore).await?;
+    let mut current_entries = state::scan_entries(
+        &local_base,
+        &PathBuf::from(""),
+        &prf.locations,
+        &scan_ignore,
+    )
+    .await?;
     state::hash_manifest(&local_base, &mut current_entries).await?;
 
     let statefile = match statefile {
@@ -271,7 +276,10 @@ mod tests {
             profile_name_recovery_target(&PathBuf::from("/tmp/cole.snp")),
             None
         );
-        assert_eq!(profile_name_recovery_target(&PathBuf::from("work\\old")), None);
+        assert_eq!(
+            profile_name_recovery_target(&PathBuf::from("work\\old")),
+            None
+        );
     }
 
     #[test]

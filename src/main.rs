@@ -6,8 +6,8 @@ mod commands;
 mod io_wrappers;
 mod orchestrator;
 mod performance;
-mod progress;
 mod profile;
+mod progress;
 mod remote;
 mod resolution;
 mod rpc;
@@ -57,7 +57,11 @@ pub async fn main() -> Result<()> {
             profile,
             path,
             options,
-        } => return orchestrator::sync(profile, path, options).await,
+        } => match orchestrator::sync(profile, path, options).await? {
+            orchestrator::SyncOutcome::Success => return Ok(()),
+            orchestrator::SyncOutcome::UserAbort => quit::with_code(1),
+            orchestrator::SyncOutcome::Interrupted => quit::with_code(6),
+        },
     }
     Ok(())
 }

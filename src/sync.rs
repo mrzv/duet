@@ -5,8 +5,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -224,8 +224,8 @@ impl SyncTuning {
         if let Some(value) = get(ENV_DETAIL_BATCH_FRAMES).and_then(|value| value.parse().ok()) {
             self.detail_batch_frames = value;
         }
-        if let Some(value) = get(ENV_DETAIL_BATCH_PAYLOAD_BYTES)
-            .and_then(|value| value.parse().ok())
+        if let Some(value) =
+            get(ENV_DETAIL_BATCH_PAYLOAD_BYTES).and_then(|value| value.parse().ok())
         {
             self.detail_batch_payload_bytes = value;
         }
@@ -295,7 +295,10 @@ pub struct SignatureWithPath(PathBuf, Signature);
 pub fn validate_relative_path(path: &Path) -> Result<()> {
     validate_relative_path_components(path)?;
 
-    if !path.components().any(|component| matches!(component, Component::Normal(_))) {
+    if !path
+        .components()
+        .any(|component| matches!(component, Component::Normal(_)))
+    {
         return Err(eyre!(
             "path {} must name an entry below the sync base",
             path.display()
@@ -443,12 +446,8 @@ where
             signature.0.display()
         ));
     }
-    validate_signature_window(signature.1.window).wrap_err_with(|| {
-        format!(
-            "invalid signature window for {}",
-            signature.0.display()
-        )
-    })?;
+    validate_signature_window(signature.1.window)
+        .wrap_err_with(|| format!("invalid signature window for {}", signature.0.display()))?;
     Ok(&signature.1)
 }
 
@@ -464,12 +463,8 @@ fn validate_change_paths(change: &Change) -> Result<()> {
 }
 
 fn validate_entry_path(entry: &Entry) -> Result<()> {
-    validate_relative_path(entry.path()).wrap_err_with(|| {
-        format!(
-            "invalid action entry path {}",
-            entry.path().display()
-        )
-    })
+    validate_relative_path(entry.path())
+        .wrap_err_with(|| format!("invalid action entry path {}", entry.path().display()))
 }
 
 pub fn get_signatures_with_config(
@@ -782,12 +777,18 @@ pub fn start_apply_attempt(
     attempt_id: Option<&str>,
 ) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
-    let parent = marker_path.parent().ok_or_else(|| eyre!(
-        "apply recovery marker {} has no parent directory", marker_path.display()
-    ))?;
-    create_dir_all_durable(parent).wrap_err_with(|| format!(
-        "unable to create apply recovery marker directory {}", parent.display()
-    ))?;
+    let parent = marker_path.parent().ok_or_else(|| {
+        eyre!(
+            "apply recovery marker {} has no parent directory",
+            marker_path.display()
+        )
+    })?;
+    create_dir_all_durable(parent).wrap_err_with(|| {
+        format!(
+            "unable to create apply recovery marker directory {}",
+            parent.display()
+        )
+    })?;
     let contents = apply_attempt_contents(side, state_path, base, "apply", actions, attempt_id);
     match fs::OpenOptions::new()
         .write(true)
@@ -798,11 +799,13 @@ pub fn start_apply_attempt(
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
             file.write_all(contents.as_bytes())?;
             file.sync_all()
-        })
-    {
-        Ok(()) => sync_directory(parent).wrap_err_with(|| format!(
-            "unable to sync apply recovery marker directory {}", parent.display()
-        )),
+        }) {
+        Ok(()) => sync_directory(parent).wrap_err_with(|| {
+            format!(
+                "unable to sync apply recovery marker directory {}",
+                parent.display()
+            )
+        }),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             let existing = fs::read_to_string(&marker_path).wrap_err_with(|| {
                 format!(
@@ -811,17 +814,29 @@ pub fn start_apply_attempt(
                 )
             })?;
             if existing == contents {
-                let file = fs::OpenOptions::new().read(true).write(true).open(&marker_path)
-                    .wrap_err_with(|| format!(
-                        "unable to open existing apply recovery marker {}", marker_path.display()
-                    ))?;
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&marker_path)
+                    .wrap_err_with(|| {
+                        format!(
+                            "unable to open existing apply recovery marker {}",
+                            marker_path.display()
+                        )
+                    })?;
                 file.set_permissions(fs::Permissions::from_mode(0o600))?;
-                file.sync_all().wrap_err_with(|| format!(
-                    "unable to sync existing apply recovery marker {}", marker_path.display()
-                ))?;
-                sync_directory(parent).wrap_err_with(|| format!(
-                    "unable to sync apply recovery marker directory {}", parent.display()
-                ))
+                file.sync_all().wrap_err_with(|| {
+                    format!(
+                        "unable to sync existing apply recovery marker {}",
+                        marker_path.display()
+                    )
+                })?;
+                sync_directory(parent).wrap_err_with(|| {
+                    format!(
+                        "unable to sync apply recovery marker directory {}",
+                        parent.display()
+                    )
+                })
             } else {
                 Err(eyre!(
                     "{}",
@@ -838,6 +853,247 @@ pub fn start_apply_attempt(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ApplyAttemptPhase {
+    Preparing,
+    Prepared,
+    Committing,
+    Committed,
+    StateSave,
+    Finished,
+}
+
+impl ApplyAttemptPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Prepared => "prepared",
+            Self::Committing => "committing",
+            Self::Committed => "committed",
+            Self::StateSave => "state-save",
+            Self::Finished => "finished",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "preparing" => Some(Self::Preparing),
+            "prepared" => Some(Self::Prepared),
+            "committing" => Some(Self::Committing),
+            "committed" => Some(Self::Committed),
+            "state-save" => Some(Self::StateSave),
+            "finished" => Some(Self::Finished),
+            _ => None,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn start_staged_apply_attempt(
+    side: &str,
+    state_path: &Path,
+    base: &Path,
+    actions: &[Action],
+    attempt_id: &str,
+) -> Result<()> {
+    if attempt_id.is_empty() || attempt_id.contains(['\n', '\r']) {
+        return Err(eyre!(
+            "staged apply attempt ID must be non-empty and single-line"
+        ));
+    }
+    if base.as_os_str().as_bytes().contains(&b'\n') || base.as_os_str().as_bytes().contains(&b'\r')
+    {
+        return Err(eyre!("staged apply base path must be single-line"));
+    }
+    if state_path.as_os_str().as_bytes().contains(&b'\n')
+        || state_path.as_os_str().as_bytes().contains(&b'\r')
+    {
+        return Err(eyre!("staged apply state path must be single-line"));
+    }
+    if actions.iter().any(|action| {
+        let path = action.path().as_os_str().as_bytes();
+        path.contains(&b'\n') || path.contains(&b'\r')
+    }) {
+        return Err(eyre!("staged apply action paths must be single-line"));
+    }
+    let marker_path = apply_attempt_path(state_path)?;
+    let parent = marker_path.parent().ok_or_else(|| {
+        eyre!(
+            "apply recovery marker {} has no parent directory",
+            marker_path.display()
+        )
+    })?;
+    create_dir_all_durable(parent)?;
+    let mut contents = apply_attempt_contents(
+        side,
+        state_path,
+        base,
+        ApplyAttemptPhase::Preparing.as_str(),
+        actions,
+        Some(attempt_id),
+    );
+    contents.replace_range(.."duet-apply-attempt-v1".len(), "duet-apply-attempt-v2");
+    write_new_apply_marker(state_path, &marker_path, parent, &contents)
+}
+
+#[allow(dead_code)]
+fn write_new_apply_marker(
+    state_path: &Path,
+    marker_path: &Path,
+    parent: &Path,
+    contents: &str,
+) -> Result<()> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(marker_path)
+        .and_then(|mut file| {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        }) {
+        Ok(()) => sync_directory(parent),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let existing = fs::read_to_string(marker_path)?;
+            if existing == contents {
+                Ok(())
+            } else {
+                Err(eyre!(
+                    "{}",
+                    apply_attempt_description(state_path, marker_path, &existing)
+                ))
+            }
+        }
+        Err(error) => Err(error).wrap_err_with(|| {
+            format!(
+                "unable to create apply recovery marker {}",
+                marker_path.display()
+            )
+        }),
+    }
+}
+
+fn transition_staged_apply_attempt(
+    state_path: &Path,
+    attempt_id: &str,
+    expected: &[ApplyAttemptPhase],
+    next: ApplyAttemptPhase,
+) -> Result<()> {
+    let marker_path = apply_attempt_path(state_path)?;
+    let contents = fs::read_to_string(&marker_path)?;
+    let marker = parse_v2_apply_attempt(&contents)?;
+    if marker.attempt_id != attempt_id {
+        return Err(eyre!(
+            "staged apply attempt ID mismatch: expected {}, marker contains {}",
+            attempt_id,
+            marker.attempt_id
+        ));
+    }
+    if !expected.contains(&marker.phase) {
+        return Err(eyre!(
+            "cannot transition staged apply attempt {} from {} to {}",
+            attempt_id,
+            marker.phase.as_str(),
+            next.as_str()
+        ));
+    }
+    let updated = replace_marker_line(&contents, "phase: ", next.as_str())?;
+    write_apply_marker_atomic(&marker_path, &updated)
+}
+
+pub(crate) fn mark_staged_apply_attempt_state_save(
+    state_path: &Path,
+    attempt_id: &str,
+) -> Result<()> {
+    transition_staged_apply_attempt(
+        state_path,
+        attempt_id,
+        &[ApplyAttemptPhase::Committed],
+        ApplyAttemptPhase::StateSave,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn finish_staged_apply_attempt(state_path: &Path, attempt_id: &str) -> Result<()> {
+    transition_staged_apply_attempt(
+        state_path,
+        attempt_id,
+        &[ApplyAttemptPhase::StateSave],
+        ApplyAttemptPhase::Finished,
+    )?;
+    finish_apply_attempt(state_path)
+}
+
+#[allow(dead_code)]
+pub(crate) fn abort_staged_apply_attempt(state_path: &Path, attempt_id: &str) -> Result<()> {
+    let marker_path = apply_attempt_path(state_path)?;
+    let contents = fs::read_to_string(&marker_path)?;
+    let marker = parse_v2_apply_attempt(&contents)?;
+    if marker.attempt_id != attempt_id {
+        return Err(eyre!(
+            "staged apply attempt ID mismatch: expected {}, marker contains {}",
+            attempt_id,
+            marker.attempt_id
+        ));
+    }
+    cleanup_v2_precommit_stage(&contents)?;
+    finish_apply_attempt(state_path)
+}
+
+fn replace_marker_line(contents: &str, prefix: &str, value: &str) -> Result<String> {
+    let mut found = false;
+    let mut updated = String::new();
+    for line in contents.lines() {
+        if line.starts_with(prefix) {
+            if found {
+                return Err(eyre!(
+                    "apply recovery marker has duplicate {} field",
+                    prefix.trim()
+                ));
+            }
+            found = true;
+            updated.push_str(prefix);
+            updated.push_str(value);
+        } else {
+            updated.push_str(line);
+        }
+        updated.push('\n');
+    }
+    if !found {
+        return Err(eyre!(
+            "apply recovery marker is missing {} field",
+            prefix.trim()
+        ));
+    }
+    Ok(updated)
+}
+
+fn write_apply_marker_atomic(marker_path: &Path, contents: &str) -> Result<()> {
+    use atomicwrites::{AllowOverwrite, AtomicFile};
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    AtomicFile::new(marker_path, AllowOverwrite)
+        .write_with_options(
+            |file| {
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                file.write_all(contents.as_bytes())?;
+                file.sync_all()
+            },
+            options,
+        )
+        .wrap_err_with(|| {
+            format!(
+                "unable to update apply recovery marker {}",
+                marker_path.display()
+            )
+        })?;
+    let parent = marker_path
+        .parent()
+        .ok_or_else(|| eyre!("apply marker has no parent"))?;
+    sync_directory(parent)
+}
+
 pub fn mark_apply_attempt_state_save(
     side: &str,
     state_path: &Path,
@@ -852,6 +1108,11 @@ pub fn mark_apply_attempt_state_save(
             marker_path.display()
         )
     })?;
+    if existing.starts_with("duet-apply-attempt-v2\n") {
+        let attempt_id =
+            attempt_id.ok_or_else(|| eyre!("V2 apply marker requires an attempt ID"))?;
+        return mark_staged_apply_attempt_state_save(state_path, attempt_id);
+    }
     let mut contents =
         apply_attempt_contents(side, state_path, base, "state-save", actions, attempt_id);
     for line in existing.lines().filter(|line| {
@@ -866,10 +1127,13 @@ pub fn mark_apply_attempt_state_save(
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true).mode(0o600);
     AtomicFile::new(&marker_path, AllowOverwrite)
-        .write_with_options(|file| {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            file.write_all(contents.as_bytes())
-        }, options)
+        .write_with_options(
+            |file| {
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                file.write_all(contents.as_bytes())
+            },
+            options,
+        )
         .wrap_err_with(|| {
             format!(
                 "unable to atomically update apply recovery marker {}",
@@ -924,11 +1188,7 @@ fn record_staged_file(attempt_state: Option<&Path>, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn record_committed_step(
-    attempt_state: Option<&Path>,
-    operation: &str,
-    path: &Path,
-) -> Result<()> {
+fn record_committed_step(attempt_state: Option<&Path>, operation: &str, path: &Path) -> Result<()> {
     let Some(state_path) = attempt_state else {
         return Ok(());
     };
@@ -958,13 +1218,19 @@ pub fn finish_apply_attempt(state_path: &Path) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
     match fs::remove_file(&marker_path) {
         Ok(()) => {
-            let parent = marker_path.parent().ok_or_else(|| eyre!(
-                "apply recovery marker {} has no parent directory", marker_path.display()
-            ))?;
-            sync_directory(parent).wrap_err_with(|| format!(
-                "unable to sync cleared apply recovery marker directory {}", parent.display()
-            ))
-        },
+            let parent = marker_path.parent().ok_or_else(|| {
+                eyre!(
+                    "apply recovery marker {} has no parent directory",
+                    marker_path.display()
+                )
+            })?;
+            sync_directory(parent).wrap_err_with(|| {
+                format!(
+                    "unable to sync cleared apply recovery marker directory {}",
+                    parent.display()
+                )
+            })
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).wrap_err_with(|| {
             format!(
@@ -983,6 +1249,16 @@ pub fn clear_apply_attempt(state_path: &Path) -> Result<()> {
             marker_path.display()
         )
     })?;
+    if marker.starts_with("duet-apply-attempt-v2\n") {
+        let parsed = parse_v2_apply_attempt(&marker)?;
+        if matches!(
+            parsed.phase,
+            ApplyAttemptPhase::Preparing | ApplyAttemptPhase::Prepared
+        ) {
+            cleanup_v2_precommit_stage(&marker)?;
+        }
+        return finish_apply_attempt(state_path);
+    }
     if !marker.starts_with("duet-apply-attempt-v1\n") {
         return Err(eyre!(
             "refusing to remove malformed apply recovery marker {}",
@@ -1166,6 +1442,273 @@ struct ApplyAttemptMarker {
     committed_steps: Vec<String>,
 }
 
+#[derive(Debug)]
+struct V2ApplyAttemptMarker {
+    attempt_id: String,
+    phase: ApplyAttemptPhase,
+    stage_parent: Option<(PathBuf, DirectoryIdentity)>,
+    stage: Option<(String, DirectoryIdentity)>,
+    entries: HashMap<String, FileIdentity>,
+}
+
+fn parse_v2_apply_attempt(contents: &str) -> Result<V2ApplyAttemptMarker> {
+    if !contents.starts_with("duet-apply-attempt-v2\n") {
+        return Err(eyre!("apply recovery marker is not V2"));
+    }
+    let mut attempt_id = None;
+    let mut phase = None;
+    let mut stage_parent = None;
+    let mut stage = None;
+    let mut entries = HashMap::new();
+    for line in contents.lines().skip(1) {
+        if let Some(value) = line.strip_prefix("attempt-id: ") {
+            if attempt_id.is_some() {
+                return Err(eyre!("V2 apply marker has duplicate attempt IDs"));
+            }
+            attempt_id = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("phase: ") {
+            if phase.is_some() {
+                return Err(eyre!("V2 apply marker has duplicate phases"));
+            }
+            phase = ApplyAttemptPhase::parse(value);
+            if phase.is_none() {
+                return Err(eyre!("V2 apply marker has an invalid phase"));
+            }
+        } else if let Some(value) = line.strip_prefix("stage-parent: ") {
+            if stage_parent.is_some() {
+                return Err(eyre!("V2 apply marker has duplicate staging parents"));
+            }
+            let (path, identity) = parse_marker_path_identity(value)?;
+            stage_parent = Some((PathBuf::from(path), identity));
+        } else if let Some(value) = line.strip_prefix("stage: ") {
+            if stage.is_some() {
+                return Err(eyre!("V2 apply marker has duplicate staging directories"));
+            }
+            let (name, identity) = parse_marker_path_identity(value)?;
+            stage = Some((name.to_string(), identity));
+        } else if let Some(value) = line.strip_prefix("stage-entry: ") {
+            let (name, identity) = parse_marker_path_identity(value)?;
+            if entries
+                .insert(
+                    name.to_string(),
+                    FileIdentity {
+                        dev: identity.dev,
+                        ino: identity.ino,
+                    },
+                )
+                .is_some()
+            {
+                return Err(eyre!("V2 apply marker has duplicate staged entries"));
+            }
+        }
+    }
+    Ok(V2ApplyAttemptMarker {
+        attempt_id: attempt_id.ok_or_else(|| eyre!("V2 apply marker is missing attempt ID"))?,
+        phase: phase.ok_or_else(|| eyre!("V2 apply marker has an invalid or missing phase"))?,
+        stage_parent,
+        stage,
+        entries,
+    })
+}
+
+fn parse_marker_path_identity(value: &str) -> Result<(&str, DirectoryIdentity)> {
+    let mut parts = value.rsplitn(3, ' ');
+    let ino = parts.next().and_then(|value| value.parse().ok());
+    let dev = parts.next().and_then(|value| value.parse().ok());
+    let path = parts.next();
+    match (path, dev, ino) {
+        (Some(path), Some(dev), Some(ino)) if !path.is_empty() => {
+            Ok((path, DirectoryIdentity { dev, ino }))
+        }
+        _ => Err(eyre!("malformed staged identity in V2 apply marker")),
+    }
+}
+
+fn append_v2_marker_line(state_path: &Path, attempt_id: &str, line: &str) -> Result<()> {
+    let marker_path = apply_attempt_path(state_path)?;
+    let contents = fs::read_to_string(&marker_path)?;
+    let marker = parse_v2_apply_attempt(&contents)?;
+    if marker.attempt_id != attempt_id || marker.phase != ApplyAttemptPhase::Preparing {
+        return Err(eyre!(
+            "staged apply marker does not match active preparing attempt"
+        ));
+    }
+    let mut file = fs::OpenOptions::new().append(true).open(&marker_path)?;
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn record_v2_stage(state_path: &Path, attempt_id: &str, staging: &StagingArea) -> Result<()> {
+    let shared = &staging.shared;
+    let metadata = shared.directory.metadata()?;
+    append_v2_marker_line(
+        state_path,
+        attempt_id,
+        &format!(
+            "stage-parent: {} {} {}\nstage: {} {} {}\n",
+            shared.stage_parent_path.display(),
+            shared.stage_parent_identity.dev,
+            shared.stage_parent_identity.ino,
+            shared.name.to_string_lossy(),
+            metadata.dev(),
+            metadata.ino()
+        ),
+    )
+}
+
+fn record_v2_stage_entry(state_path: &Path, attempt_id: &str, output: &TempOutput) -> Result<()> {
+    let metadata = output
+        .file
+        .as_ref()
+        .ok_or_else(|| eyre!("new staged output is closed"))?
+        .metadata()?;
+    append_v2_marker_line(
+        state_path,
+        attempt_id,
+        &format!(
+            "stage-entry: {} {} {}\n",
+            output.output_name.to_string_lossy(),
+            metadata.dev(),
+            metadata.ino()
+        ),
+    )
+}
+
+fn cleanup_v2_precommit_stage(contents: &str) -> Result<()> {
+    let marker = parse_v2_apply_attempt(contents)?;
+    if !matches!(
+        marker.phase,
+        ApplyAttemptPhase::Preparing | ApplyAttemptPhase::Prepared
+    ) {
+        return Err(eyre!(
+            "refusing precommit cleanup for staged apply attempt {} in {} phase",
+            marker.attempt_id,
+            marker.phase.as_str()
+        ));
+    }
+    let entries = marker.entries;
+    let (Some((parent_path, parent_identity)), Some((stage_name, stage_identity))) =
+        (marker.stage_parent, marker.stage)
+    else {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        return Err(eyre!(
+            "V2 apply marker has staged entries without a recorded stage"
+        ));
+    };
+    let parent = open_directory_for_access(&parent_path)?;
+    verify_directory_handle_identity(
+        &parent,
+        parent_identity,
+        &parent_path,
+        "staging parent directory",
+    )?;
+    verify_path_identity(&parent_path, &parent, "staging parent directory")?;
+    let stage_name = path_component_cstring(stage_name.as_ref(), "recorded stage name")?;
+    let stage_stat = match fstatat_nofollow(parent.as_raw_fd(), &stage_name) {
+        Ok(stage_stat) => stage_stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return sync_retained_directory(
+                &parent_path,
+                &parent,
+                Some(parent_identity),
+                "staging parent directory",
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if stage_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || stage_stat.st_dev as u64 != stage_identity.dev
+        || stage_stat.st_ino as u64 != stage_identity.ino
+    {
+        return Err(eyre!(
+            "refusing to remove substituted staging directory {}",
+            parent_path
+                .join(stage_name.to_string_lossy().as_ref())
+                .display()
+        ));
+    }
+    let stage = openat_file(
+        parent.as_raw_fd(),
+        &stage_name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    verify_directory_handle_identity(
+        &stage,
+        stage_identity,
+        &parent_path.join(stage_name.to_string_lossy().as_ref()),
+        "staging directory",
+    )?;
+
+    let names = directory_entry_names(&stage)?;
+    if names.iter().any(|name| !entries.contains_key(name)) {
+        return Err(eyre!(
+            "refusing to clean staged apply attempt: staging directory contains unexpected entries"
+        ));
+    }
+    for name in names {
+        let expected = entries[&name];
+        let name_c = path_component_cstring(name.as_ref(), "recorded staged entry")?;
+        let actual = fstatat_nofollow(stage.as_raw_fd(), &name_c)?;
+        if actual.st_mode & libc::S_IFMT != libc::S_IFREG
+            || actual.st_uid != unsafe { libc::geteuid() }
+            || actual.st_dev as u64 != expected.dev
+            || actual.st_ino as u64 != expected.ino
+        {
+            return Err(eyre!(
+                "refusing to remove substituted staged entry {}",
+                name
+            ));
+        }
+        unlinkat(stage.as_raw_fd(), &name_c, 0)?;
+    }
+    stage.sync_all()?;
+    match unlinkat(parent.as_raw_fd(), &stage_name, libc::AT_REMOVEDIR) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    sync_retained_directory(
+        &parent_path,
+        &parent,
+        Some(parent_identity),
+        "staging parent directory",
+    )
+}
+
+fn directory_entry_names(directory: &fs::File) -> Result<Vec<String>> {
+    let duplicated = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let stream = unsafe { libc::fdopendir(duplicated) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicated) };
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let name = std::str::from_utf8(name.to_bytes())
+            .map_err(|_| eyre!("staging directory contains a non-UTF-8 entry"))?;
+        names.push(name.to_string());
+    }
+    if unsafe { libc::closedir(stream) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(names)
+}
+
 fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
     let mut parsed = ApplyAttemptMarker::default();
     for line in marker.lines() {
@@ -1189,20 +1732,21 @@ fn parse_apply_attempt_marker(marker: &str) -> ApplyAttemptMarker {
 pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut current = path;
-    while !current.try_exists().wrap_err_with(|| format!(
-        "unable to check directory {}", current.display()
-    ))? {
+    while !current
+        .try_exists()
+        .wrap_err_with(|| format!("unable to check directory {}", current.display()))?
+    {
         missing.push(current.to_path_buf());
-        current = current.parent().ok_or_else(|| eyre!(
-            "directory {} has no existing ancestor", path.display()
-        ))?;
+        current = current
+            .parent()
+            .ok_or_else(|| eyre!("directory {} has no existing ancestor", path.display()))?;
     }
     fs::create_dir_all(path)
         .wrap_err_with(|| format!("unable to create directory {}", path.display()))?;
     for directory in missing.iter().rev() {
-        let parent = directory.parent().ok_or_else(|| eyre!(
-            "directory {} has no parent", directory.display()
-        ))?;
+        let parent = directory
+            .parent()
+            .ok_or_else(|| eyre!("directory {} has no parent", directory.display()))?;
         sync_directory(parent)?;
     }
     Ok(())
@@ -1219,11 +1763,15 @@ fn directory_identity(
     path: &Path,
     description: &str,
 ) -> Result<DirectoryIdentity> {
-    let metadata = directory.metadata().wrap_err_with(|| {
-        format!("failed to inspect {} {}", description, path.display())
-    })?;
+    let metadata = directory
+        .metadata()
+        .wrap_err_with(|| format!("failed to inspect {} {}", description, path.display()))?;
     if !metadata.is_dir() {
-        return Err(eyre!("{} {} is not a directory", description, path.display()));
+        return Err(eyre!(
+            "{} {} is not a directory",
+            description,
+            path.display()
+        ));
     }
     Ok(DirectoryIdentity {
         dev: metadata.dev(),
@@ -1235,7 +1783,11 @@ fn directory_path_identity(path: &Path, description: &str) -> Result<DirectoryId
     let metadata = fs::symlink_metadata(path)
         .wrap_err_with(|| format!("failed to inspect {} {}", description, path.display()))?;
     if !metadata.is_dir() {
-        return Err(eyre!("{} {} is not a directory", description, path.display()));
+        return Err(eyre!(
+            "{} {} is not a directory",
+            description,
+            path.display()
+        ));
     }
     Ok(DirectoryIdentity {
         dev: metadata.dev(),
@@ -1314,7 +1866,8 @@ fn sync_retained_directory(
         }
         Err(error) if access_descriptor_needs_readable_sync(&error) => {}
         Err(error) => {
-            return Err(error).wrap_err_with(|| format!("unable to sync directory {}", path.display()));
+            return Err(error)
+                .wrap_err_with(|| format!("unable to sync directory {}", path.display()));
         }
     }
 
@@ -1326,7 +1879,10 @@ fn sync_retained_directory(
         & 0o7777;
     verify_path_identity(path, access, description)?;
     set_retained_directory_mode(&access, original_mode | 0o500, path).wrap_err_with(|| {
-        format!("unable to temporarily make directory readable for syncing {}", path.display())
+        format!(
+            "unable to temporarily make directory readable for syncing {}",
+            path.display()
+        )
     })?;
 
     let readable = fs::OpenOptions::new()
@@ -1357,7 +1913,10 @@ fn sync_retained_directory(
     if let Err(error) = set_retained_directory_mode(&access, original_mode, path) {
         let _ = set_retained_directory_mode(&access, original_mode, path);
         return Err(error).wrap_err_with(|| {
-            format!("unable to restore directory mode after opening it for syncing {}", path.display())
+            format!(
+                "unable to restore directory mode after opening it for syncing {}",
+                path.display()
+            )
         });
     }
     verify_same_directory_handles(&access, &readable, path, "directory being synced")?;
@@ -1406,12 +1965,15 @@ fn complete_apply_phase(
             }
             if !already_synced.contains(&path)
                 && !metadata_synced_directories.contains(&path)
-                && path.try_exists().wrap_err_with(|| format!(
-                "unable to check affected path {}", path.display()
-            ))?
-                && fs::symlink_metadata(&path).wrap_err_with(|| format!(
-                "unable to inspect affected path {}", path.display()
-            ))?.is_dir() {
+                && path
+                    .try_exists()
+                    .wrap_err_with(|| format!("unable to check affected path {}", path.display()))?
+                && fs::symlink_metadata(&path)
+                    .wrap_err_with(|| {
+                        format!("unable to inspect affected path {}", path.display())
+                    })?
+                    .is_dir()
+            {
                 directories.insert(path.clone());
             }
             if path == base || !path.pop() {
@@ -1429,11 +1991,16 @@ fn complete_apply_phase(
     }
     if let Some(state_path) = attempt_state {
         let marker_path = apply_attempt_path(state_path)?;
-        fs::OpenOptions::new().read(true).open(&marker_path)
+        fs::OpenOptions::new()
+            .read(true)
+            .open(&marker_path)
             .and_then(|file| file.sync_all())
-            .wrap_err_with(|| format!(
-                "unable to sync accumulated apply recovery records {}", marker_path.display()
-            ))?;
+            .wrap_err_with(|| {
+                format!(
+                    "unable to sync accumulated apply recovery records {}",
+                    marker_path.display()
+                )
+            })?;
     }
     Ok(())
 }
@@ -1448,21 +2015,47 @@ fn apply_attempt_description(state_path: &Path, marker_path: &Path, marker: &str
 }
 
 fn apply_attempt_recovery_advice(state_path: &Path, marker_path: &Path, marker: &str) -> String {
+    let v2_marker = marker.starts_with("duet-apply-attempt-v2");
+    let staged_precommit = v2_marker
+        && parse_v2_apply_attempt(marker)
+            .map(|marker| {
+                matches!(
+                    marker.phase,
+                    ApplyAttemptPhase::Preparing | ApplyAttemptPhase::Prepared
+                )
+            })
+            .unwrap_or(false);
     let marker = parse_apply_attempt_marker(marker);
-    let mut advice = if marker.phase.as_deref() == Some("state-save") {
-        "Recovery: filesystem changes were applied, but Duet state may not have been saved on this side. Fix state-storage permissions if needed, inspect the listed paths if needed, then remove only this marker and rerun Duet before making unrelated changes."
+    let mut advice = if staged_precommit {
+        "Recovery: this staged apply did not begin committing, so synchronized target paths were not changed. `duet recover --clear` can identity-check and remove the recorded Duet staging directory before clearing the marker."
+            .to_string()
+    } else if marker.phase.as_deref() == Some("state-save") {
+        "Recovery: filesystem changes were applied, but Duet state may not have been saved on this side. Inspect and reconcile both synchronized trees and snapshots before explicitly clearing the markers; do not rerun sync against stale snapshots."
             .to_string()
     } else {
-        "Recovery: filesystem changes may have been partially applied on this side. Inspect the listed paths on both sides, fix any permission or filesystem problem, then remove only this marker and rerun Duet."
+        "Recovery: filesystem changes may have been partially applied on this side. Inspect and reconcile the listed paths and snapshots on both sides before explicitly clearing the markers."
             .to_string()
     };
 
-    advice.push_str(&format!(
-        " Inspect this marker with `duet recover {}`. After inspection, remove it with `duet recover --clear {}` or manually with `rm {}`.",
-        state_path.display(),
-        state_path.display(),
-        marker_path.display()
-    ));
+    if staged_precommit {
+        advice.push_str(&format!(
+            " Inspect and safely clean this marker with `duet recover --clear {}`; do not remove the marker directly because it owns the recorded staging directory.",
+            state_path.display()
+        ));
+    } else if v2_marker {
+        advice.push_str(&format!(
+            " Inspect this marker with `duet recover {}`. After the required inspection and reconciliation, use `duet recover --clear {}`; do not remove the marker directly because it may own recorded staging.",
+            state_path.display(),
+            state_path.display()
+        ));
+    } else {
+        advice.push_str(&format!(
+            " Inspect this marker with `duet recover {}`. After inspection and reconciliation, remove it with `duet recover --clear {}` or manually with `rm {}`.",
+            state_path.display(),
+            state_path.display(),
+            marker_path.display()
+        ));
+    }
     advice.push_str(" Run recovery commands on the side where this state file exists; for remote-side markers, SSH to the remote host first.");
 
     if marker
@@ -1725,17 +2318,18 @@ impl RemovalBlockerPolicy {
         };
 
         use fnmatch_regex::glob_to_regex;
-        let compile_patterns = |patterns: &[String], kind: &str| -> Result<Vec<(String, regex::Regex)>> {
-            let mut compiled = Vec::new();
-            for pattern in patterns {
-                compiled.push((
-                    pattern.clone(),
-                    glob_to_regex(pattern)
-                        .wrap_err_with(|| format!("invalid {kind} pattern {pattern}"))?,
-                ));
-            }
-            Ok(compiled)
-        };
+        let compile_patterns =
+            |patterns: &[String], kind: &str| -> Result<Vec<(String, regex::Regex)>> {
+                let mut compiled = Vec::new();
+                for pattern in patterns {
+                    compiled.push((
+                        pattern.clone(),
+                        glob_to_regex(pattern)
+                            .wrap_err_with(|| format!("invalid {kind} pattern {pattern}"))?,
+                    ));
+                }
+                Ok(compiled)
+            };
         let ignore = compile_patterns(&scan_policy.ignore, "ignore")?;
         let prune = compile_patterns(&scan_policy.prune, "prune")?;
 
@@ -1921,9 +2515,12 @@ fn collect_removed_directory_blockers(
     policy: &RemovalBlockerPolicy,
     report: &mut ApplyPreflightReport,
 ) -> Result<()> {
-    for entry in fs::read_dir(dirname)
-        .wrap_err_with(|| format!("unable to preflight directory removal {}", dirname.display()))?
-    {
+    for entry in fs::read_dir(dirname).wrap_err_with(|| {
+        format!(
+            "unable to preflight directory removal {}",
+            dirname.display()
+        )
+    })? {
         let entry = entry.wrap_err_with(|| {
             format!(
                 "unable to preflight directory removal entry in {}",
@@ -1976,9 +2573,12 @@ fn preflight_removed_directory_contents(
     removed_paths: &HashSet<PathBuf>,
     policy: &RemovalBlockerPolicy,
 ) -> Result<()> {
-    for entry in fs::read_dir(dirname)
-        .wrap_err_with(|| format!("unable to preflight directory removal {}", dirname.display()))?
-    {
+    for entry in fs::read_dir(dirname).wrap_err_with(|| {
+        format!(
+            "unable to preflight directory removal {}",
+            dirname.display()
+        )
+    })? {
         let entry = entry.wrap_err_with(|| {
             format!(
                 "unable to preflight directory removal entry in {}",
@@ -2031,9 +2631,12 @@ fn prune_ignored_removal_blockers(
     policy: &RemovalBlockerPolicy,
     attempt_state: Option<&Path>,
 ) -> Result<()> {
-    for entry in fs::read_dir(dirname)
-        .wrap_err_with(|| format!("unable to preflight directory removal {}", dirname.display()))?
-    {
+    for entry in fs::read_dir(dirname).wrap_err_with(|| {
+        format!(
+            "unable to preflight directory removal {}",
+            dirname.display()
+        )
+    })? {
         let entry = entry.wrap_err_with(|| {
             format!(
                 "unable to preflight directory removal entry in {}",
@@ -2059,32 +2662,21 @@ fn prune_ignored_removal_blockers(
 
         let kind = policy.classify(relative_path);
         if policy.should_prune(&kind) {
-                if file_type.is_dir() {
-                    let base_dev = fs::symlink_metadata(base)
-                        .wrap_err_with(|| {
-                            format!("failed to read sync base metadata for {}", base.display())
-                        })?
-                        .dev();
-                    remove_ignored_dir_all_same_device(
-                        base,
-                        &path,
-                        base_dev,
-                        policy,
-                        attempt_state,
-                    )
-                        .wrap_err_with(|| {
-                            format!("failed to prune ignored directory {}", path.display())
-                        })?;
-                } else {
-                    fs::remove_file(&path).wrap_err_with(|| {
-                        format!("failed to prune file {}", path.display())
+            if file_type.is_dir() {
+                let base_dev = fs::symlink_metadata(base)
+                    .wrap_err_with(|| {
+                        format!("failed to read sync base metadata for {}", base.display())
+                    })?
+                    .dev();
+                remove_ignored_dir_all_same_device(base, &path, base_dev, policy, attempt_state)
+                    .wrap_err_with(|| {
+                        format!("failed to prune ignored directory {}", path.display())
                     })?;
-                }
-                record_committed_step(
-                    attempt_state,
-                    "prune-blocker",
-                    &relative_path.to_path_buf(),
-                )?;
+            } else {
+                fs::remove_file(&path)
+                    .wrap_err_with(|| format!("failed to prune file {}", path.display()))?;
+            }
+            record_committed_step(attempt_state, "prune-blocker", &relative_path.to_path_buf())?;
         } else {
             return Err(removal_blocker_error(
                 dirname,
@@ -2228,10 +2820,7 @@ fn ignored_prune_temp_path(path: &Path) -> Result<PathBuf> {
             filename
         ));
         if !temp_path.try_exists().wrap_err_with(|| {
-            format!(
-                "failed to check ignored prune path {}",
-                temp_path.display()
-            )
+            format!("failed to check ignored prune path {}", temp_path.display())
         })? {
             return Ok(temp_path);
         }
@@ -2373,10 +2962,7 @@ pub fn get_detailed_changes(
         }
     }
     if let Some(extra) = sig_iter.next() {
-        return Err(eyre!(
-            "unexpected signature for {}",
-            extra.0.display()
-        ));
+        return Err(eyre!("unexpected signature for {}", extra.0.display()));
     }
 
     Ok(details)
@@ -2518,12 +3104,14 @@ impl DetailProducer {
                             signature_with_path.0.display()
                         ));
                     }
-                    validate_signature_window(signature_with_path.1.window).wrap_err_with(|| {
-                        format!(
-                            "invalid signature window for {}",
-                            signature_with_path.0.display()
-                        )
-                    })?;
+                    validate_signature_window(signature_with_path.1.window).wrap_err_with(
+                        || {
+                            format!(
+                                "invalid signature window for {}",
+                                signature_with_path.0.display()
+                            )
+                        },
+                    )?;
                     let signature = signature_with_path.1.clone();
                     self.signature_index += 1;
 
@@ -2552,10 +3140,7 @@ impl DetailProducer {
         }
 
         if let Some(extra) = self.signatures.get(self.signature_index) {
-            return Err(eyre!(
-                "unexpected signature for {}",
-                extra.0.display()
-            ));
+            return Err(eyre!("unexpected signature for {}", extra.0.display()));
         }
 
         Ok(None)
@@ -2745,18 +3330,15 @@ impl StagingState {
         self.verify_identity()?;
         for _ in 0..128 {
             let component = format!(
-                "o-{:x}", TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+                "o-{:x}",
+                TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
             );
             let name = path_component_cstring(component.as_ref(), "temporary output name")?;
             let path = self.path.join(&component);
             let file = match openat_file(
                 self.directory.as_raw_fd(),
                 &name,
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_NOFOLLOW
-                    | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o600,
             ) {
                 Ok(file) => file,
@@ -2803,6 +3385,7 @@ impl StagingState {
 struct StagingArea {
     shared: Arc<StagingState>,
     finished: bool,
+    cleanup_on_drop: bool,
 }
 
 impl StagingArea {
@@ -2826,6 +3409,7 @@ impl StagingArea {
                 published_parents: Mutex::new(HashMap::new()),
             }),
             finished: false,
+            cleanup_on_drop: true,
         };
         if let Some(guard) = stage_parent_guard {
             guard.restore()?;
@@ -2841,10 +3425,22 @@ impl StagingArea {
         Arc::clone(&self.shared)
     }
 
-    fn finish(
-        mut self,
-        metadata_synced: &HashSet<PathBuf>,
-    ) -> Result<HashSet<PathBuf>> {
+    fn retain_for_recovery(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+
+    fn seal(&self) -> Result<()> {
+        self.shared.verify_identity()?;
+        self.shared.directory.sync_all().wrap_err_with(|| {
+            format!(
+                "failed to sync temporary directory {}",
+                self.shared.path.display()
+            )
+        })?;
+        self.shared.verify_identity()
+    }
+
+    fn finish(mut self, metadata_synced: &HashSet<PathBuf>) -> Result<HashSet<PathBuf>> {
         self.shared.verify_stage_parent_identity()?;
         let stage_parent_guard = WritableDirGuard::from_retained(
             &self.shared.stage_parent_path,
@@ -2907,7 +3503,7 @@ impl StagingArea {
 
 impl Drop for StagingArea {
     fn drop(&mut self) {
-        if !self.finished {
+        if !self.finished && self.cleanup_on_drop {
             let guard = WritableDirGuard::from_retained(
                 &self.shared.stage_parent_path,
                 &self.shared.stage_parent_directory,
@@ -2931,12 +3527,20 @@ impl Drop for StagingArea {
 struct TempOutput {
     final_path: PathBuf,
     parent_path: PathBuf,
-    parent_identity: DirectoryIdentity,
+    parent_identity: Option<DirectoryIdentity>,
     temp_path: PathBuf,
     final_name: std::ffi::CString,
     output_name: std::ffi::CString,
     staging: Arc<StagingState>,
     file: Option<fs::File>,
+    identity: Option<FileIdentity>,
+    cleanup_on_drop: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
 }
 
 fn output_parent(path: &Path) -> &Path {
@@ -2949,7 +3553,16 @@ impl TempOutput {
     fn new(final_path: PathBuf, staging: Arc<StagingState>) -> Result<Self> {
         let parent = output_parent(&final_path);
         let parent_path = parent.to_path_buf();
-        let parent_identity = directory_path_identity(parent, "output parent directory")?;
+        let parent_identity = if parent.try_exists().wrap_err_with(|| {
+            format!(
+                "failed to inspect output parent directory {}",
+                parent.display()
+            )
+        })? {
+            Some(directory_path_identity(parent, "output parent directory")?)
+        } else {
+            None
+        };
         let final_name = path_component_cstring(
             final_path
                 .file_name()
@@ -2966,6 +3579,8 @@ impl TempOutput {
             output_name,
             staging,
             file: Some(file),
+            identity: None,
+            cleanup_on_drop: true,
         };
         output.verify_at_identity(
             &output.staging.directory,
@@ -3041,17 +3656,25 @@ impl TempOutput {
         name: &std::ffi::CStr,
         path: &Path,
     ) -> Result<()> {
-        let file_meta = self
-            .file
-            .as_ref()
-            .ok_or_else(|| eyre!("temporary output is closed"))?
-            .metadata()
-            .wrap_err("failed to read open temporary file metadata")?;
+        let identity = match self.file.as_ref() {
+            Some(file) => {
+                let metadata = file
+                    .metadata()
+                    .wrap_err("failed to read open temporary file metadata")?;
+                FileIdentity {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                }
+            }
+            None => self
+                .identity
+                .ok_or_else(|| eyre!("temporary output has no recorded identity"))?,
+        };
         let path_stat = fstatat_nofollow(directory.as_raw_fd(), name)
             .wrap_err_with(|| format!("failed to read temporary path {}", path.display()))?;
         if path_stat.st_mode & libc::S_IFMT != libc::S_IFREG
-            || path_stat.st_dev as u64 != file_meta.dev()
-            || path_stat.st_ino as u64 != file_meta.ino()
+            || path_stat.st_dev as u64 != identity.dev
+            || path_stat.st_ino as u64 != identity.ino
         {
             return Err(eyre!(
                 "temporary path {} no longer refers to the open output file",
@@ -3061,8 +3684,23 @@ impl TempOutput {
         Ok(())
     }
 
+    fn verify_prepared_contents(&self, entry: &Entry) -> Result<()> {
+        let mut file = openat_file(
+            self.staging.directory.as_raw_fd(),
+            &self.output_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
+        verify_open_file_matches_entry(&mut file, &self.temp_path, entry, "staged output")
+    }
+
     fn prepare(mut self, entry: &Entry, publication: OutputPublication) -> Result<PreparedOutput> {
         let final_entry = self.prepare_metadata(entry)?;
+        self.file
+            .as_ref()
+            .ok_or_else(|| eyre!("temporary output is closed"))?
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
         Ok(PreparedOutput {
             output: self,
             final_entry,
@@ -3071,18 +3709,18 @@ impl TempOutput {
     }
 
     fn publish_replacing(
-        self,
+        mut self,
         final_entry: Entry,
         expected: &Entry,
         on_commit: impl FnOnce(&Entry) -> Result<()>,
     ) -> Result<Entry> {
+        self.reopen()?;
+        self.verify_contents(&final_entry, "staged output")?;
+        let final_entry = self.prepare_metadata(&final_entry)?;
+        self.prepare_publication_parent()?;
         verify_current_matches_entry(&self.final_path, expected, "rename target")?;
         self.with_publication_parent(|parent_directory| {
-            self.verify_at_identity(
-                &self.staging.directory,
-                &self.output_name,
-                &self.temp_path,
-            )?;
+            self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
             self.staging.verify_identity()?;
             cvt(unsafe {
                 libc::renameat(
@@ -3113,17 +3751,17 @@ impl TempOutput {
     }
 
     fn publish_without_replacing(
-        self,
+        mut self,
         final_entry: Entry,
         description: &str,
         on_commit: impl FnOnce(&Entry) -> Result<()>,
     ) -> Result<Entry> {
+        self.reopen()?;
+        self.verify_contents(&final_entry, "staged output")?;
+        let final_entry = self.prepare_metadata(&final_entry)?;
+        self.prepare_publication_parent()?;
         self.with_publication_parent(|parent_directory| {
-            self.verify_at_identity(
-                &self.staging.directory,
-                &self.output_name,
-                &self.temp_path,
-            )?;
+            self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
             self.staging.verify_identity()?;
             match cvt(unsafe {
                 libc::linkat(
@@ -3162,7 +3800,10 @@ impl TempOutput {
             self.staging
                 .record_published_parent(&self.parent_path, parent_directory)?;
             unlinkat(self.staging.directory.as_raw_fd(), &self.output_name, 0).wrap_err_with(|| {
-                format!("failed to remove temporary file {}", self.temp_path.display())
+                format!(
+                    "failed to remove temporary file {}",
+                    self.temp_path.display()
+                )
             })
         })?;
         Ok(final_entry)
@@ -3190,13 +3831,10 @@ impl TempOutput {
     }
 
     #[cfg(test)]
-    fn publish_replacing_without_target_check(self, final_entry: Entry) -> Result<Entry> {
+    fn publish_replacing_without_target_check(mut self, final_entry: Entry) -> Result<Entry> {
+        self.prepare_publication_parent()?;
         self.with_publication_parent(|parent_directory| {
-            self.verify_at_identity(
-                &self.staging.directory,
-                &self.output_name,
-                &self.temp_path,
-            )?;
+            self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
             self.staging.verify_identity()?;
             cvt(unsafe {
                 libc::renameat(
@@ -3241,31 +3879,99 @@ impl TempOutput {
             .ok_or_else(|| eyre!("temporary output is closed"))?
             .flush()
             .wrap_err_with(|| {
-                format!("failed to flush temporary file {}", self.temp_path.display())
+                format!(
+                    "failed to flush temporary file {}",
+                    self.temp_path.display()
+                )
             })
+    }
+
+    fn close_after_sync(&mut self) -> Result<()> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| eyre!("temporary output is closed"))?;
+        let metadata = file.metadata().wrap_err_with(|| {
+            format!(
+                "failed to inspect temporary file {}",
+                self.temp_path.display()
+            )
+        })?;
+        self.identity = Some(FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        });
+        self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
+        self.file = None;
+        Ok(())
+    }
+
+    fn reopen(&mut self) -> Result<()> {
+        if self.file.is_some() {
+            return Ok(());
+        }
+        let expected = self
+            .identity
+            .ok_or_else(|| eyre!("temporary output has no recorded identity"))?;
+        let file = openat_file(
+            self.staging.directory.as_raw_fd(),
+            &self.output_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .wrap_err_with(|| {
+            format!(
+                "failed to reopen temporary file {}",
+                self.temp_path.display()
+            )
+        })?;
+        let metadata = file.metadata().wrap_err_with(|| {
+            format!(
+                "failed to inspect reopened temporary file {}",
+                self.temp_path.display()
+            )
+        })?;
+        if !metadata.is_file() || metadata.dev() != expected.dev || metadata.ino() != expected.ino {
+            return Err(eyre!(
+                "temporary path {} no longer refers to the prepared output file",
+                self.temp_path.display()
+            ));
+        }
+        self.file = Some(file);
+        self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)
     }
 
     #[cfg(test)]
     fn sync_all(&self) -> Result<()> {
-        self.file.as_ref()
+        self.file
+            .as_ref()
             .ok_or_else(|| eyre!("temporary output is closed"))?
             .sync_all()
-            .wrap_err_with(|| format!(
-                "failed to sync temporary file {}", self.temp_path.display()
-            ))
+            .wrap_err_with(|| format!("failed to sync temporary file {}", self.temp_path.display()))
+    }
+
+    fn prepare_publication_parent(&mut self) -> Result<()> {
+        if self.parent_identity.is_none() {
+            self.parent_identity = Some(directory_path_identity(
+                &self.parent_path,
+                "output parent directory",
+            )?);
+        }
+        Ok(())
     }
 
     fn with_publication_parent<T>(
         &self,
         operation: impl FnOnce(&fs::File) -> Result<T>,
     ) -> Result<T> {
-        let (parent_directory, parent_guard) = WritableDirGuard::new_with_expected(
-            &self.parent_path,
-            Some(self.parent_identity),
-        )?;
+        let parent_identity = self
+            .parent_identity
+            .expect("parent identity is initialized");
+        let (parent_directory, parent_guard) =
+            WritableDirGuard::new_with_expected(&self.parent_path, Some(parent_identity))?;
         verify_directory_handle_identity(
             &parent_directory,
-            self.parent_identity,
+            parent_identity,
             &self.parent_path,
             "output parent directory",
         )?;
@@ -3277,7 +3983,6 @@ impl TempOutput {
             (Ok(_), Err(error)) => Err(error),
         }
     }
-
 }
 
 fn restore_parent_guard(parent_guard: Option<WritableDirGuard>) -> Result<()> {
@@ -3395,7 +4100,10 @@ struct FilePublicationBatch {
 
 impl FilePublicationBatch {
     fn new() -> Self {
-        Self::with_worker(OutputBatchConfig::from_env(), Arc::new(FileOutputSyncWorker))
+        Self::with_worker(
+            OutputBatchConfig::from_env(),
+            Arc::new(FileOutputSyncWorker),
+        )
     }
 
     fn with_worker(config: OutputBatchConfig, sync_worker: Arc<dyn OutputSyncWorker>) -> Self {
@@ -3423,8 +4131,7 @@ impl FilePublicationBatch {
             action_index,
             prepared,
         });
-        self.pending.len() >= self.config.max_files
-            || self.pending_bytes >= self.config.max_bytes
+        self.pending.len() >= self.config.max_files || self.pending_bytes >= self.config.max_bytes
     }
 
     fn is_empty(&self) -> bool {
@@ -3432,8 +4139,7 @@ impl FilePublicationBatch {
     }
 
     fn is_full(&self) -> bool {
-        self.pending.len() >= self.config.max_files
-            || self.pending_bytes >= self.config.max_bytes
+        self.pending.len() >= self.config.max_files || self.pending_bytes >= self.config.max_bytes
     }
 
     fn flush(
@@ -3457,38 +4163,36 @@ impl FilePublicationBatch {
                 let pending = &pending;
                 let sync_worker = Arc::clone(&self.sync_worker);
                 let next = &next;
-                thread::Builder::new()
-                    .spawn_scoped(scope, move || loop {
-                        let index = next.fetch_add(1, AtomicOrdering::Relaxed);
-                        if index >= pending.len() {
-                            break;
-                        }
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            sync_worker.sync(index, &pending[index].prepared.output)
-                        }))
-                        .unwrap_or_else(|panic| {
-                            let message = panic
-                                .downcast_ref::<&str>()
-                                .copied()
-                                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                                .unwrap_or("unknown panic");
-                            Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("sync worker panicked: {}", message),
-                            ))
-                        });
-                        if sender.send((index, result)).is_err() {
-                            break;
-                        }
-                    })?;
+                thread::Builder::new().spawn_scoped(scope, move || loop {
+                    let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                    if index >= pending.len() {
+                        break;
+                    }
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sync_worker.sync(index, &pending[index].prepared.output)
+                    }))
+                    .unwrap_or_else(|panic| {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("unknown panic");
+                        Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("sync worker panicked: {}", message),
+                        ))
+                    });
+                    if sender.send((index, result)).is_err() {
+                        break;
+                    }
+                })?;
             }
             Ok(())
         });
         drop(sender);
         spawn_result.wrap_err("failed to start temporary file sync worker")?;
 
-        let mut results: Vec<Option<io::Result<()>>> =
-            (0..pending.len()).map(|_| None).collect();
+        let mut results: Vec<Option<io::Result<()>>> = (0..pending.len()).map(|_| None).collect();
         for (index, result) in receiver {
             results[index] = Some(result);
         }
@@ -3542,6 +4246,88 @@ impl FilePublicationBatch {
         }
         Ok(())
     }
+
+    fn seal_into(&mut self, prepared_outputs: &mut [Option<PreparedOutput>]) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
+        let next = AtomicUsize::new(0);
+        let (sender, receiver) = mpsc::channel();
+        let worker_count = self.config.workers.min(pending.len()).max(1);
+        thread::scope(|scope| -> io::Result<()> {
+            for _ in 0..worker_count {
+                let sender = sender.clone();
+                let pending = &pending;
+                let sync_worker = Arc::clone(&self.sync_worker);
+                let next = &next;
+                thread::Builder::new().spawn_scoped(scope, move || loop {
+                    let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                    if index >= pending.len() {
+                        break;
+                    }
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sync_worker.sync(index, &pending[index].prepared.output)
+                    }))
+                    .unwrap_or_else(|panic| {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("unknown panic");
+                        Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("sync worker panicked: {}", message),
+                        ))
+                    });
+                    if sender.send((index, result)).is_err() {
+                        break;
+                    }
+                })?;
+            }
+            Ok(())
+        })
+        .wrap_err("failed to start temporary file sync worker")?;
+        drop(sender);
+        let mut results: Vec<Option<io::Result<()>>> = (0..pending.len()).map(|_| None).collect();
+        for (index, result) in receiver {
+            results[index] = Some(result);
+        }
+        for (index, result) in results.into_iter().enumerate() {
+            match result {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "failed to sync output for {} at batch item {}",
+                            pending[index].prepared.final_entry.path().display(),
+                            index
+                        )
+                    });
+                }
+                None => {
+                    return Err(eyre!(
+                        "temporary file sync worker stopped before syncing batch item {}",
+                        index
+                    ));
+                }
+            }
+        }
+        for mut item in pending {
+            item.prepared.output.close_after_sync()?;
+            if prepared_outputs[item.action_index]
+                .replace(item.prepared)
+                .is_some()
+            {
+                return Err(eyre!(
+                    "duplicate prepared output for action {}",
+                    item.action_index
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn create_staging_directory(
@@ -3558,13 +4344,20 @@ fn create_staging_directory(
         let stage_name = path_component_cstring(stage_component.as_ref(), "stage directory name")?;
         let stage_dir = stage_parent.join(&stage_component);
         match cvt(unsafe {
-            libc::mkdirat(stage_parent_directory.as_raw_fd(), stage_name.as_ptr(), 0o700)
+            libc::mkdirat(
+                stage_parent_directory.as_raw_fd(),
+                stage_name.as_ptr(),
+                0o700,
+            )
         }) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
                 return Err(e).wrap_err_with(|| {
-                    format!("failed to create temporary directory {}", stage_dir.display())
+                    format!(
+                        "failed to create temporary directory {}",
+                        stage_dir.display()
+                    )
                 });
             }
         }
@@ -3606,7 +4399,10 @@ fn create_staging_directory(
             Err(error) => {
                 cleanup_unopened_stage_at(stage_parent_directory, &stage_name, &created_stat);
                 return Err(error).wrap_err_with(|| {
-                    format!("failed to retain temporary directory {}", stage_dir.display())
+                    format!(
+                        "failed to retain temporary directory {}",
+                        stage_dir.display()
+                    )
                 });
             }
         };
@@ -3653,7 +4449,10 @@ fn create_staging_directory(
                 &stage_dir,
             )?;
             let opened_meta = directory.metadata().wrap_err_with(|| {
-                format!("failed to inspect temporary directory {}", stage_dir.display())
+                format!(
+                    "failed to inspect temporary directory {}",
+                    stage_dir.display()
+                )
             })?;
             if created_stat.st_dev as u64 != opened_meta.dev()
                 || created_stat.st_ino as u64 != opened_meta.ino()
@@ -3752,11 +4551,20 @@ fn normalize_stage_directory_mode(
     set_retained_directory_mode(retained, 0o700, path)
         .wrap_err_with(|| format!("failed to secure temporary directory {}", path.display()))?;
     let retained_after = retained.metadata().wrap_err_with(|| {
-        format!("failed to verify retained temporary directory {}", path.display())
+        format!(
+            "failed to verify retained temporary directory {}",
+            path.display()
+        )
     })?;
     let after = fstatat_nofollow(parent.as_raw_fd(), name)
         .wrap_err_with(|| format!("failed to verify temporary directory {}", path.display()))?;
-    verify_stat_identity(created, &after, libc::S_IFDIR, path, "new temporary directory")?;
+    verify_stat_identity(
+        created,
+        &after,
+        libc::S_IFDIR,
+        path,
+        "new temporary directory",
+    )?;
     if retained_after.dev() != created.st_dev as u64
         || retained_after.ino() != created.st_ino as u64
         || !retained_after.is_dir()
@@ -3799,9 +4607,13 @@ fn verify_retained_directory_at_identity(
     path: &Path,
     description: &str,
 ) -> Result<()> {
-    let retained_meta = retained
-        .metadata()
-        .wrap_err_with(|| format!("failed to inspect retained {} {}", description, path.display()))?;
+    let retained_meta = retained.metadata().wrap_err_with(|| {
+        format!(
+            "failed to inspect retained {} {}",
+            description,
+            path.display()
+        )
+    })?;
     if !retained_meta.is_dir()
         || retained_meta.dev() != created.st_dev as u64
         || retained_meta.ino() != created.st_ino as u64
@@ -3827,11 +4639,14 @@ fn verify_directory_at_identity(
     directory: &fs::File,
     path: &Path,
 ) -> Result<()> {
-    let expected = directory.metadata().wrap_err_with(|| {
-        format!("failed to inspect temporary directory {}", path.display())
-    })?;
+    let expected = directory
+        .metadata()
+        .wrap_err_with(|| format!("failed to inspect temporary directory {}", path.display()))?;
     let actual = fstatat_nofollow(parent.as_raw_fd(), name).wrap_err_with(|| {
-        format!("failed to inspect temporary directory path {}", path.display())
+        format!(
+            "failed to inspect temporary directory path {}",
+            path.display()
+        )
     })?;
     if actual.st_mode & libc::S_IFMT != libc::S_IFDIR
         || actual.st_dev as u64 != expected.dev()
@@ -3846,9 +4661,13 @@ fn verify_directory_at_identity(
 }
 
 fn verify_path_identity(path: &Path, retained: &fs::File, description: &str) -> Result<()> {
-    let expected = retained
-        .metadata()
-        .wrap_err_with(|| format!("failed to inspect retained {} {}", description, path.display()))?;
+    let expected = retained.metadata().wrap_err_with(|| {
+        format!(
+            "failed to inspect retained {} {}",
+            description,
+            path.display()
+        )
+    })?;
     let actual = fs::symlink_metadata(path)
         .wrap_err_with(|| format!("failed to inspect {} path {}", description, path.display()))?;
     if !actual.is_dir() || actual.dev() != expected.dev() || actual.ino() != expected.ino() {
@@ -3867,12 +4686,20 @@ fn verify_same_directory_handles(
     path: &Path,
     description: &str,
 ) -> Result<()> {
-    let expected = expected
-        .metadata()
-        .wrap_err_with(|| format!("failed to inspect retained {} {}", description, path.display()))?;
-    let actual = actual
-        .metadata()
-        .wrap_err_with(|| format!("failed to inspect reopened {} {}", description, path.display()))?;
+    let expected = expected.metadata().wrap_err_with(|| {
+        format!(
+            "failed to inspect retained {} {}",
+            description,
+            path.display()
+        )
+    })?;
+    let actual = actual.metadata().wrap_err_with(|| {
+        format!(
+            "failed to inspect reopened {} {}",
+            description,
+            path.display()
+        )
+    })?;
     if !actual.is_dir() || actual.dev() != expected.dev() || actual.ino() != expected.ino() {
         return Err(eyre!(
             "{} path {} no longer refers to the retained directory",
@@ -3883,11 +4710,7 @@ fn verify_same_directory_handles(
     Ok(())
 }
 
-fn cleanup_stage_at(
-    parent: &fs::File,
-    stage_name: &std::ffi::CStr,
-    directory: &fs::File,
-) {
+fn cleanup_stage_at(parent: &fs::File, stage_name: &std::ffi::CStr, directory: &fs::File) {
     if directory
         .metadata()
         .map(|meta| meta.uid() != unsafe { libc::geteuid() })
@@ -3895,13 +4718,8 @@ fn cleanup_stage_at(
     {
         return;
     }
-    if verify_directory_at_identity(
-        parent,
-        stage_name,
-        directory,
-        Path::new("stage directory"),
-    )
-    .is_err()
+    if verify_directory_at_identity(parent, stage_name, directory, Path::new("stage directory"))
+        .is_err()
     {
         return;
     }
@@ -3986,14 +4804,13 @@ impl WritableDirGuard {
         }
         let directory = match open_directory_for_access(path) {
             Ok(directory) => directory,
-            Err(error) if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                error.kind() == io::ErrorKind::PermissionDenied
-            }) => open_directory_after_bootstrap_widening(
-                path,
-                &path_meta,
-                expected,
-                original_mode,
-            )?,
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied) =>
+            {
+                open_directory_after_bootstrap_widening(path, &path_meta, expected, original_mode)?
+            }
             Err(error) => return Err(error),
         };
         if let Err(error) = verify_path_identity(path, &directory, "output parent directory") {
@@ -4033,17 +4850,23 @@ impl WritableDirGuard {
                 });
             }
         };
-        Ok((directory, Some(Self {
-            path: path.to_path_buf(),
-            directory: guard_directory,
-            original_mode,
-        })))
+        Ok((
+            directory,
+            Some(Self {
+                path: path.to_path_buf(),
+                directory: guard_directory,
+                original_mode,
+            }),
+        ))
     }
 
     fn from_retained(path: &Path, directory: &fs::File) -> Result<Option<Self>> {
         verify_path_identity(path, directory, "temporary directory parent")?;
         let metadata = directory.metadata().wrap_err_with(|| {
-            format!("failed to inspect directory permissions for {}", path.display())
+            format!(
+                "failed to inspect directory permissions for {}",
+                path.display()
+            )
         })?;
         let original_mode = metadata.permissions().mode() & 0o7777;
         if owner_write_execute(original_mode) {
@@ -4052,9 +4875,14 @@ impl WritableDirGuard {
         let guard_directory = directory.try_clone().wrap_err_with(|| {
             format!("failed to retain directory handle for {}", path.display())
         })?;
-        set_retained_directory_mode(directory, original_mode | 0o700, path).wrap_err_with(|| {
-            format!("failed to make directory writable for sync {}", path.display())
-        })?;
+        set_retained_directory_mode(directory, original_mode | 0o700, path).wrap_err_with(
+            || {
+                format!(
+                    "failed to make directory writable for sync {}",
+                    path.display()
+                )
+            },
+        )?;
         if let Err(error) = verify_path_identity(path, directory, "temporary directory parent") {
             let _ = set_retained_directory_mode(directory, original_mode, path);
             return Err(error);
@@ -4068,9 +4896,12 @@ impl WritableDirGuard {
 
     fn restore(mut self) -> Result<()> {
         set_retained_directory_mode(&self.directory, self.original_mode, &self.path)
-            .wrap_err_with(|| format!(
-                "failed to restore directory permissions after sync {}", self.path.display()
-            ))?;
+            .wrap_err_with(|| {
+                format!(
+                    "failed to restore directory permissions after sync {}",
+                    self.path.display()
+                )
+            })?;
         verify_path_identity(&self.path, &self.directory, "output parent directory")?;
         self.path.clear();
         Ok(())
@@ -4095,18 +4926,14 @@ fn open_directory_after_bootstrap_widening(
         dev: initial.dev(),
         ino: initial.ino(),
     });
-    let retained = open_permission_independent_directory_at(&parent, &name).wrap_err_with(|| {
-        format!(
-            "failed to retain mode-independent access to output parent {}",
-            path.display()
-        )
-    })?;
-    verify_directory_handle_identity(
-        &retained,
-        expected,
-        path,
-        "output parent directory",
-    )?;
+    let retained =
+        open_permission_independent_directory_at(&parent, &name).wrap_err_with(|| {
+            format!(
+                "failed to retain mode-independent access to output parent {}",
+                path.display()
+            )
+        })?;
+    verify_directory_handle_identity(&retained, expected, path, "output parent directory")?;
     verify_path_identity(path, &retained, "output parent directory")?;
     if let Err(error) = set_retained_directory_mode(&retained, original_mode | 0o700, path) {
         let restore = set_retained_directory_mode(&retained, original_mode, path);
@@ -4145,14 +4972,17 @@ fn open_directory_after_bootstrap_widening(
             };
         }
     };
-    let verify = verify_directory_handle_identity(
-        &directory,
-        expected,
-        path,
-        "output parent directory",
-    )
-    .and_then(|()| verify_same_directory_handles(&retained, &directory, path, "output parent directory"))
-    .and_then(|()| verify_path_identity(path, &directory, "output parent directory"));
+    let verify =
+        verify_directory_handle_identity(&directory, expected, path, "output parent directory")
+            .and_then(|()| {
+                verify_same_directory_handles(
+                    &retained,
+                    &directory,
+                    path,
+                    "output parent directory",
+                )
+            })
+            .and_then(|()| verify_path_identity(path, &directory, "output parent directory"));
     if let Err(error) = verify {
         let restore = set_retained_directory_mode(&retained, original_mode, path);
         return match restore {
@@ -4196,11 +5026,7 @@ fn open_permission_independent_directory_at(
     ))
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_vendor = "apple"
-)))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn open_permission_independent_directory_at(
     _parent: &fs::File,
     _name: &std::ffi::CStr,
@@ -4214,7 +5040,9 @@ fn open_permission_independent_directory_at(
 fn open_directory_for_access(path: &Path) -> Result<fs::File> {
     fs::OpenOptions::new()
         .read(true)
-        .custom_flags(directory_access_flag() | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(
+            directory_access_flag() | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
         .open(path)
         .wrap_err_with(|| format!("failed to retain access to directory {}", path.display()))
 }
@@ -4377,24 +5205,17 @@ fn set_retained_directory_mode(directory: &fs::File, mode: u32, _path: &Path) ->
 impl Drop for WritableDirGuard {
     fn drop(&mut self) {
         if !self.path.as_os_str().is_empty() {
-            let _ = set_retained_directory_mode(
-                &self.directory,
-                self.original_mode,
-                &self.path,
-            );
+            let _ = set_retained_directory_mode(&self.directory, self.original_mode, &self.path);
         }
     }
 }
 
 impl Drop for TempOutput {
     fn drop(&mut self) {
-        if self
-            .verify_at_identity(
-                &self.staging.directory,
-                &self.output_name,
-                &self.temp_path,
-            )
-            .is_ok()
+        if self.cleanup_on_drop
+            && self
+                .verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)
+                .is_ok()
         {
             let _ = unlinkat(self.staging.directory.as_raw_fd(), &self.output_name, 0);
         }
@@ -4522,12 +5343,20 @@ fn create_private_directory(path: &Path) -> Result<()> {
         .metadata()
         .wrap_err_with(|| format!("failed to inspect new directory {}", path.display()))?;
     if !meta.is_dir() {
-        return Err(eyre!("new directory path {} is not a directory", path.display()));
+        return Err(eyre!(
+            "new directory path {} is not a directory",
+            path.display()
+        ));
     }
     let private_mode = 0o700 | (meta.mode() & 0o2000);
     directory
         .set_permissions(fs::Permissions::from_mode(private_mode))
-        .wrap_err_with(|| format!("failed to normalize directory permissions {}", path.display()))
+        .wrap_err_with(|| {
+            format!(
+                "failed to normalize directory permissions {}",
+                path.display()
+            )
+        })
 }
 
 enum ApplyState {
@@ -4547,6 +5376,7 @@ pub struct DetailApplier {
     actions: Vec<Action>,
     all_old: Vec<Entry>,
     attempt_state: Option<PathBuf>,
+    attempt_id: Option<String>,
     recorder: ApplyRecorder,
     scan_policy: Option<ScanPolicy>,
     apply_options: ApplyOptions,
@@ -4555,9 +5385,22 @@ pub struct DetailApplier {
     new_entries: Vec<Entry>,
     state: Option<ApplyState>,
     output_batch: FilePublicationBatch,
+    prepared_outputs: Vec<Option<PreparedOutput>>,
     // Drop pending outputs before removing their shared staging directory.
     staging: Option<StagingArea>,
     failed: Option<String>,
+}
+
+pub struct PreparedApply {
+    inner: DetailApplier,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedApplyReport {
+    pub action_count: usize,
+    pub prepared_file_count: usize,
+    pub prepared_file_bytes: u64,
 }
 
 impl DetailApplier {
@@ -4578,6 +5421,28 @@ impl DetailApplier {
         )
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn new_staged_with_attempt_and_policy(
+        base: PathBuf,
+        actions: Vec<Action>,
+        all_old: Vec<Entry>,
+        attempt_state: PathBuf,
+        attempt_id: String,
+        scan_policy: Option<ScanPolicy>,
+        apply_options: ApplyOptions,
+    ) -> Self {
+        let mut applier = Self::new_with_attempt_and_policy(
+            base,
+            actions,
+            all_old,
+            Some(attempt_state),
+            scan_policy,
+            apply_options,
+        );
+        applier.attempt_id = Some(attempt_id);
+        applier
+    }
+
     pub fn new_with_attempt_and_policy(
         base: PathBuf,
         actions: Vec<Action>,
@@ -4586,12 +5451,15 @@ impl DetailApplier {
         scan_policy: Option<ScanPolicy>,
         apply_options: ApplyOptions,
     ) -> Self {
+        let mut prepared_outputs = Vec::with_capacity(actions.len());
+        prepared_outputs.resize_with(actions.len(), || None);
         DetailApplier {
             base,
             actions,
             all_old,
             recorder: ApplyRecorder::new(attempt_state.clone()),
             attempt_state,
+            attempt_id: None,
             scan_policy,
             apply_options,
             old_index: 0,
@@ -4600,6 +5468,7 @@ impl DetailApplier {
             state: None,
             staging: None,
             output_batch: FilePublicationBatch::new(),
+            prepared_outputs,
             failed: None,
         }
     }
@@ -4697,10 +5566,9 @@ impl DetailApplier {
             DetailPayload::DiffBegin if expected_detail == Some(ApplyDetailKind::Diff) => {
                 self.begin_diff_detail(frame_index)
             }
-            DetailPayload::FileBegin | DetailPayload::DiffBegin => Err(eyre!(
-                "unexpected detail kind for action {}",
-                frame_index
-            )),
+            DetailPayload::FileBegin | DetailPayload::DiffBegin => {
+                Err(eyre!("unexpected detail kind for action {}", frame_index))
+            }
             _ => Err(eyre!(
                 "detail stream for action {} did not begin with a begin frame",
                 frame_index
@@ -4715,7 +5583,16 @@ impl DetailApplier {
         })
     }
 
-    pub fn finish(mut self) -> Result<Vec<Entry>> {
+    pub fn finish(self) -> Result<Vec<Entry>> {
+        self.finish_preparation()?.commit()
+    }
+
+    #[allow(dead_code)]
+    pub fn prepare(self) -> Result<PreparedApply> {
+        self.finish_preparation()
+    }
+
+    pub fn finish_preparation(mut self) -> Result<PreparedApply> {
         if let Some(failed) = &self.failed {
             return Err(eyre!("detail apply stream already failed: {}", failed));
         }
@@ -4723,25 +5600,22 @@ impl DetailApplier {
             return Err(eyre!("detail stream ended with an unfinished file"));
         }
         self.advance_to_action(self.actions.len())?;
-        self.flush_outputs()?;
-        self.apply_directory_second_pass()?;
-
-        for e in self.all_old.iter().skip(self.old_index) {
-            self.new_entries.push(e.clone());
+        self.seal_outputs()?;
+        if let Some(staging) = &self.staging {
+            staging.seal()?;
         }
-        self.new_entries.sort();
-        let metadata_synced = metadata_synced_directories(&self.base, &self.actions);
-        let already_synced = match self.staging.take() {
-            Some(staging) => staging.finish(&metadata_synced)?,
-            None => HashSet::new(),
-        };
-        complete_apply_phase(
-            &self.base,
-            &self.actions,
-            self.attempt_state.as_deref(),
-            &already_synced,
-        )?;
-        Ok(self.new_entries)
+        validate_actions(&self.actions)?;
+        if let (Some(state_path), Some(attempt_id)) =
+            (self.attempt_state.as_deref(), self.attempt_id.as_deref())
+        {
+            transition_staged_apply_attempt(
+                state_path,
+                attempt_id,
+                &[ApplyAttemptPhase::Preparing],
+                ApplyAttemptPhase::Prepared,
+            )?;
+        }
+        Ok(PreparedApply { inner: self })
     }
 
     fn advance_to_action(&mut self, target_index: usize) -> Result<()> {
@@ -4752,8 +5626,6 @@ impl DetailApplier {
                     self.action_index
                 ));
             }
-            self.flush_outputs()?;
-            self.apply_action_without_detail(self.action_index)?;
             self.action_index += 1;
         }
         Ok(())
@@ -4946,11 +5818,9 @@ impl DetailApplier {
     }
 
     fn begin_file_detail(&mut self, action_index: usize) -> Result<()> {
-        self.prepare_action(action_index);
         let output_bytes = action_output_entry(&self.actions[action_index])?.size();
         self.flush_before_output(output_bytes)?;
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
-        ensure_parent_directory(&filename)?;
         let output = self.new_output(filename)?;
         self.state = Some(ApplyState::File {
             action_index,
@@ -4960,7 +5830,6 @@ impl DetailApplier {
     }
 
     fn begin_diff_detail(&mut self, action_index: usize) -> Result<()> {
-        self.prepare_action(action_index);
         let output_bytes = action_output_entry(&self.actions[action_index])?.size();
         self.flush_before_output(output_bytes)?;
         let filename = detail_filename(&self.base, &self.actions[action_index])?;
@@ -4982,17 +5851,31 @@ impl DetailApplier {
 
     fn new_output(&mut self, final_path: PathBuf) -> Result<TempOutput> {
         if self.staging.is_none() {
-            let staging = StagingArea::new(output_parent(&final_path))?;
-            self.recorder.record_staged_file(staging.path())?;
+            let mut staging = StagingArea::new(&self.base)?;
+            if let (Some(state_path), Some(attempt_id)) =
+                (self.attempt_state.as_deref(), self.attempt_id.as_deref())
+            {
+                record_v2_stage(state_path, attempt_id, &staging)?;
+                staging.retain_for_recovery();
+            } else {
+                self.recorder.record_staged_file(staging.path())?;
+            }
             self.staging = Some(staging);
         }
-        TempOutput::new(
+        let mut output = TempOutput::new(
             final_path,
             self.staging
                 .as_ref()
                 .expect("staging area is initialized")
                 .shared(),
-        )
+        )?;
+        if let (Some(state_path), Some(attempt_id)) =
+            (self.attempt_state.as_deref(), self.attempt_id.as_deref())
+        {
+            record_v2_stage_entry(state_path, attempt_id, &output)?;
+            output.cleanup_on_drop = false;
+        }
+        Ok(output)
     }
 
     fn finish_file_detail(&mut self) -> Result<()> {
@@ -5019,38 +5902,75 @@ impl DetailApplier {
             _ => return Err(eyre!("file detail finished for non-file action")),
         };
         output.verify_contents(entry, "file output")?;
-        let publication = if let Some(old_entry) = replacement_old_entry(&self.actions[action_index]) {
-            OutputPublication::Replace {
-                expected: old_entry.clone(),
-            }
-        } else {
-            OutputPublication::NoReplace {
-                description: "rename target".to_string(),
-            }
-        };
+        let publication =
+            if let Some(old_entry) = replacement_old_entry(&self.actions[action_index]) {
+                OutputPublication::Replace {
+                    expected: old_entry.clone(),
+                }
+            } else {
+                OutputPublication::NoReplace {
+                    description: "rename target".to_string(),
+                }
+            };
         let prepared = output.prepare(entry, publication)?;
         let flush = self.output_batch.push(action_index, prepared);
         self.action_index = action_index + 1;
         if flush {
-            self.flush_outputs()?;
+            self.seal_outputs()?;
         }
         Ok(())
     }
 
     fn flush_before_output(&mut self, bytes: u64) -> Result<()> {
         if self.output_batch.should_flush_before(bytes) {
-            self.flush_outputs()?;
+            self.seal_outputs()?;
         }
         Ok(())
     }
 
-    fn flush_outputs(&mut self) -> Result<()> {
-        self.output_batch
-            .flush(&self.actions, &mut self.recorder, &mut self.new_entries)
+    fn seal_outputs(&mut self) -> Result<()> {
+        self.output_batch.seal_into(&mut self.prepared_outputs)
+    }
+
+    fn publish_prepared_output(&mut self, action_index: usize) -> Result<()> {
+        let PreparedOutput {
+            output,
+            final_entry,
+            publication,
+        } = self.prepared_outputs[action_index]
+            .take()
+            .ok_or_else(|| eyre!("missing prepared output for action {}", action_index))?;
+        ensure_parent_directory(&output.final_path)?;
+        let action = &self.actions[action_index];
+        let recorder = &mut self.recorder;
+        let new_entries = &mut self.new_entries;
+        #[cfg(test)]
+        let post_commit_hook = self.output_batch.post_commit_hook.clone();
+        let on_commit = |entry: &Entry| -> Result<()> {
+            recorder.record_committed_step("rename-file", entry.path())?;
+            new_entries.push(entry.clone());
+            recorder.record_committed_step("update-metadata", entry.path())?;
+            recorder.record_committed_action(action)?;
+            #[cfg(test)]
+            if let Some(hook) = &post_commit_hook {
+                hook(action_index)?;
+            }
+            Ok(())
+        };
+        match publication {
+            OutputPublication::Replace { expected } => {
+                output.publish_replacing(final_entry, &expected, on_commit)?;
+            }
+            OutputPublication::NoReplace { description } => {
+                output.publish_without_replacing(final_entry, &description, on_commit)?;
+            }
+        }
+        Ok(())
     }
 
     fn apply_directory_second_pass(&mut self) -> Result<()> {
-        let removal_policy = RemovalBlockerPolicy::new(self.scan_policy.as_ref(), self.apply_options)?;
+        let removal_policy =
+            RemovalBlockerPolicy::new(self.scan_policy.as_ref(), self.apply_options)?;
         let removed_paths = removed_destination_paths(&self.actions);
         for action in self.actions.iter().rev() {
             match action {
@@ -5106,6 +6026,147 @@ impl DetailApplier {
                     record_committed_action(self.attempt_state.as_deref(), action)?;
                 }
                 _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PreparedApply {
+    #[allow(dead_code)]
+    pub fn report(&self) -> PreparedApplyReport {
+        let mut prepared_file_count = 0;
+        let mut prepared_file_bytes = 0u64;
+        for output in self.inner.prepared_outputs.iter().flatten() {
+            prepared_file_count += 1;
+            prepared_file_bytes = prepared_file_bytes.saturating_add(output.final_entry.size());
+        }
+        PreparedApplyReport {
+            action_count: self.inner.actions.len(),
+            prepared_file_count,
+            prepared_file_bytes,
+        }
+    }
+
+    pub fn validate_commit(&self) -> Result<()> {
+        preflight_apply_with_policy(
+            &self.inner.base,
+            &self.inner.actions,
+            self.inner.scan_policy.as_ref(),
+            self.inner.apply_options,
+        )?;
+        for output in self.inner.prepared_outputs.iter().flatten() {
+            output.output.verify_at_identity(
+                &output.output.staging.directory,
+                &output.output.output_name,
+                &output.output.temp_path,
+            )?;
+            output
+                .output
+                .verify_prepared_contents(&output.final_entry)?;
+        }
+        for action in &self.inner.actions {
+            let change = match action {
+                Action::Local(change) | Action::ResolvedLocal((_, _), change) => change,
+                _ => continue,
+            };
+            let path = safe_join(&self.inner.base, change.path())?;
+            match change {
+                Change::Added(_) => match path.symlink_metadata() {
+                    Ok(_) => {
+                        return Err(eyre!(
+                            "destination {} appeared after staged preparation",
+                            path.display()
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).wrap_err_with(|| {
+                            format!("unable to validate destination {}", path.display())
+                        });
+                    }
+                },
+                Change::Removed(old) | Change::Modified(old, _) => {
+                    verify_current_matches_entry(&path, old, "staged commit target")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn commit(mut self) -> Result<Vec<Entry>> {
+        self.validate_commit()?;
+        if let (Some(state_path), Some(attempt_id)) = (
+            self.inner.attempt_state.as_deref(),
+            self.inner.attempt_id.as_deref(),
+        ) {
+            transition_staged_apply_attempt(
+                state_path,
+                attempt_id,
+                &[ApplyAttemptPhase::Prepared],
+                ApplyAttemptPhase::Committing,
+            )?;
+        }
+
+        self.inner.old_index = 0;
+        self.inner.action_index = 0;
+        self.inner.new_entries.clear();
+        for action_index in 0..self.inner.actions.len() {
+            if self.inner.prepared_outputs[action_index].is_some() {
+                self.inner.prepare_action(action_index);
+                self.inner.publish_prepared_output(action_index)?;
+            } else {
+                self.inner.apply_action_without_detail(action_index)?;
+            }
+            self.inner.action_index = action_index + 1;
+        }
+        self.inner.apply_directory_second_pass()?;
+
+        for entry in self.inner.all_old.iter().skip(self.inner.old_index) {
+            self.inner.new_entries.push(entry.clone());
+        }
+        self.inner.new_entries.sort();
+        let metadata_synced = metadata_synced_directories(&self.inner.base, &self.inner.actions);
+        let already_synced = match self.inner.staging.take() {
+            Some(staging) => staging.finish(&metadata_synced)?,
+            None => HashSet::new(),
+        };
+        complete_apply_phase(
+            &self.inner.base,
+            &self.inner.actions,
+            self.inner.attempt_state.as_deref(),
+            &already_synced,
+        )?;
+        if let (Some(state_path), Some(attempt_id)) = (
+            self.inner.attempt_state.as_deref(),
+            self.inner.attempt_id.as_deref(),
+        ) {
+            transition_staged_apply_attempt(
+                state_path,
+                attempt_id,
+                &[ApplyAttemptPhase::Committing],
+                ApplyAttemptPhase::Committed,
+            )?;
+        }
+        Ok(std::mem::take(&mut self.inner.new_entries))
+    }
+
+    #[allow(dead_code)]
+    pub fn abort(mut self) -> Result<()> {
+        if let (Some(state_path), Some(attempt_id)) = (
+            self.inner.attempt_state.as_deref(),
+            self.inner.attempt_id.as_deref(),
+        ) {
+            abort_staged_apply_attempt(state_path, attempt_id)?;
+        }
+        self.inner.output_batch.pending.clear();
+        for output in &mut self.inner.prepared_outputs {
+            *output = None;
+        }
+        self.inner.staging = None;
+        if self.inner.attempt_id.is_none() {
+            if let Some(state_path) = self.inner.attempt_state.as_deref() {
+                finish_apply_attempt(state_path)?;
             }
         }
         Ok(())
@@ -5406,11 +6467,7 @@ fn apply_detailed_changes_with_output_batch(
                                         }
                                     }
                                 } else {
-                                    verify_current_matches_entry(
-                                        &filename,
-                                        e1,
-                                        "metadata target",
-                                    )?;
+                                    verify_current_matches_entry(&filename, e1, "metadata target")?;
                                 }
                                 if e1.same_contents(e2) {
                                     new_entries.push(update_meta(&filename, e2)?);
@@ -5431,13 +6488,15 @@ fn apply_detailed_changes_with_output_batch(
                                 })?;
                                 record_committed_step(attempt_state, "remove-file", e1.path())?;
                                 if let Some(p) = e2.target() {
-                                    std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
-                                        format!(
-                                            "failed to create symlink {} -> {}",
-                                            filename.display(),
-                                            p.display()
-                                        )
-                                    })?;
+                                    std::os::unix::fs::symlink(p, &filename).wrap_err_with(
+                                        || {
+                                            format!(
+                                                "failed to create symlink {} -> {}",
+                                                filename.display(),
+                                                p.display()
+                                            )
+                                        },
+                                    )?;
                                     record_committed_step(
                                         attempt_state,
                                         "create-symlink",
@@ -5469,11 +6528,7 @@ fn apply_detailed_changes_with_output_batch(
                             if e2.is_file() {
                                 let detail = next_detail(&mut details_iter, e2.path())?;
                                 if output_batch.should_flush_before(e2.size()) {
-                                    output_batch.flush(
-                                        actions,
-                                        &mut recorder,
-                                        &mut new_entries,
-                                    )?;
+                                    output_batch.flush(actions, &mut recorder, &mut new_entries)?;
                                 }
                                 create_file(
                                     &filename,
@@ -5486,11 +6541,7 @@ fn apply_detailed_changes_with_output_batch(
                                 )?;
                                 queued_file_output = true;
                                 if output_batch.is_full() {
-                                    output_batch.flush(
-                                        actions,
-                                        &mut recorder,
-                                        &mut new_entries,
-                                    )?;
+                                    output_batch.flush(actions, &mut recorder, &mut new_entries)?;
                                 }
                             } else if let Some(p) = e2.target() {
                                 std::os::unix::fs::symlink(p, &filename).wrap_err_with(|| {
@@ -5500,17 +6551,9 @@ fn apply_detailed_changes_with_output_batch(
                                         p.display()
                                     )
                                 })?;
-                                record_committed_step(
-                                    attempt_state,
-                                    "create-symlink",
-                                    e2.path(),
-                                )?;
+                                record_committed_step(attempt_state, "create-symlink", e2.path())?;
                                 new_entries.push(update_meta(&filename, e2)?);
-                                record_committed_step(
-                                    attempt_state,
-                                    "update-metadata",
-                                    e2.path(),
-                                )?;
+                                record_committed_step(attempt_state, "update-metadata", e2.path())?;
                             } else if e2.is_dir() {
                                 create_private_directory(&filename)?;
                                 record_committed_step(attempt_state, "create-dir", e2.path())?;
@@ -5524,10 +6567,7 @@ fn apply_detailed_changes_with_output_batch(
                                 leftover_details.push(detail);
                             }
                         } else {
-                            return Err(eyre!(
-                                "unsupported old entry for {}",
-                                e1.path().display()
-                            ));
+                            return Err(eyre!("unsupported old entry for {}", e1.path().display()));
                         }
                     }
                 }
@@ -5617,11 +6657,7 @@ fn apply_detailed_changes_with_output_batch(
                                         p.display()
                                     )
                                 })?;
-                                record_committed_step(
-                                    attempt_state,
-                                    "create-symlink",
-                                    e2.path(),
-                                )?;
+                                record_committed_step(attempt_state, "create-symlink", e2.path())?;
                             } else if e2.is_file() {
                                 let detail = details_iter.next().ok_or_else(|| {
                                     eyre!("missing detail for {}", e2.path().display())
@@ -5636,11 +6672,7 @@ fn apply_detailed_changes_with_output_batch(
                                     &mut output_batch,
                                 )?;
                                 queued_file_output = true;
-                                output_batch.flush(
-                                    actions,
-                                    &mut recorder,
-                                    &mut new_entries,
-                                )?;
+                                output_batch.flush(actions, &mut recorder, &mut new_entries)?;
                             }
                         }
                         if e1.is_dir() && e2.is_dir() {
@@ -5748,13 +6780,27 @@ fn create_file_with_contents(
     if let Some(expected) = entry.digest() {
         let actual = content_digest(data);
         if actual != expected {
-            return Err(eyre!("file detail for {} strong digest mismatch: expected {}, got {}", entry.path().display(), expected, actual));
+            return Err(eyre!(
+                "file detail for {} strong digest mismatch: expected {}, got {}",
+                entry.path().display(),
+                expected,
+                actual
+            ));
         }
     } else {
-        let checksum = adler32::adler32(data)
-            .wrap_err_with(|| format!("failed to checksum legacy detail for {}", entry.path().display()))?;
+        let checksum = adler32::adler32(data).wrap_err_with(|| {
+            format!(
+                "failed to checksum legacy detail for {}",
+                entry.path().display()
+            )
+        })?;
         if checksum != entry.checksum() {
-            return Err(eyre!("file detail for {} legacy checksum mismatch: expected {}, got {}", entry.path().display(), entry.checksum(), checksum));
+            return Err(eyre!(
+                "file detail for {} legacy checksum mismatch: expected {}, got {}",
+                entry.path().display(),
+                entry.checksum(),
+                checksum
+            ));
         }
     }
 
@@ -5818,13 +6864,25 @@ fn verify_open_file_matches_entry(
         let actual = content_digest_reader(file)
             .wrap_err_with(|| format!("failed to hash {}", filename.display()))?;
         if actual != expected {
-            return Err(eyre!("{} {} strong digest mismatch: expected {}, got {}", description, entry.path().display(), expected, actual));
+            return Err(eyre!(
+                "{} {} strong digest mismatch: expected {}, got {}",
+                description,
+                entry.path().display(),
+                expected,
+                actual
+            ));
         }
     } else {
         let checksum = adler32::adler32(file)
             .wrap_err_with(|| format!("failed to checksum legacy file {}", filename.display()))?;
         if checksum != entry.checksum() {
-            return Err(eyre!("{} {} legacy checksum mismatch: expected {}, got {}", description, entry.path().display(), entry.checksum(), checksum));
+            return Err(eyre!(
+                "{} {} legacy checksum mismatch: expected {}, got {}",
+                description,
+                entry.path().display(),
+                entry.checksum(),
+                checksum
+            ));
         }
     }
 
@@ -5975,8 +7033,9 @@ fn update_meta(path: &PathBuf, e: &Entry) -> Result<Entry> {
                 })?
             }
             Err(error) => {
-                return Err(error)
-                    .wrap_err_with(|| format!("failed to open metadata target {}", path.display()));
+                return Err(error).wrap_err_with(|| {
+                    format!("failed to open metadata target {}", path.display())
+                });
             }
         };
         file.set_permissions(fs::Permissions::from_mode(desired_mode))
@@ -6051,14 +7110,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let expected = [10, 10, 10, 10];
         let collision = [11, 9, 9, 11];
-        assert_eq!(adler32::adler32(&expected[..]).unwrap(), adler32::adler32(&collision[..]).unwrap());
+        assert_eq!(
+            adler32::adler32(&expected[..]).unwrap(),
+            adler32::adler32(&collision[..]).unwrap()
+        );
         std::fs::write(dir.path().join("file"), collision).unwrap();
         let mut entry = test_file_entry("file", &expected);
         entry.set_digest(Some(content_digest(&expected)));
 
-        let error = verify_file_matches_entry(&dir.path().join("file"), &entry, "target").unwrap_err();
+        let error =
+            verify_file_matches_entry(&dir.path().join("file"), &entry, "target").unwrap_err();
 
-        assert!(error.to_string().contains("strong digest mismatch"), "{}", error);
+        assert!(
+            error.to_string().contains("strong digest mismatch"),
+            "{}",
+            error
+        );
     }
 
     fn mode(path: &Path) -> u32 {
@@ -6097,7 +7164,11 @@ mod tests {
         update_meta(&base.join(path), &Entry::test_dir(PathBuf::from(path))).unwrap()
     }
 
-    fn stream_file(applier: &mut DetailApplier, action_index: usize, contents: &[u8]) -> Result<()> {
+    fn stream_file(
+        applier: &mut DetailApplier,
+        action_index: usize,
+        contents: &[u8],
+    ) -> Result<()> {
         applier.apply_frame(DetailFrame {
             action_index: action_index as u32,
             payload: DetailPayload::FileBegin,
@@ -6315,7 +7386,10 @@ mod tests {
         let state_path = dir.path().join("profile.snp");
         fs::create_dir(&base).unwrap();
         fs::write(&state_path, b"old snapshot").unwrap();
-        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let entries = [
+            test_file_entry("a.txt", b"a"),
+            test_file_entry("b.txt", b"b"),
+        ];
         let actions = entries
             .iter()
             .cloned()
@@ -6356,14 +7430,17 @@ mod tests {
     }
 
     #[test]
-    fn streamed_publication_failure_poisons_finish() {
+    fn streamed_validation_failure_publishes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let state_path = dir.path().join("profile.snp");
         fs::create_dir(&base).unwrap();
         fs::write(&state_path, b"old snapshot").unwrap();
         fs::write(base.join("b.txt"), b"racing destination").unwrap();
-        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let entries = [
+            test_file_entry("a.txt", b"a"),
+            test_file_entry("b.txt", b"b"),
+        ];
         let actions = entries
             .iter()
             .cloned()
@@ -6386,36 +7463,20 @@ mod tests {
         );
 
         stream_file(&mut applier, 0, b"a").unwrap();
-        let publication_error = stream_file(&mut applier, 1, b"b").unwrap_err();
+        stream_file(&mut applier, 1, b"b").unwrap();
+        let publication_error = applier.finish().unwrap_err();
         assert!(
-            publication_error.to_string().contains("already exists"),
+            publication_error
+                .to_string()
+                .contains("appeared after staged preparation"),
             "{}",
             publication_error
         );
-        let retry_error = applier
-            .apply_file_byte_chunk(FileByteChunk::new(1, b"ignored".to_vec()))
-            .unwrap_err();
-        assert!(
-            retry_error
-                .to_string()
-                .contains("detail apply stream already failed"),
-            "{}",
-            retry_error
-        );
-        let finish_error = applier.finish().unwrap_err();
-
-        assert!(
-            finish_error
-                .to_string()
-                .contains("detail apply stream already failed"),
-            "{}",
-            finish_error
-        );
-        assert_eq!(fs::read(base.join("a.txt")).unwrap(), b"a");
+        assert!(!base.join("a.txt").exists());
         assert_eq!(fs::read(base.join("b.txt")).unwrap(), b"racing destination");
         assert_eq!(fs::read(&state_path).unwrap(), b"old snapshot");
         let marker = fs::read_to_string(apply_attempt_path(&state_path).unwrap()).unwrap();
-        assert!(marker.contains("committed-operation: add-file a.txt"));
+        assert!(!marker.contains("committed-operation: add-file a.txt"));
         assert!(!marker.contains("committed-operation: add-file b.txt"));
     }
 
@@ -6448,7 +7509,8 @@ mod tests {
         }));
         applier.output_batch = batch;
 
-        let error = stream_file(&mut applier, 0, b"a").unwrap_err();
+        stream_file(&mut applier, 0, b"a").unwrap();
+        let error = applier.finish().unwrap_err();
 
         assert!(
             error
@@ -6457,22 +7519,12 @@ mod tests {
             "{}",
             error
         );
-        assert_eq!(applier.new_entries.len(), 1);
-        assert_eq!(applier.new_entries[0].path(), Path::new("a.txt"));
         assert_eq!(fs::read(base.join("a.txt")).unwrap(), b"a");
         assert_eq!(fs::read(&state_path).unwrap(), b"old snapshot");
         let marker = fs::read_to_string(apply_attempt_path(&state_path).unwrap()).unwrap();
         assert!(marker.contains("committed-step: rename-file a.txt"));
         assert!(marker.contains("committed-step: update-metadata a.txt"));
         assert!(marker.contains("committed-operation: add-file a.txt"));
-        let finish_error = applier.finish().unwrap_err();
-        assert!(
-            finish_error
-                .to_string()
-                .contains("detail apply stream already failed"),
-            "{}",
-            finish_error
-        );
     }
 
     #[test]
@@ -6499,11 +7551,7 @@ mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
 
         let error = batch
-            .flush(
-                &actions,
-                &mut ApplyRecorder::new(None),
-                &mut Vec::new(),
-            )
+            .flush(&actions, &mut ApplyRecorder::new(None), &mut Vec::new())
             .unwrap_err();
 
         assert!(
@@ -6522,7 +7570,10 @@ mod tests {
     fn worker_panics_are_indexed_errors_and_publish_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let staging = StagingArea::new(dir.path()).unwrap();
-        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let entries = [
+            test_file_entry("a.txt", b"a"),
+            test_file_entry("b.txt", b"b"),
+        ];
         let actions = entries
             .iter()
             .cloned()
@@ -6546,16 +7597,16 @@ mod tests {
         );
 
         let error = batch
-            .flush(
-                &actions,
-                &mut ApplyRecorder::new(None),
-                &mut Vec::new(),
-            )
+            .flush(&actions, &mut ApplyRecorder::new(None), &mut Vec::new())
             .unwrap_err();
         let error_chain = format!("{:#}", error);
 
         assert!(error.to_string().contains("a.txt"), "{}", error);
-        assert!(error_chain.contains("sync worker panicked"), "{}", error_chain);
+        assert!(
+            error_chain.contains("sync worker panicked"),
+            "{}",
+            error_chain
+        );
         assert!(!dir.path().join("a.txt").exists());
         assert!(!dir.path().join("b.txt").exists());
         staging.finish(&HashSet::new()).unwrap();
@@ -6594,21 +7645,11 @@ mod tests {
                         expected_mode: requested_mode,
                     }),
                 );
-                batch.push(
-                    0,
-                    prepared_test_output(&base, &staging, &entries[0], b"a"),
-                );
-                batch.push(
-                    1,
-                    prepared_test_output(&base, &staging, &entries[1], b"b"),
-                );
+                batch.push(0, prepared_test_output(&base, &staging, &entries[0], b"a"));
+                batch.push(1, prepared_test_output(&base, &staging, &entries[1], b"b"));
 
                 assert_eq!(mode(&parent), requested_mode);
-                let result = batch.flush(
-                    &actions,
-                    &mut ApplyRecorder::new(None),
-                    &mut Vec::new(),
-                );
+                let result = batch.flush(&actions, &mut ApplyRecorder::new(None), &mut Vec::new());
                 let bootstrap_unsupported = requested_mode == 0o000
                     && !cfg!(any(target_os = "linux", target_os = "android"));
                 assert_eq!(
@@ -6726,7 +7767,10 @@ mod tests {
     fn fallback_error_drops_pending_outputs_before_staging_area() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().to_path_buf();
-        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let entries = [
+            test_file_entry("a.txt", b"a"),
+            test_file_entry("b.txt", b"b"),
+        ];
         let actions = entries
             .iter()
             .cloned()
@@ -6760,13 +7804,11 @@ mod tests {
         assert!(error.to_string().contains("size mismatch"), "{}", error);
         assert!(!base.join("a.txt").exists());
         assert!(!base.join("b.txt").exists());
-        assert!(fs::read_dir(&base)
+        assert!(fs::read_dir(&base).unwrap().all(|entry| !entry
             .unwrap()
-            .all(|entry| !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".duet-stage-")));
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".duet-stage-")));
     }
 
     #[test]
@@ -6777,7 +7819,10 @@ mod tests {
         fs::create_dir(&base).unwrap();
         fs::write(&state_path, b"old snapshot").unwrap();
         fs::write(base.join("b.txt"), b"racing destination").unwrap();
-        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let entries = [
+            test_file_entry("a.txt", b"a"),
+            test_file_entry("b.txt", b"b"),
+        ];
         let actions = entries
             .iter()
             .cloned()
@@ -6853,11 +7898,7 @@ mod tests {
         }
 
         batch
-            .flush(
-                &actions,
-                &mut ApplyRecorder::new(None),
-                &mut Vec::new(),
-            )
+            .flush(&actions, &mut ApplyRecorder::new(None), &mut Vec::new())
             .unwrap();
 
         assert_eq!(worker.state.lock().unwrap().1, 2);
@@ -6893,9 +7934,11 @@ mod tests {
         stream_file(&mut count_applier, 0, b"aaa").unwrap();
         assert!(!count_dir.path().join("a.txt").exists());
         stream_file(&mut count_applier, 1, b"bbb").unwrap();
+        assert!(!count_dir.path().join("a.txt").exists());
+        assert!(!count_dir.path().join("b.txt").exists());
+        count_applier.finish().unwrap();
         assert!(count_dir.path().join("a.txt").exists());
         assert!(count_dir.path().join("b.txt").exists());
-        count_applier.finish().unwrap();
 
         let byte_dir = tempfile::tempdir().unwrap();
         let byte_actions = count_entries
@@ -6924,7 +7967,7 @@ mod tests {
                 payload: DetailPayload::FileBegin,
             })
             .unwrap();
-        assert!(byte_dir.path().join("a.txt").exists());
+        assert!(!byte_dir.path().join("a.txt").exists());
         assert!(!byte_dir.path().join("b.txt").exists());
         byte_applier
             .apply_frame(DetailFrame {
@@ -6949,7 +7992,10 @@ mod tests {
         let base = dir.path().join("base");
         let state_path = dir.path().join("profile.snp");
         fs::create_dir(&base).unwrap();
-        let entries = [test_file_entry("a.txt", b"a"), test_file_entry("b.txt", b"b")];
+        let entries = [
+            test_file_entry("a.txt", b"a"),
+            test_file_entry("b.txt", b"b"),
+        ];
         let actions = entries
             .iter()
             .cloned()
@@ -6984,6 +8030,16 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("committed-operation: "))
             .collect::<Vec<_>>();
+        assert!(committed.is_empty());
+        assert!(applier.new_entries.is_empty());
+        let entries = applier.finish().unwrap();
+        assert_eq!(entries[0].path(), Path::new("a.txt"));
+        assert_eq!(entries[1].path(), Path::new("b.txt"));
+        let marker = fs::read_to_string(apply_attempt_path(&state_path).unwrap()).unwrap();
+        let committed = marker
+            .lines()
+            .filter(|line| line.starts_with("committed-operation: "))
+            .collect::<Vec<_>>();
         assert_eq!(
             committed,
             vec![
@@ -6991,9 +8047,6 @@ mod tests {
                 "committed-operation: add-file b.txt",
             ]
         );
-        assert_eq!(applier.new_entries[0].path(), Path::new("a.txt"));
-        assert_eq!(applier.new_entries[1].path(), Path::new("b.txt"));
-        applier.finish().unwrap();
     }
 
     #[test]
@@ -7005,7 +8058,10 @@ mod tests {
         fs::write(&state_path, b"old snapshot").unwrap();
         fs::write(base.join("a.txt"), b"unchanged-a").unwrap();
         fs::write(base.join("b.txt"), b"unchanged-b").unwrap();
-        let entries = [test_file_entry("a.txt", b"new-a"), test_file_entry("b.txt", b"new-b")];
+        let entries = [
+            test_file_entry("a.txt", b"new-a"),
+            test_file_entry("b.txt", b"new-b"),
+        ];
         let actions = entries
             .iter()
             .cloned()
@@ -7077,8 +8133,8 @@ mod tests {
 
         stream_file(&mut applier, 0, b"first").unwrap();
         stream_file(&mut applier, 1, b"second").unwrap();
-        assert!(base.join("first.txt").exists());
-        assert!(base.join("second.txt").exists());
+        assert!(!base.join("first.txt").exists());
+        assert!(!base.join("second.txt").exists());
         stream_file(&mut applier, 2, b"third").unwrap();
         let error = stream_file(&mut applier, 3, b"fourth").unwrap_err();
 
@@ -7089,8 +8145,8 @@ mod tests {
         let marker_path = apply_attempt_path(&state_path).unwrap();
         assert!(marker_path.exists());
         let marker = fs::read_to_string(marker_path).unwrap();
-        assert!(marker.contains("committed-operation: add-file first.txt"));
-        assert!(marker.contains("committed-operation: add-file second.txt"));
+        assert!(!marker.contains("committed-operation: add-file first.txt"));
+        assert!(!marker.contains("committed-operation: add-file second.txt"));
         assert!(!marker.contains("committed-operation: add-file c.txt"));
     }
 
@@ -7271,13 +8327,8 @@ mod tests {
         let name = std::ffi::CString::new("stage").unwrap();
         cvt(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o000) }).unwrap();
         let created = fstatat_nofollow(parent.as_raw_fd(), &name).unwrap();
-        let retained = open_new_stage_for_access(
-            &parent,
-            &name,
-            &created,
-            &dir.path().join("stage"),
-        )
-        .unwrap();
+        let retained =
+            open_new_stage_for_access(&parent, &name, &created, &dir.path().join("stage")).unwrap();
 
         normalize_stage_directory_mode(
             &parent,
@@ -7372,12 +8423,8 @@ mod tests {
         let entry = test_file_entry("parent/out.txt", b"contents");
         let actions = vec![Action::Local(Change::Added(entry.clone()))];
         start_apply_attempt("local", &state, &base, &actions, None).unwrap();
-        let mut applier = DetailApplier::new_with_attempt(
-            base.clone(),
-            actions,
-            Vec::new(),
-            Some(state.clone()),
-        );
+        let mut applier =
+            DetailApplier::new_with_attempt(base.clone(), actions, Vec::new(), Some(state.clone()));
         applier
             .apply_frame(DetailFrame {
                 action_index: 0,
@@ -7402,9 +8449,7 @@ mod tests {
         let error = applier.finish().unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("output parent directory path"),
+            error.to_string().contains("output parent directory path"),
             "{}",
             error
         );
@@ -7412,7 +8457,11 @@ mod tests {
         assert!(!moved_parent.join("out.txt").exists());
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("staged-file: "), "{}", marker);
-        assert!(!marker.contains("committed-step: rename-file"), "{}", marker);
+        assert!(
+            !marker.contains("committed-step: rename-file"),
+            "{}",
+            marker
+        );
     }
 
     #[test]
@@ -7435,12 +8484,8 @@ mod tests {
             .map(|entry| Action::Local(Change::Added(entry)))
             .collect::<Vec<_>>();
         start_apply_attempt("local", &state, &base, &actions, None).unwrap();
-        let mut applier = DetailApplier::new_with_attempt(
-            base.clone(),
-            actions,
-            Vec::new(),
-            Some(state.clone()),
-        );
+        let mut applier =
+            DetailApplier::new_with_attempt(base.clone(), actions, Vec::new(), Some(state.clone()));
         applier.output_batch.config.max_files = 1;
         for (index, contents) in [b"first".as_slice(), b"second".as_slice()]
             .iter()
@@ -7472,13 +8517,11 @@ mod tests {
         let error = applier.finish().unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("published destination parent"),
+            error.to_string().contains("output parent directory path"),
             "{}",
             error
         );
-        assert_eq!(fs::read(moved_parent.join("second.txt")).unwrap(), b"second");
+        assert!(!moved_parent.join("second.txt").exists());
         assert!(!swapped_parent.join("second.txt").exists());
         assert!(apply_attempt_path(&state).unwrap().exists());
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
@@ -7494,7 +8537,12 @@ mod tests {
         let stage_dir = output.stage_path().to_path_buf();
         let output_name = output.temp_path().file_name().unwrap().to_owned();
         let moved_stage = dir.path().join("moved-stage");
-        output.file.as_mut().unwrap().write_all(b"retained").unwrap();
+        output
+            .file
+            .as_mut()
+            .unwrap()
+            .write_all(b"retained")
+            .unwrap();
         fs::rename(&stage_dir, &moved_stage).unwrap();
         fs::create_dir(&stage_dir).unwrap();
         fs::write(stage_dir.join(&output_name), b"substitute").unwrap();
@@ -7503,12 +8551,17 @@ mod tests {
         let error = output.finish(&entry).unwrap_err();
 
         assert!(
-            error.to_string().contains("no longer refers to the retained directory"),
+            error
+                .to_string()
+                .contains("no longer refers to the retained directory"),
             "{}",
             error
         );
         assert!(!final_path.exists());
-        assert_eq!(fs::read(stage_dir.join(&output_name)).unwrap(), b"substitute");
+        assert_eq!(
+            fs::read(stage_dir.join(&output_name)).unwrap(),
+            b"substitute"
+        );
         drop(staging);
         fs::remove_dir(&moved_stage).unwrap();
         fs::remove_file(stage_dir.join(output_name)).unwrap();
@@ -7524,12 +8577,8 @@ mod tests {
         let entry = test_file_entry("out.txt", b"contents");
         let actions = vec![Action::Local(Change::Added(entry))];
         start_apply_attempt("local", &state, &base, &actions, None).unwrap();
-        let mut applier = DetailApplier::new_with_attempt(
-            base.clone(),
-            actions,
-            Vec::new(),
-            Some(state.clone()),
-        );
+        let mut applier =
+            DetailApplier::new_with_attempt(base.clone(), actions, Vec::new(), Some(state.clone()));
         applier
             .apply_frame(DetailFrame {
                 action_index: 0,
@@ -7556,14 +8605,20 @@ mod tests {
         let error = applier.finish().unwrap_err();
 
         assert!(
-            error.to_string().contains("no longer refers to the retained directory"),
+            error
+                .to_string()
+                .contains("no longer refers to the retained directory"),
             "{}",
             error
         );
         assert!(!base.join("out.txt").exists());
         assert_eq!(marker_staged_paths(&state), vec![stage_path.clone()]);
         let recovery = describe_apply_attempt(&state).unwrap().unwrap();
-        assert!(recovery.contains(&stage_path.display().to_string()), "{}", recovery);
+        assert!(
+            recovery.contains(&stage_path.display().to_string()),
+            "{}",
+            recovery
+        );
         assert!(apply_attempt_path(&state).unwrap().exists());
         fs::remove_dir(moved_stage).unwrap();
         fs::remove_dir(stage_path).unwrap();
@@ -7598,12 +8653,9 @@ mod tests {
         std::os::unix::fs::symlink("target.txt", dir.path().join("link.txt")).unwrap();
         let entry = test_file_entry("link.txt", b"contents");
 
-        let error = verify_file_matches_entry(
-            &dir.path().join("link.txt"),
-            &entry,
-            "verification target",
-        )
-        .unwrap_err();
+        let error =
+            verify_file_matches_entry(&dir.path().join("link.txt"), &entry, "verification target")
+                .unwrap_err();
 
         assert!(error.to_string().contains("failed to open file"));
     }
@@ -7657,14 +8709,17 @@ mod tests {
                 .unwrap();
             assert!(!base.join(entry.path()).exists());
             let pending = &applier.output_batch.pending[index].prepared.output;
-            assert_eq!(mode(pending.temp_path()), requested_modes[index]);
+            assert_eq!(mode(pending.temp_path()), 0o600);
         }
 
         let final_entries = applier.finish().unwrap();
         assert_eq!(final_entries.len(), entries.len());
         for final_entry in final_entries {
             let metadata = fs::metadata(base.join(final_entry.path())).unwrap();
-            assert_eq!(metadata.permissions().mode() & 0o777, final_entry.mode() & 0o777);
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                final_entry.mode() & 0o777
+            );
             assert_eq!(metadata.mtime(), final_entry.mtime());
             assert_eq!(final_entry.ino(), metadata.ino());
         }
@@ -7686,12 +8741,8 @@ mod tests {
             .map(|entry| Action::Local(Change::Added(entry)))
             .collect::<Vec<_>>();
         start_apply_attempt("local", &state, &base, &actions, None).unwrap();
-        let mut applier = DetailApplier::new_with_attempt(
-            base.clone(),
-            actions,
-            Vec::new(),
-            Some(state.clone()),
-        );
+        let mut applier =
+            DetailApplier::new_with_attempt(base.clone(), actions, Vec::new(), Some(state.clone()));
         let mut stage_path = None;
 
         for (index, contents) in [b"first".as_slice(), b"second".as_slice()]
@@ -7715,7 +8766,10 @@ mod tests {
                 Some(stage_path) => assert_eq!(output.stage_path(), stage_path),
                 None => stage_path = Some(output.stage_path().to_path_buf()),
             }
-            assert_eq!(marker_staged_paths(&state), vec![stage_path.clone().unwrap()]);
+            assert_eq!(
+                marker_staged_paths(&state),
+                vec![stage_path.clone().unwrap()]
+            );
             applier
                 .apply_frame(DetailFrame {
                     action_index: index as u32,
@@ -7758,12 +8812,8 @@ mod tests {
                 Action::Local(Change::Added(parent_entry)),
                 Action::Local(Change::Added(file_entry)),
             ];
-            let mut applier = DetailApplier::new_with_attempt(
-                base.clone(),
-                actions,
-                Vec::new(),
-                None,
-            );
+            let mut applier =
+                DetailApplier::new_with_attempt(base.clone(), actions, Vec::new(), None);
             applier
                 .apply_frame(DetailFrame {
                     action_index: 1,
@@ -7830,7 +8880,7 @@ mod tests {
         assert_eq!(mode(&base.join("file.txt")), 0o644);
         assert_eq!(
             mode(applier.output_batch.pending[0].prepared.output.temp_path()),
-            0o400
+            0o600
         );
         applier.finish().unwrap();
         assert_eq!(mode(&base.join("file.txt")), 0o400);
@@ -7894,7 +8944,10 @@ mod tests {
             fs::read(real_base.join("nested/file.txt")).unwrap(),
             b"contents"
         );
-        assert!(fs::symlink_metadata(&base).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&base)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
@@ -7919,14 +8972,7 @@ mod tests {
         let mut all_old = Vec::new();
         start_apply_attempt("local", &state, &base, &actions, None).unwrap();
 
-        apply_detailed_changes(
-            &base,
-            &actions,
-            &details,
-            &mut all_old,
-            Some(&state),
-        )
-        .unwrap();
+        apply_detailed_changes(&base, &actions, &details, &mut all_old, Some(&state)).unwrap();
 
         let staged_paths = marker_staged_paths(&state);
         assert_eq!(staged_paths.len(), 1);
@@ -7946,14 +8992,7 @@ mod tests {
         fs::create_dir(&streamed_base).unwrap();
         let old = synced_existing_file_entry(&streamed_base, "removed.txt", b"old");
         let actions = vec![Action::Local(Change::Removed(old.clone()))];
-        start_apply_attempt(
-            "local",
-            &streamed_state,
-            &streamed_base,
-            &actions,
-            None,
-        )
-        .unwrap();
+        start_apply_attempt("local", &streamed_state, &streamed_base, &actions, None).unwrap();
 
         DetailApplier::new_with_attempt(
             streamed_base.clone(),
@@ -7976,14 +9015,7 @@ mod tests {
         new.set_mode(0o600);
         let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
         let mut all_old = vec![old];
-        start_apply_attempt(
-            "local",
-            &fallback_state,
-            &fallback_base,
-            &actions,
-            None,
-        )
-        .unwrap();
+        start_apply_attempt("local", &fallback_state, &fallback_base, &actions, None).unwrap();
 
         apply_detailed_changes(
             &fallback_base,
@@ -8024,16 +9056,12 @@ mod tests {
         let details = vec![ChangeDetails::Contents(b"replacement".to_vec())];
         let mut all_old = vec![old];
 
-        apply_detailed_changes(
-            &replacement_base,
-            &actions,
-            &details,
-            &mut all_old,
-            None,
-        )
-        .unwrap();
+        apply_detailed_changes(&replacement_base, &actions, &details, &mut all_old, None).unwrap();
         assert_eq!(mode(&replacement_base.join("path")), 0o400);
-        assert_eq!(fs::metadata(replacement_base.join("path")).unwrap().mtime(), 0);
+        assert_eq!(
+            fs::metadata(replacement_base.join("path")).unwrap().mtime(),
+            0
+        );
     }
 
     #[test]
@@ -8194,14 +9222,7 @@ mod tests {
         let actions = vec![Action::Local(Change::Removed(old.clone()))];
         let mut all_old = vec![old];
 
-        apply_detailed_changes(
-            &base,
-            &actions,
-            &Vec::new(),
-            &mut all_old,
-            None,
-        )
-        .unwrap();
+        apply_detailed_changes(&base, &actions, &Vec::new(), &mut all_old, None).unwrap();
 
         assert!(fs::symlink_metadata(base.join("link")).is_err());
         assert!(all_old.is_empty());
@@ -8244,7 +9265,10 @@ mod tests {
             .to_string();
 
         assert!(error.contains("metadata target"), "{}", error);
-        assert_eq!(fs::metadata(&dirname).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&dirname).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]
@@ -8277,7 +9301,7 @@ mod tests {
             .unwrap();
         let error = applier.finish().unwrap_err().to_string();
 
-        assert!(error.contains("rename target"), "{}", error);
+        assert!(error.contains("staged commit target"), "{}", error);
         assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"race");
     }
 
@@ -8349,7 +9373,11 @@ mod tests {
             .unwrap();
         let error = applier.finish().unwrap_err().to_string();
 
-        assert!(error.contains("rename target"), "{}", error);
+        assert!(
+            error.contains("appeared after staged preparation"),
+            "{}",
+            error
+        );
         assert_eq!(fs::read(base.join("file.txt")).unwrap(), b"race");
     }
 
@@ -8478,7 +9506,10 @@ mod tests {
             tuning.detail_batch_frames,
             DEFAULT_DETAIL_BATCH_FRAMES as u32
         );
-        assert_eq!(tuning.detail_batch_payload_bytes, MAX_DETAIL_BATCH_PAYLOAD_BYTES);
+        assert_eq!(
+            tuning.detail_batch_payload_bytes,
+            MAX_DETAIL_BATCH_PAYLOAD_BYTES
+        );
     }
 
     #[test]
@@ -8535,10 +9566,9 @@ mod tests {
     fn temp_output_does_not_clobber_predictable_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let final_path = dir.path().join("out.txt");
-        let old_predictable = dir.path().join(format!(
-            ".duet-part-{}-0",
-            std::process::id()
-        ));
+        let old_predictable = dir
+            .path()
+            .join(format!(".duet-part-{}-0", std::process::id()));
         fs::write(&old_predictable, b"do not touch").unwrap();
         let staging = StagingArea::new(dir.path()).unwrap();
 
@@ -8647,26 +9677,18 @@ mod tests {
             vec!["__pycache__".to_string()],
         );
 
-        let error = preflight_apply_with_policy(
-            &base,
-            &actions,
-            Some(&policy),
-            ApplyOptions::default(),
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            preflight_apply_with_policy(&base, &actions, Some(&policy), ApplyOptions::default())
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("ignored child"), "{}", error);
         assert!(error.contains("__pycache__"), "{}", error);
         assert!(error.contains("--prune-ignored"), "{}", error);
 
-        let report = preflight_apply_report(
-            &base,
-            &actions,
-            Some(&policy),
-            ApplyOptions::default(),
-        )
-        .unwrap();
+        let report =
+            preflight_apply_report(&base, &actions, Some(&policy), ApplyOptions::default())
+                .unwrap();
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].kind, RemovalBlockerType::Ignored);
         assert_eq!(report.blockers[0].pattern.as_deref(), Some("__pycache__"));
@@ -8724,13 +9746,9 @@ mod tests {
             vec!["__pycache__".to_string()],
         );
 
-        let report = preflight_apply_report(
-            &base,
-            &actions,
-            Some(&policy),
-            ApplyOptions::default(),
-        )
-        .unwrap();
+        let report =
+            preflight_apply_report(&base, &actions, Some(&policy), ApplyOptions::default())
+                .unwrap();
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].kind, RemovalBlockerType::Prune);
         assert_eq!(report.blockers[0].pattern.as_deref(), Some("__pycache__"));
@@ -8757,25 +9775,17 @@ mod tests {
             Vec::new(),
         );
 
-        let error = preflight_apply_with_policy(
-            &base,
-            &actions,
-            Some(&policy),
-            ApplyOptions::default(),
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            preflight_apply_with_policy(&base, &actions, Some(&policy), ApplyOptions::default())
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("excluded child"), "{}", error);
         assert!(error.contains("outside the sync selection"), "{}", error);
 
-        let report = preflight_apply_report(
-            &base,
-            &actions,
-            Some(&policy),
-            ApplyOptions::default(),
-        )
-        .unwrap();
+        let report =
+            preflight_apply_report(&base, &actions, Some(&policy), ApplyOptions::default())
+                .unwrap();
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].kind, RemovalBlockerType::Excluded);
         assert!(!report.blockers[0].prunable);
@@ -8791,8 +9801,8 @@ mod tests {
             0,
         )))];
 
-        let report = preflight_apply_report(&base, &actions, None, ApplyOptions::default())
-            .unwrap();
+        let report =
+            preflight_apply_report(&base, &actions, None, ApplyOptions::default()).unwrap();
 
         assert!(report.blockers.is_empty());
         assert!(!report.has_unprunable_blockers());
@@ -9245,23 +10255,38 @@ mod tests {
         let base = dir.path().join("base");
         fs::create_dir(&base).unwrap();
         let actions = vec![Action::Local(Change::Added(Entry::test_file(
-            PathBuf::from("a.txt"), 0,
+            PathBuf::from("a.txt"),
+            0,
         )))];
 
         start_apply_attempt("local", &state, &base, &actions, None).unwrap();
         let marker_path = apply_attempt_path(&state).unwrap();
         fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o644)).unwrap();
         start_apply_attempt("local", &state, &base, &actions, None).unwrap();
-        assert_eq!(fs::metadata(&marker_path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&marker_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         record_staged_file(Some(&state), Path::new(".duet-part-test")).unwrap();
         record_committed_step(Some(&state), "rename-file", Path::new("a.txt")).unwrap();
         mark_apply_attempt_state_save("local", &state, &base, &actions, None).unwrap();
 
         let marker = fs::read_to_string(&marker_path).unwrap();
         assert!(marker.contains("phase: state-save"), "{}", marker);
-        assert!(marker.contains("staged-file: .duet-part-test"), "{}", marker);
-        assert!(marker.contains("committed-step: rename-file a.txt"), "{}", marker);
-        assert_eq!(fs::metadata(&marker_path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(
+            marker.contains("staged-file: .duet-part-test"),
+            "{}",
+            marker
+        );
+        assert!(
+            marker.contains("committed-step: rename-file a.txt"),
+            "{}",
+            marker
+        );
+        assert_eq!(
+            fs::metadata(&marker_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -9322,5 +10347,383 @@ mod tests {
         assert!(advice.contains("committed apply step(s)"), "{}", advice);
         assert!(advice.contains("staged temporary path(s)"), "{}", advice);
         assert!(advice.contains("unstaged operation(s)"), "{}", advice);
+    }
+
+    #[test]
+    fn staged_precommit_recovery_advice_does_not_suggest_raw_marker_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+        start_staged_apply_attempt("local", &state, &base, &[], "attempt-1").unwrap();
+        let marker_path = apply_attempt_path(&state).unwrap();
+        let marker = fs::read_to_string(&marker_path).unwrap();
+
+        let advice = apply_attempt_recovery_advice(&state, &marker_path, &marker);
+
+        assert!(advice.contains("duet recover --clear"), "{}", advice);
+        assert!(
+            advice.contains("do not remove the marker directly"),
+            "{}",
+            advice
+        );
+        assert!(!advice.contains("manually with `rm"), "{}", advice);
+    }
+
+    #[test]
+    fn malformed_v2_recovery_advice_does_not_suggest_raw_marker_removal() {
+        let marker = "duet-apply-attempt-v2";
+        let advice = apply_attempt_recovery_advice(
+            Path::new("/tmp/profile.snp"),
+            Path::new("/tmp/.profile.snp.duet-apply"),
+            marker,
+        );
+
+        assert!(
+            advice.contains("do not remove the marker directly"),
+            "{}",
+            advice
+        );
+        assert!(!advice.contains("manually with `rm"), "{}", advice);
+    }
+
+    #[test]
+    fn staged_marker_rejects_line_breaking_action_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+        let actions = vec![Action::Local(Change::Added(Entry::test_file(
+            PathBuf::from("bad\nphase: committed"),
+            0,
+        )))];
+
+        let error =
+            start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap_err();
+
+        assert!(error.to_string().contains("single-line"), "{}", error);
+        assert!(!apply_attempt_path(&state).unwrap().exists());
+    }
+
+    #[test]
+    fn conflicting_staged_marker_advice_uses_state_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+        start_staged_apply_attempt("local", &state, &base, &[], "attempt-1").unwrap();
+
+        let error =
+            start_staged_apply_attempt("local", &state, &base, &[], "attempt-2").unwrap_err();
+        let rendered = format!("{:#}", error);
+
+        assert!(
+            rendered.contains(&format!("duet recover --clear {}", state.display())),
+            "{}",
+            rendered
+        );
+        let marker_path = apply_attempt_path(&state).unwrap();
+        assert!(
+            !rendered.contains(&format!("duet recover {}", marker_path.display())),
+            "{}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn staged_prepare_mutates_no_targets_and_commit_applies_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let removed = synced_existing_file_entry(&base, "z-remove.txt", b"old");
+        let added_dir = Entry::test_dir(PathBuf::from("a-dir"));
+        let added_file = test_file_entry("b-file.txt", b"new");
+        let added_link = Entry::test_symlink(PathBuf::from("c-link"), PathBuf::from("b-file.txt"));
+        let actions = vec![
+            Action::Local(Change::Added(added_dir)),
+            Action::Local(Change::Added(added_file)),
+            Action::Local(Change::Added(added_link)),
+            Action::Local(Change::Removed(removed.clone())),
+        ];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base.clone(),
+            actions,
+            vec![removed],
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+
+        stream_file(&mut applier, 1, b"new").unwrap();
+        let prepared = applier.finish_preparation().unwrap();
+
+        assert_eq!(prepared.report().prepared_file_count, 1);
+        assert!(!base.join("a-dir").exists());
+        assert!(!base.join("b-file.txt").exists());
+        assert!(!base.join("c-link").exists());
+        assert_eq!(fs::read(base.join("z-remove.txt")).unwrap(), b"old");
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert!(marker.contains("phase: prepared"), "{}", marker);
+
+        let entries = prepared.commit().unwrap();
+        assert!(base.join("a-dir").is_dir());
+        assert_eq!(fs::read(base.join("b-file.txt")).unwrap(), b"new");
+        assert_eq!(
+            fs::read_link(base.join("c-link")).unwrap(),
+            Path::new("b-file.txt")
+        );
+        assert!(!base.join("z-remove.txt").exists());
+        assert_eq!(entries.len(), 3);
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert!(marker.contains("phase: committed"), "{}", marker);
+        mark_staged_apply_attempt_state_save(&state, "attempt-1").unwrap();
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert!(marker.contains("phase: state-save"), "{}", marker);
+        finish_staged_apply_attempt(&state, "attempt-1").unwrap();
+        assert!(!apply_attempt_path(&state).unwrap().exists());
+    }
+
+    #[test]
+    fn staged_abort_removes_stage_and_marker_and_checks_attempt_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entry = test_file_entry("file.txt", b"contents");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base.clone(),
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        stream_file(&mut applier, 0, b"contents").unwrap();
+        let prepared = applier.finish_preparation().unwrap();
+        let stage = prepared
+            .inner
+            .staging
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+
+        assert!(abort_staged_apply_attempt(&state, "wrong-attempt").is_err());
+        assert!(stage.exists());
+        prepared.abort().unwrap();
+        assert!(!stage.exists());
+        assert!(!apply_attempt_path(&state).unwrap().exists());
+        assert!(!base.join("file.txt").exists());
+    }
+
+    #[test]
+    fn staged_validation_rejects_in_place_output_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entry = test_file_entry("file.txt", b"contents");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        stream_file(&mut applier, 0, b"contents").unwrap();
+        let prepared = applier.finish_preparation().unwrap();
+        let output = prepared.inner.prepared_outputs[0]
+            .as_ref()
+            .unwrap()
+            .output
+            .temp_path
+            .clone();
+
+        fs::write(&output, b"mutated!").unwrap();
+        let error = prepared.validate_commit().unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"), "{}", error);
+        prepared.abort().unwrap();
+    }
+
+    #[test]
+    fn staged_abort_is_idempotent_after_partial_stage_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let actions = vec![
+            Action::Local(Change::Added(test_file_entry("a.txt", b"a"))),
+            Action::Local(Change::Added(test_file_entry("b.txt", b"b"))),
+        ];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base.clone(),
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        stream_file(&mut applier, 0, b"a").unwrap();
+        stream_file(&mut applier, 1, b"b").unwrap();
+        let prepared = applier.finish_preparation().unwrap();
+        let first_output = prepared.inner.prepared_outputs[0]
+            .as_ref()
+            .unwrap()
+            .output
+            .temp_path
+            .clone();
+        let stage = prepared
+            .inner
+            .staging
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+
+        fs::remove_file(first_output).unwrap();
+        prepared.abort().unwrap();
+        assert!(!stage.exists());
+        assert!(!apply_attempt_path(&state).unwrap().exists());
+
+        let state2 = dir.path().join("profile2.snp");
+        let actions = vec![Action::Local(Change::Added(test_file_entry("c.txt", b"c")))];
+        start_staged_apply_attempt("local", &state2, &base, &actions, "attempt-2").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            actions,
+            Vec::new(),
+            state2.clone(),
+            "attempt-2".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        stream_file(&mut applier, 0, b"c").unwrap();
+        let prepared = applier.finish_preparation().unwrap();
+        let output = prepared.inner.prepared_outputs[0]
+            .as_ref()
+            .unwrap()
+            .output
+            .temp_path
+            .clone();
+        let stage = prepared
+            .inner
+            .staging
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        fs::remove_file(output).unwrap();
+        fs::remove_dir(stage).unwrap();
+
+        prepared.abort().unwrap();
+        assert!(!apply_attempt_path(&state2).unwrap().exists());
+    }
+
+    #[test]
+    fn staged_cleanup_fails_closed_for_substitution_and_committing_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entry = test_file_entry("file.txt", b"contents");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base.clone(),
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        stream_file(&mut applier, 0, b"contents").unwrap();
+        let prepared = applier.finish_preparation().unwrap();
+        let output = prepared.inner.prepared_outputs[0]
+            .as_ref()
+            .unwrap()
+            .output
+            .temp_path
+            .clone();
+        fs::remove_file(&output).unwrap();
+        fs::write(&output, b"substitute").unwrap();
+        assert!(abort_staged_apply_attempt(&state, "attempt-1").is_err());
+        assert!(apply_attempt_path(&state).unwrap().exists());
+        drop(prepared);
+
+        let state2 = dir.path().join("profile2.snp");
+        start_staged_apply_attempt("local", &state2, &base, &[], "attempt-2").unwrap();
+        transition_staged_apply_attempt(
+            &state2,
+            "attempt-2",
+            &[ApplyAttemptPhase::Preparing],
+            ApplyAttemptPhase::Prepared,
+        )
+        .unwrap();
+        transition_staged_apply_attempt(
+            &state2,
+            "attempt-2",
+            &[ApplyAttemptPhase::Prepared],
+            ApplyAttemptPhase::Committing,
+        )
+        .unwrap();
+        assert!(abort_staged_apply_attempt(&state2, "attempt-2").is_err());
+        clear_apply_attempt(&state2).unwrap();
+        assert!(!apply_attempt_path(&state2).unwrap().exists());
+    }
+
+    #[test]
+    fn dropped_preparing_applier_leaves_marker_owned_stage_for_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entry = test_file_entry("file.txt", b"contents");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base.clone(),
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBytes(b"partial".to_vec()),
+            })
+            .unwrap();
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        let parsed = parse_v2_apply_attempt(&marker).unwrap();
+        let (stage_parent, _) = parsed.stage_parent.unwrap();
+        let (stage_name, _) = parsed.stage.unwrap();
+
+        drop(applier);
+
+        assert!(stage_parent.join(stage_name).exists());
+        abort_staged_apply_attempt(&state, "attempt-1").unwrap();
+        assert!(!apply_attempt_path(&state).unwrap().exists());
+        assert!(fs::read_dir(&base).unwrap().next().is_none());
     }
 }

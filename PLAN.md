@@ -84,25 +84,17 @@ helpers.
 
 ## Remaining Work
 
-### 1. Apply Needs A Prepare/Commit Protocol
+### 1. Prepare/Commit Protocol
 
-Current preflight catches common permission failures before mutation, and apply
-now records recovery markers while filesystem changes and state saves are in
-progress. The markers include the side, base, state file, shared apply attempt
-id, current phase, affected paths, compact operation summaries,
-unstaged-operation classifications for direct commit operations, plus
-committed-operation records for side-local actions that completed before
-interruption. While apply is in progress, file content writes also record staged
-temporary file paths that may need cleanup after a crash, and staged file writes
-record committed-step entries after the temp file is renamed into place. Direct
-remove, create, symlink, and metadata operations also record committed-step
-entries after each step succeeds. New peers prepare both local and remote markers
-before concurrent apply begins. This prevents a later run from silently
-continuing after an interrupted apply. Sync is still not a true transaction:
-local and remote apply can still mutate files before a later non-preflighted
-error, crash, or race is detected.
+Peers advertising `staged-apply-v1` now use a prepare/commit protocol for plans
+supported by streamed details. Both sides reconstruct, verify, fsync, seal, and
+close every regular-file output in private side-local staging before either side
+mutates a synchronized target. Deletes, publications, directory/symlink changes,
+metadata changes, and ignored-path pruning are deferred to commit. After both
+sides report `prepared`, the client crosses one atomic cancellation/commit fence
+and starts both commits concurrently.
 
-Target design:
+Implemented lifecycle:
 
 - `prepare`: both sides validate the selected actions again, create a per-sync
   apply attempt id, and stage all content writes into side-local temporary files.
@@ -112,28 +104,32 @@ Target design:
   window. File content replacement should be rename-based wherever the platform
   allows it.
 - `finish`: state is saved only after both sides report commit success.
-- `recover`: if a process dies after `prepare` or during `commit`, the next run
-  detects the attempt id, reports which phase may have partially completed, and
-  either cleans abandoned staged files or asks the user to inspect committed
-  paths before continuing.
+- `recover`: V2 markers distinguish `preparing`, `prepared`, `committing`,
+  `committed`, `state-save`, and `finished`. Explicit `recover --clear`
+  identity-checks and removes private staging for precommit attempts. Commit or
+  later phases remain manual recovery cases; after inspection and reconciliation,
+  explicit clear removes their marker without treating them as precommit cleanup.
+
+Ctrl+C is cooperative. The first interrupt before the commit fence aborts both
+prepared attempts and exits with code 6. Once commit starts, the first interrupt
+is deferred through commit, state save, coordinated marker cleanup, and server
+shutdown; a successful finalized sync exits 0. A second interrupt forces an
+immediate code-6 exit.
 
 Remaining work:
 
-- Add RPC methods for `prepare`, `commit`, `finish`, and `recover`, advertised by
-  a protocol capability. The current protocol has a prepare marker RPC with a
-  shared attempt id, but not a full staged prepare/commit/recover sequence.
-- Move streamed and non-streamed apply through the same staged apply engine.
-  File-content writes now share the same temporary-output primitive, but the full
-  staged engine still needs to cover directory, symlink, metadata, and removal
-  operations.
+- Extend staged transfer to plans that currently require the non-streamed legacy
+  path, notably directory-to-nondirectory conversions, and eventually retire the
+  immediate-apply compatibility engine.
+- Consider bounded staging or resumable prepare checkpoints. The current protocol
+  may temporarily require space for the complete new contents of every changed
+  regular file, including reconstructed delta outputs.
 - Persist enough committed-operation metadata to resume automatically after a
   crash. The current marker records completed side-local action summaries, but it
   does not yet support automatic replay/rollback.
 - Close any remaining gaps in step-level commit records for multi-step
   replacements, chmod, and utime as the staged apply engine is built out.
-- Use staged-file records to offer safe automatic cleanup for abandoned temp
-  files that were never renamed into place.
-- Keep state saving after both sides have committed successfully.
+- Extend automatic recovery beyond identity-checked precommit cleanup.
 
 ### 2. Preflight And Apply Recovery Are Still Best-Effort
 

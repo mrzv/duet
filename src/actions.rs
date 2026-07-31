@@ -1,18 +1,18 @@
-use std::fmt;
-use std::path::{PathBuf,Component};
+use super::scan::change::{same, same_strong, Change, LegacyChange};
+use super::scan::DirEntryWithMeta as Entry;
 use colored::*;
-use serde::{Serialize,Deserialize};
-use super::scan::change::{Change, LegacyChange, same, same_strong};
-use super::scan::{DirEntryWithMeta as Entry};
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::path::{Component, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     Local(Change),
     Remote(Change),
-    Conflict(Change,Change),
-    ResolvedLocal((Change,Change), Change),
-    ResolvedRemote((Change,Change), Change),
-    Identical(Change,Change),       // need for bookkeeping
+    Conflict(Change, Change),
+    ResolvedLocal((Change, Change), Change),
+    ResolvedRemote((Change, Change), Change),
+    Identical(Change, Change), // need for bookkeeping
 }
 
 pub type Actions = Vec<Action>;
@@ -35,8 +35,12 @@ impl From<LegacyAction> for Action {
             LegacyAction::Local(c) => Self::Local(c.into()),
             LegacyAction::Remote(c) => Self::Remote(c.into()),
             LegacyAction::Conflict(a, b) => Self::Conflict(a.into(), b.into()),
-            LegacyAction::ResolvedLocal((a, b), c) => Self::ResolvedLocal((a.into(), b.into()), c.into()),
-            LegacyAction::ResolvedRemote((a, b), c) => Self::ResolvedRemote((a.into(), b.into()), c.into()),
+            LegacyAction::ResolvedLocal((a, b), c) => {
+                Self::ResolvedLocal((a.into(), b.into()), c.into())
+            }
+            LegacyAction::ResolvedRemote((a, b), c) => {
+                Self::ResolvedRemote((a.into(), b.into()), c.into())
+            }
             LegacyAction::Identical(a, b) => Self::Identical(a.into(), b.into()),
         }
     }
@@ -49,7 +53,9 @@ impl From<Action> for LegacyAction {
             Action::Remote(c) => Self::Remote(c.into()),
             Action::Conflict(a, b) => Self::Conflict(a.into(), b.into()),
             Action::ResolvedLocal((a, b), c) => Self::ResolvedLocal((a.into(), b.into()), c.into()),
-            Action::ResolvedRemote((a, b), c) => Self::ResolvedRemote((a.into(), b.into()), c.into()),
+            Action::ResolvedRemote((a, b), c) => {
+                Self::ResolvedRemote((a.into(), b.into()), c.into())
+            }
             Action::Identical(a, b) => Self::Identical(a.into(), b.into()),
         }
     }
@@ -65,17 +71,17 @@ pub fn to_legacy(actions: Actions) -> LegacyActions {
 
 impl Action {
     pub fn create(loc: Option<&Change>, roc: Option<&Change>) -> Option<Action> {
-        match (loc,roc) {
+        match (loc, roc) {
             (Some(lc), None) => Some(Action::Remote(lc.clone())),
             (None, Some(rc)) => Some(Action::Local(rc.clone())),
             (Some(lc), Some(rc)) => {
-                if same(lc,rc) {
-                    Some(Action::Identical(lc.clone(),rc.clone()))
+                if same(lc, rc) {
+                    Some(Action::Identical(lc.clone(), rc.clone()))
                 } else {
-                    Some(Action::Conflict(lc.clone(),rc.clone()))
+                    Some(Action::Conflict(lc.clone(), rc.clone()))
                 }
             }
-            (None,None) => None,
+            (None, None) => None,
         }
     }
 
@@ -96,21 +102,22 @@ impl Action {
 
     pub fn is_conflict(&self) -> bool {
         match self {
-            Action::Conflict(_,_) | Action::ResolvedLocal((_,_),_) | Action::ResolvedRemote((_,_),_) => true,
+            Action::Conflict(_, _)
+            | Action::ResolvedLocal((_, _), _)
+            | Action::ResolvedRemote((_, _), _) => true,
             _ => false,
         }
     }
 
     pub fn is_unresolved_conflict(&self) -> bool {
         match self {
-            Action::Conflict(_,_) => true,
+            Action::Conflict(_, _) => true,
             _ => false,
         }
     }
 
-
     pub fn is_identical(&self) -> bool {
-        if let Action::Identical(_,_) = self {
+        if let Action::Identical(_, _) = self {
             true
         } else {
             false
@@ -121,41 +128,42 @@ impl Action {
         match self {
             Action::Local(l) => l.path(),
             Action::Remote(r) => r.path(),
-            Action::Conflict(l,_r) => l.path(),
-            Action::ResolvedLocal((_,_),l) => l.path(),
-            Action::ResolvedRemote((_,_),r) => r.path(),
-            Action::Identical(l,_r) => l.path(),
+            Action::Conflict(l, _r) => l.path(),
+            Action::ResolvedLocal((_, _), l) => l.path(),
+            Action::ResolvedRemote((_, _), r) => r.path(),
+            Action::Identical(l, _r) => l.path(),
         }
     }
 }
 
-pub fn num_unresolved_conflicts<'a,I>(actions: I) -> usize
+pub fn num_unresolved_conflicts<'a, I>(actions: I) -> usize
 where
     I: Iterator<Item = &'a Action>,
 {
-    actions
-        .filter(|a| a.is_unresolved_conflict())
-        .count()
+    actions.filter(|a| a.is_unresolved_conflict()).count()
 }
 
-pub fn num_identical<'a,I>(actions: I) -> usize
+pub fn num_identical<'a, I>(actions: I) -> usize
 where
     I: Iterator<Item = &'a Action>,
 {
-    actions
-        .filter(|a| a.is_identical())
-        .count()
+    actions.filter(|a| a.is_identical()).count()
 }
 
 pub fn reverse(actions: &Vec<Action>) -> Vec<Action> {
-    actions.iter()
+    actions
+        .iter()
         .map(|a| match a {
             Action::Local(l) => Action::Remote(l.clone()),
             Action::Remote(r) => Action::Local(r.clone()),
-            Action::Conflict(l,r) => Action::Conflict(r.clone(),l.clone()),
-            Action::ResolvedLocal((o,n),l) => Action::ResolvedRemote((o.clone(), n.clone()), l.clone()),
-            Action::ResolvedRemote((o,n),r) => Action::ResolvedLocal((o.clone(), n.clone()), r.clone()),
-            Action::Identical(l,r) => Action::Identical(r.clone(),l.clone()),
+            Action::Conflict(l, r) => Action::Conflict(r.clone(), l.clone()),
+            Action::ResolvedLocal((o, n), l) => {
+                Action::ResolvedRemote((o.clone(), n.clone()), l.clone())
+            }
+            Action::ResolvedRemote((o, n), r) => {
+                Action::ResolvedLocal((o.clone(), n.clone()), r.clone())
+            }
+            Action::Identical(l, r) => Action::Identical(r.clone(), l.clone()),
         })
         .collect()
 }
@@ -208,12 +216,19 @@ impl fmt::Display for Action {
         match &self {
             // actions are reversed:
             // local action means remote change, and remote action means local change
-            Action::Local(l)                => write!(f, "  <---- {} {}", l, show_path(l.path())),
-            Action::Remote(r)               => write!(f, "{} ---->   {}", r, show_path(r.path())),
-            Action::Conflict(l,r)           => write!(f, "{} {} {} {}", l, "<===>".bright_red(), r, show_path(l.path())),
-            Action::ResolvedLocal((_,_),l)  => write!(f, "  <==== {} {}", l, show_path(l.path())),
-            Action::ResolvedRemote((_,_),r) => write!(f, "{} ====>   {}", r, show_path(r.path())),
-            Action::Identical(l,r)          => write!(f, "{} --I-- {} {}", l, r, show_path(l.path())),
+            Action::Local(l) => write!(f, "  <---- {} {}", l, show_path(l.path())),
+            Action::Remote(r) => write!(f, "{} ---->   {}", r, show_path(r.path())),
+            Action::Conflict(l, r) => write!(
+                f,
+                "{} {} {} {}",
+                l,
+                "<===>".bright_red(),
+                r,
+                show_path(l.path())
+            ),
+            Action::ResolvedLocal((_, _), l) => write!(f, "  <==== {} {}", l, show_path(l.path())),
+            Action::ResolvedRemote((_, _), r) => write!(f, "{} ====>   {}", r, show_path(r.path())),
+            Action::Identical(l, r) => write!(f, "{} --I-- {} {}", l, r, show_path(l.path())),
         }
     }
 }
@@ -235,40 +250,42 @@ mod tests {
 
 pub fn details(action: &Action) -> String {
     match action {
-            Action::Local(c) => {
-                match c {
-                    Change::Added(d) | Change::Removed(d) => {
-                        format!("{}", show_meta(d, d))
-                    },
-                    Change::Modified(o,n) => {
-                        format!("{}      {}", show_meta(o, o), show_meta(n, o))           // remote is new, local is old
-                    },
+        Action::Local(c) => {
+            match c {
+                Change::Added(d) | Change::Removed(d) => {
+                    format!("{}", show_meta(d, d))
                 }
-            },
-            Action::Remote(c) => {
-                match c {
-                    Change::Added(d) | Change::Removed(d) => {
-                        format!("{}", show_meta(d, d))
-                    },
-                    Change::Modified(o,n) => {
-                        format!("{}      {}", show_meta(n,o), show_meta(o,o))           // local is new, remote is old
-                    },
+                Change::Modified(o, n) => {
+                    format!("{}      {}", show_meta(o, o), show_meta(n, o)) // remote is new, local is old
                 }
-            },
-            Action::Conflict(l,r)
-            | Action::ResolvedLocal((l,r),_)
-            | Action::ResolvedRemote((l,r),_) => {
-                format!("{}      {}", show_meta(change_entry(l),change_entry(r)), show_meta(change_entry(r),change_entry(l)))
-            },
-            Action::Identical(l,_) => format!("{}", show_meta(change_entry(l),change_entry(l))),
+            }
+        }
+        Action::Remote(c) => {
+            match c {
+                Change::Added(d) | Change::Removed(d) => {
+                    format!("{}", show_meta(d, d))
+                }
+                Change::Modified(o, n) => {
+                    format!("{}      {}", show_meta(n, o), show_meta(o, o)) // local is new, remote is old
+                }
+            }
+        }
+        Action::Conflict(l, r)
+        | Action::ResolvedLocal((l, r), _)
+        | Action::ResolvedRemote((l, r), _) => {
+            format!(
+                "{}      {}",
+                show_meta(change_entry(l), change_entry(r)),
+                show_meta(change_entry(r), change_entry(l))
+            )
+        }
+        Action::Identical(l, _) => format!("{}", show_meta(change_entry(l), change_entry(l))),
     }
 }
 
 fn change_entry(change: &Change) -> &Entry {
     match change {
-        Change::Added(d) | Change::Removed(d) | Change::Modified(_,d) => {
-            d
-        }
+        Change::Added(d) | Change::Removed(d) | Change::Modified(_, d) => d,
     }
 }
 
@@ -283,16 +300,28 @@ fn highlight(s: String, status: bool) -> ColoredString {
 fn show_meta(e: &Entry, before: &Entry) -> String {
     if e.is_symlink() {
         // permissions don't matter
-        format!("{} -> {}", highlight(show_mtime(e), e.mtime() != before.mtime()),
-                            highlight(e.target().as_ref().unwrap().display().to_string(), e.target() != before.target()))
+        format!(
+            "{} -> {}",
+            highlight(show_mtime(e), e.mtime() != before.mtime()),
+            highlight(
+                e.target().as_ref().unwrap().display().to_string(),
+                e.target() != before.target()
+            )
+        )
     } else if e.is_dir() {
-        format!("{} {}", highlight(show_permissions(e), e.mode() != before.mode()),
-                         highlight(show_mtime(e), e.mtime() != before.mtime()))
+        format!(
+            "{} {}",
+            highlight(show_permissions(e), e.mode() != before.mode()),
+            highlight(show_mtime(e), e.mtime() != before.mtime())
+        )
     } else {
-        format!("{} {} {} {}", highlight(show_permissions(e), e.mode() != before.mode()),
-                               highlight(show_mtime(e), e.mtime() != before.mtime()),
-                               highlight(show_size(e), e.size() != before.size()),
-                               highlight(show_checksum(e), e.checksum() != before.checksum()))
+        format!(
+            "{} {} {} {}",
+            highlight(show_permissions(e), e.mode() != before.mode()),
+            highlight(show_mtime(e), e.mtime() != before.mtime()),
+            highlight(show_size(e), e.size() != before.size()),
+            highlight(show_checksum(e), e.checksum() != before.checksum())
+        )
     }
 }
 
@@ -310,7 +339,12 @@ fn show_permissions(e: &Entry) -> String {
 
 fn show_size(e: &Entry) -> String {
     let size = e.size();
-    format!("{:>10}", byte_unit::Byte::from_u64(size.into()).get_appropriate_unit(byte_unit::UnitType::Decimal).to_string())
+    format!(
+        "{:>10}",
+        byte_unit::Byte::from_u64(size.into())
+            .get_appropriate_unit(byte_unit::UnitType::Decimal)
+            .to_string()
+    )
 }
 
 fn show_checksum(e: &Entry) -> String {

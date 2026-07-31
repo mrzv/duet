@@ -33,7 +33,7 @@ fnmatch-regex = "0.2.1"
 adler32 = "1.2.0"
 atomicwrites = "0.4.4"
 readwrite = { version = "0.2.0", features = ["tokio"] }
-openssh = "0.11.5"
+openssh = { version = "0.11.5", default-features = false, features = ["native-mux"] }
 simple-logging = "2.0.2"
 async-std = "1.13.1"
 chrono = "0.4.40"

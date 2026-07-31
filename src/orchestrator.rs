@@ -1,12 +1,15 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
+use std::process::ExitStatus;
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use colored::*;
 use essrpc::{RPCError, RPCErrorKind};
-use openssh::{KnownHosts, Session, SessionBuilder};
+use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder};
 
 use crate::actions::{num_identical, num_unresolved_conflicts, reverse, Action, Actions};
 use crate::cli::SyncOptions;
@@ -22,8 +25,6 @@ use crate::sync as sync_ops;
 use crate::sync_error;
 use crate::utils;
 
-const OK_CODE: u8 = 0;
-const ABORT_CODE: u8 = 1;
 const PROFILE_ERROR_CODE: u8 = 2;
 const SSH_ERROR_CODE: u8 = 3;
 const SERVER_ERROR_CODE: u8 = 4;
@@ -31,10 +32,151 @@ const CTRLC_CODE: u8 = 6;
 #[cfg(debug_assertions)]
 const TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS: &str =
     "DUET_TEST_PAUSE_AFTER_REMOTE_APPLY_PREPARE_MS";
-const POST_PREFLIGHT_RECOVERY_ADVICE: &str = "Recovery: filesystem changes may have been partially applied, but Duet state was not saved. Fix the reported problem, inspect both sides if needed, then rerun duet. If conflicts appear, resolve them manually.";
-const STATE_SAVE_RECOVERY_ADVICE: &str = "Recovery: filesystem changes were applied, but Duet state was not saved on both sides. Fix state storage permissions, then rerun duet before making unrelated changes.";
+const TEST_PAUSE_AFTER_STAGED_PREPARE_MS: &str = "DUET_TEST_PAUSE_AFTER_STAGED_PREPARE_MS";
+const TEST_PAUSE_AFTER_STAGED_COMMIT_MS: &str = "DUET_TEST_PAUSE_AFTER_STAGED_COMMIT_MS";
+const POST_PREFLIGHT_RECOVERY_ADVICE: &str = "Recovery: filesystem changes may have been partially applied, but Duet state was not saved. Inspect and reconcile both synchronized trees and snapshots before explicitly clearing the recovery markers; do not rerun sync against stale snapshots.";
+const STATE_SAVE_RECOVERY_ADVICE: &str = "Recovery: filesystem changes were applied, but Duet state was not saved on both sides. Inspect and reconcile both synchronized trees and snapshots before explicitly clearing the recovery markers; do not rerun sync against stale snapshots.";
 const MAX_NON_STREAMED_DETAIL_BYTES: u64 = 64 * 1024 * 1024;
 const FILE_BYTE_CHUNK_RPC_THRESHOLD: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncOutcome {
+    Success,
+    UserAbort,
+    Interrupted,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptPhase {
+    PreCommit = 0,
+    CancelRequested = 1,
+    Committed = 2,
+    CommittedInterrupted = 3,
+    Complete = 4,
+    CompleteInterrupted = 5,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptRequest {
+    Cancel,
+    Deferred,
+    Force,
+}
+
+#[derive(Clone)]
+struct InterruptState {
+    phase: Arc<AtomicU8>,
+    local_server_process_group: Arc<AtomicI32>,
+}
+
+impl InterruptState {
+    fn new() -> Self {
+        Self {
+            phase: Arc::new(AtomicU8::new(InterruptPhase::PreCommit as u8)),
+            local_server_process_group: Arc::new(AtomicI32::new(0)),
+        }
+    }
+
+    fn request_interrupt(&self) -> InterruptRequest {
+        loop {
+            let phase = self.phase.load(Ordering::SeqCst);
+            let (next, result) = match phase {
+                x if x == InterruptPhase::PreCommit as u8 => {
+                    (InterruptPhase::CancelRequested, InterruptRequest::Cancel)
+                }
+                x if x == InterruptPhase::Committed as u8 => (
+                    InterruptPhase::CommittedInterrupted,
+                    InterruptRequest::Deferred,
+                ),
+                x if x == InterruptPhase::Complete as u8 => (
+                    InterruptPhase::CompleteInterrupted,
+                    InterruptRequest::Deferred,
+                ),
+                x if x == InterruptPhase::CancelRequested as u8
+                    || x == InterruptPhase::CommittedInterrupted as u8
+                    || x == InterruptPhase::CompleteInterrupted as u8 =>
+                {
+                    return InterruptRequest::Force;
+                }
+                _ => unreachable!("invalid interrupt phase"),
+            };
+            if self
+                .phase
+                .compare_exchange(phase, next as u8, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return result;
+            }
+        }
+    }
+
+    fn is_cancel_requested(&self) -> bool {
+        self.phase.load(Ordering::SeqCst) == InterruptPhase::CancelRequested as u8
+    }
+
+    fn try_begin_commit(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                InterruptPhase::PreCommit as u8,
+                InterruptPhase::Committed as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn complete(&self) -> bool {
+        loop {
+            let phase = self.phase.load(Ordering::SeqCst);
+            let next = match phase {
+                x if x == InterruptPhase::PreCommit as u8
+                    || x == InterruptPhase::Committed as u8 =>
+                {
+                    InterruptPhase::Complete
+                }
+                x if x == InterruptPhase::CommittedInterrupted as u8 => {
+                    InterruptPhase::CompleteInterrupted
+                }
+                x if x == InterruptPhase::CancelRequested as u8 => return true,
+                _ => return false,
+            };
+            if self
+                .phase
+                .compare_exchange(phase, next as u8, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return false;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn register_local_server(&self, server: &remote::Server<'_>) {
+        self.local_server_process_group
+            .store(server.local_process_group().unwrap_or(0), Ordering::SeqCst);
+    }
+
+    #[cfg(not(unix))]
+    fn register_local_server(&self, _server: &remote::Server<'_>) {}
+
+    fn clear_local_server(&self) {
+        self.local_server_process_group.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(unix)]
+    fn force_stop_local_server(&self) {
+        let process_group = self.local_server_process_group.load(Ordering::SeqCst);
+        if process_group > 0 {
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn force_stop_local_server(&self) {}
+}
 
 struct SyncContext {
     profile: profile::Profile,
@@ -55,11 +197,26 @@ struct LocalIds {
     legacy: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyStrategy {
+    StagedStream,
+    LegacyStream,
+    LegacyNonStream,
+}
+
+impl ApplyStrategy {
+    fn is_staged(self) -> bool {
+        matches!(self, Self::StagedStream)
+    }
+}
+
 pub async fn sync(
     source: ProfileSource,
     path: Option<PathBuf>,
     options: SyncOptions,
-) -> Result<()> {
+) -> Result<SyncOutcome> {
+    let interrupt = InterruptState::new();
+    install_ctrlc_handler(interrupt.clone())?;
     let total_start = Instant::now();
     let print_performance = options.profile_performance;
     let performance_json = options.profile_performance_json.clone();
@@ -68,11 +225,13 @@ pub async fn sync(
 
     let setup_start = Instant::now();
     env_logger::init();
-    install_ctrlc_handler()?;
 
     let context = prepare_context(source, path)?;
     sync_ops::check_apply_attempt_clear(&context.local_state)?;
     performance.record_phase("setup", setup_start.elapsed());
+    if interrupt.is_cancel_requested() {
+        return Ok(SyncOutcome::Interrupted);
+    }
 
     let SyncContext {
         profile: prf,
@@ -90,17 +249,17 @@ pub async fn sync(
     let apply_attempt_id = new_apply_attempt_id(&local_id);
     let locations = outbound_scan_locations(&prf.locations);
     let scan_ignore = prf.scan_ignore();
-    let scan_policy = sync_ops::ScanPolicy::with_prune(
-        locations.clone(),
-        prf.ignore.clone(),
-        prf.prune.clone(),
-    );
+    let scan_policy =
+        sync_ops::ScanPolicy::with_prune(locations.clone(), prf.ignore.clone(), prf.prune.clone());
     let mut apply_options = sync_ops::ApplyOptions {
         prune_ignored: options.prune_ignored,
     };
 
     let remote_setup_start = Instant::now();
     let remote_session = open_remote_session(remote_server).await;
+    if interrupt.is_cancel_requested() {
+        return Ok(SyncOutcome::Interrupted);
+    }
     let mut server = remote::launch_server(&remote_session, remote_cmd, &server_log)
         .await
         .unwrap_or_else(|e| {
@@ -109,8 +268,13 @@ pub async fn sync(
             eprintln!("{}", diagnostic.cyan());
             quit::with_code(SERVER_ERROR_CODE);
         });
-    let remote = remote::get_remote(&mut server)?;
-    remote
+    interrupt.register_local_server(&server);
+    let sync_result = async {
+        let remote = remote::get_remote(&mut server)?;
+        if interrupt.is_cancel_requested() {
+            return Ok(SyncOutcome::Interrupted);
+        }
+        remote
         .set_base(remote_base)
         .await
         .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
@@ -130,6 +294,9 @@ pub async fn sync(
         eprintln!("Warning: peer lacks {}; Adler-32 compatibility fallback is active and snapshots will be saved as legacy V1.", rpc::CAPABILITY_CONTENT_DIGEST_BLAKE2B256);
     }
     performance.record_phase("remote_setup", remote_setup_start.elapsed());
+    if interrupt.is_cancel_requested() {
+        return Ok(SyncOutcome::Interrupted);
+    }
 
     let local_fut = async {
         let start = Instant::now();
@@ -163,6 +330,9 @@ pub async fn sync(
     performance.record_phase("remote_scan_rpc", remote_scan_duration);
     let local_context = local_result?;
     let remote_context = remote_result?;
+    if interrupt.is_cancel_requested() {
+        return Ok(SyncOutcome::Interrupted);
+    }
     let mut local_all_old = local_context.all_old;
     let local_changes = local_context.changes;
     let remote_changes = remote_context.changes;
@@ -177,6 +347,9 @@ pub async fn sync(
     let tuning = negotiate_sync_tuning(&remote, &remote_info).await?;
     performance.record_phase("sync_tuning", tuning_start.elapsed());
     performance.sync_tuning = Some(tuning.normalized());
+    if interrupt.is_cancel_requested() {
+        return Ok(SyncOutcome::Interrupted);
+    }
 
     let resolve_start = Instant::now();
     let migration = strong && (local_context.migration_needed || remote_context.migration_needed);
@@ -210,6 +383,14 @@ pub async fn sync(
     performance.counters.identical_actions = num_identical(actions.iter());
     performance.record_phase("resolve_actions", resolve_start.elapsed());
 
+    if resolution == AllResolution::Interrupted {
+        handle_interrupt_request(&interrupt);
+        return Ok(SyncOutcome::Interrupted);
+    }
+    if interrupt.is_cancel_requested() {
+        return Ok(SyncOutcome::Interrupted);
+    }
+
     if migration && performance.counters.unresolved_conflicts > 0 && !options.dry_run {
         return Err(eyre!(
             "strong-digest migration found divergent current files; resolve every conflict before migration can save a shared baseline"
@@ -218,11 +399,15 @@ pub async fn sync(
 
     if let AllResolution::Abort = resolution {
         println!("Aborting");
-        quit::with_code(ABORT_CODE);
+        return Ok(SyncOutcome::UserAbort);
     }
 
     if strong {
         sync_ops::validate_strong_actions(&actions)?;
+    }
+
+    if actions.is_empty() && !options.dry_run {
+        return Ok(SyncOutcome::Success);
     }
 
     if options.dry_run && actions.is_empty() {
@@ -241,12 +426,11 @@ pub async fn sync(
                 performance.write_json(&path)?;
             }
         }
-        return Ok(());
+        return Ok(SyncOutcome::Success);
     }
 
     log::debug!("synchronizing");
 
-    use std::sync::Arc;
     let actions: Arc<Actions> = Arc::new(
         actions
             .into_iter()
@@ -270,11 +454,12 @@ pub async fn sync(
                 performance.write_json(&path)?;
             }
         }
-        return Ok(());
+        return Ok(SyncOutcome::Success);
     }
 
     let preflight_start = Instant::now();
     let remote_actions: Actions = reverse(&actions);
+    let remote_action_count = remote_actions.len();
     apply_options = resolve_removal_blockers(
         &remote,
         &remote_info,
@@ -296,6 +481,7 @@ pub async fn sync(
         has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAIL_BATCHES)
             && sync_ops::can_stream_details(&actions)
             && sync_ops::can_stream_details(&remote_actions);
+    let apply_strategy = select_apply_strategy(&remote_info, can_stream_details);
     if !can_stream_details {
         preflight_non_streamed_detail_size(actions.as_ref(), &remote_actions)?;
     }
@@ -318,6 +504,9 @@ pub async fn sync(
             remote.preflight_apply(crate::actions::to_legacy(remote_actions), apply_options).await
                 .map_err(|e| remote_rpc_error("Failed to preflight remote apply", e))?;
         }
+        if interrupt.is_cancel_requested() {
+            return Ok(SyncOutcome::Interrupted);
+        }
         performance.record_phase("preflight_and_set_actions", preflight_start.elapsed());
         finish_dry_run(
             performance.counters.total_actions,
@@ -333,7 +522,7 @@ pub async fn sync(
                 performance.write_json(&path)?;
             }
         }
-        return Ok(());
+        return Ok(SyncOutcome::Success);
     }
     if apply_options.prune_ignored {
         remote
@@ -350,6 +539,9 @@ pub async fn sync(
     }
     performance.record_phase("preflight_and_set_actions", preflight_start.elapsed());
     log::debug!("set remote actions");
+    if interrupt.is_cancel_requested() {
+        return Ok(SyncOutcome::Interrupted);
+    }
 
     let local_signatures_fut = {
         let local_base = local_base.clone();
@@ -383,9 +575,162 @@ pub async fn sync(
         local_signatures.len(),
         remote_signatures.len()
     );
+    if interrupt.is_cancel_requested() {
+        return Ok(SyncOutcome::Interrupted);
+    }
 
-    let local_all_old = if can_stream_details {
+    let apply_start = Instant::now();
+    let local_all_old = if apply_strategy == ApplyStrategy::StagedStream {
+        log::debug!("preparing staged detailed changes");
+        let stream_result = stream_detailed_changes(
+            &remote,
+            &local_base,
+            &local_state,
+            &actions,
+            local_all_old,
+            local_signatures,
+            remote_signatures,
+            tuning,
+            Some(scan_policy.clone()),
+            apply_options,
+            remote_stream_performance_enabled(profiling_enabled, &remote_info),
+            has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
+            Some(&apply_attempt_id),
+            Some(&interrupt),
+        )
+        .await?;
+        let StreamDetailedChangesRun::Complete(mut stream_result) = stream_result else {
+            return Ok(SyncOutcome::Interrupted);
+        };
+        record_stream_performance(&mut performance, &mut stream_result);
+        let StreamApplyOutcome::Staged {
+            prepared,
+            local_report,
+            remote_report,
+        } = stream_result.outcome
+        else {
+            unreachable!("staged stream returned legacy outcome");
+        };
+        if let Err(error) = validate_staged_prepare_barrier(
+            &local_report,
+            actions.len(),
+            &remote_report,
+            remote_action_count,
+        ) {
+            let local_cleanup = prepared.abort().err();
+            let remote_cleanup = remote
+                .abort_staged_apply(apply_attempt_id.clone())
+                .await
+                .err();
+            return Err(add_staged_cleanup_context(
+                error,
+                local_cleanup,
+                remote_cleanup,
+            ));
+        }
+        performance.record_phase("staged_prepare_transfer", apply_start.elapsed());
+
+        test_pause_until_interrupt(TEST_PAUSE_AFTER_STAGED_PREPARE_MS, &interrupt).await;
+
+        let local_validation = tokio::task::spawn_blocking(move || {
+            let result = prepared.validate_commit();
+            (prepared, result)
+        });
+        let remote_validation = remote.validate_staged_apply(apply_attempt_id.clone());
+        let (local_validation, remote_validation) =
+            tokio::join!(local_validation, remote_validation);
+        let (prepared, local_validation) = match local_validation {
+            Ok(validation) => validation,
+            Err(error) => {
+                let local_cleanup = sync_ops::abort_staged_apply_attempt(
+                    &local_state,
+                    &apply_attempt_id,
+                )
+                .err();
+                let remote_cleanup = remote
+                    .abort_staged_apply(apply_attempt_id.clone())
+                    .await
+                    .err();
+                return Err(add_staged_cleanup_context(
+                    eyre!("local staged validation task failed: {}", error),
+                    local_cleanup,
+                    remote_cleanup,
+                ));
+            }
+        };
+        if let Err(error) = local_validation {
+            let local_cleanup = prepared.abort().err();
+            let remote_cleanup = remote
+                .abort_staged_apply(apply_attempt_id.clone())
+                .await
+                .err();
+            return Err(add_staged_cleanup_context(
+                error,
+                local_cleanup,
+                remote_cleanup,
+            ));
+        }
+        if let Err(error) = remote_validation {
+            let local_cleanup = prepared.abort().err();
+            let remote_cleanup = remote
+                .abort_staged_apply(apply_attempt_id.clone())
+                .await
+                .err();
+            return Err(add_staged_cleanup_context(
+                remote_rpc_error("remote staged validation failed", error),
+                local_cleanup,
+                remote_cleanup,
+            ));
+        }
+
+        if !interrupt.try_begin_commit() {
+            let local_cleanup = prepared.abort().err();
+            let remote_cleanup = remote
+                .abort_staged_apply(apply_attempt_id.clone())
+                .await
+                .err();
+            if local_cleanup.is_some() || remote_cleanup.is_some() {
+                return Err(add_staged_cleanup_context(
+                    eyre!("sync interrupted before staged commit"),
+                    local_cleanup,
+                    remote_cleanup,
+                ));
+            }
+            return Ok(SyncOutcome::Interrupted);
+        }
+
+        let commit_start = Instant::now();
+        let local_commit = tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
+            let result = prepared.commit();
+            (result, start.elapsed())
+        });
+        let remote_commit = async {
+            let start = Instant::now();
+            let result = remote.commit_staged_apply(apply_attempt_id.clone()).await;
+            (result, start.elapsed())
+        };
+        // This join is the bilateral commit barrier. Once entered, both commits must be awaited.
+        let (local_commit, remote_commit) = tokio::join!(local_commit, remote_commit);
+        let (local_commit, local_commit_duration) = match local_commit {
+            Ok(result) => result,
+            Err(error) => (
+                Err(eyre!("local staged commit task failed: {}", error)),
+                Duration::default(),
+            ),
+        };
+        let (remote_commit, remote_commit_duration) = remote_commit;
+        let local_all_old = finish_staged_commit(local_commit, remote_commit)?;
+        performance.record_phase("staged_local_commit", local_commit_duration);
+        performance.record_phase("staged_remote_commit_rpc", remote_commit_duration);
+        performance.record_phase("staged_commit", commit_start.elapsed());
+        test_pause_until_interrupt(TEST_PAUSE_AFTER_STAGED_COMMIT_MS, &interrupt).await;
+        local_all_old
+    } else if apply_strategy == ApplyStrategy::LegacyStream {
         log::debug!("streaming detailed changes");
+        if !interrupt.try_begin_commit() {
+            return Ok(SyncOutcome::Interrupted);
+        }
         prepare_remote_apply_attempt(
             &remote,
             can_prepare_remote_apply,
@@ -413,23 +758,18 @@ pub async fn sync(
             apply_options,
             remote_stream_performance_enabled(profiling_enabled, &remote_info),
             has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
+            None,
+            None,
         )
         .await?;
-        performance.record_phase(
-            "stream_remote_detail_and_local_apply",
-            stream_result.remote_detail_and_local_apply_duration,
-        );
-        performance.record_phase("stream_remote_detail_rpc", stream_result.remote_detail_duration);
-        performance.record_phase("stream_local_apply", stream_result.local_apply_duration);
-        performance.record_phase(
-            "stream_local_detail_and_remote_apply",
-            stream_result.local_detail_and_remote_apply_duration,
-        );
-        performance.record_phase("stream_local_detail", stream_result.local_detail_duration);
-        performance.record_phase("stream_remote_apply_rpc", stream_result.remote_apply_duration);
-        performance.counters.streamed_details = true;
-        performance.counters.streaming = stream_result.profile;
-        stream_result.local_all_old
+        let StreamDetailedChangesRun::Complete(mut stream_result) = stream_result else {
+            unreachable!("legacy stream cannot be cancelled after commit")
+        };
+        record_stream_performance(&mut performance, &mut stream_result);
+        let StreamApplyOutcome::Legacy(local_all_old) = stream_result.outcome else {
+            unreachable!("legacy stream returned staged outcome");
+        };
+        local_all_old
     } else {
         let local_detailed_changes_fut = {
             let local_base = local_base.clone();
@@ -457,6 +797,13 @@ pub async fn sync(
         performance.record_phase("local_details", local_detail_duration);
         performance.record_phase("remote_details_rpc", remote_detail_duration);
         log::debug!("got detailed changes");
+
+        if interrupt.is_cancel_requested() {
+            return Ok(SyncOutcome::Interrupted);
+        }
+        if !interrupt.try_begin_commit() {
+            return Ok(SyncOutcome::Interrupted);
+        }
 
         prepare_remote_apply_attempt(
             &remote,
@@ -508,13 +855,17 @@ pub async fn sync(
         local_all_old
     };
 
-    sync_ops::mark_apply_attempt_state_save(
-        "local",
-        &local_state,
-        &local_base,
-        actions.as_ref(),
-        Some(&apply_attempt_id),
-    )?;
+    if apply_strategy.is_staged() {
+        sync_ops::mark_staged_apply_attempt_state_save(&local_state, &apply_attempt_id)?;
+    } else {
+        sync_ops::mark_apply_attempt_state_save(
+            "local",
+            &local_state,
+            &local_base,
+            actions.as_ref(),
+            Some(&apply_attempt_id),
+        )?;
+    }
 
     let state_save_start = Instant::now();
     let coordinated_cleanup = has_remote_capability(&remote_info, rpc::CAPABILITY_COORDINATED_MARKER_CLEANUP);
@@ -523,7 +874,11 @@ pub async fn sync(
     let (remote_result, local_result) = tokio::join!(
         async {
             let start = Instant::now();
-            let result = if coordinated_cleanup {
+            let result = if apply_strategy.is_staged() {
+                remote
+                    .save_staged_state_pending(apply_attempt_id.clone(), strong)
+                    .await
+            } else if coordinated_cleanup {
                 remote.save_state_pending(strong).await
             } else if strong {
                 remote.save_state_v2().await
@@ -549,11 +904,19 @@ pub async fn sync(
     })?;
     let (remote_result, remote_state_save_duration) = remote_result;
     remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
-    if coordinated_cleanup {
+    if apply_strategy.is_staged() {
+        remote
+            .complete_staged_apply(apply_attempt_id.clone())
+            .await
+            .map_err(|e| post_state_save_rpc_error("failed to complete remote staged apply", e))?;
+        sync_ops::finish_staged_apply_attempt(&local_state, &apply_attempt_id)?;
+    } else if coordinated_cleanup {
         remote.clear_apply_attempt(remote_id).await
             .map_err(|e| remote_rpc_error("failed to clear remote recovery marker", e))?;
+        sync_ops::finish_apply_attempt(&local_state)?;
+    } else {
+        sync_ops::finish_apply_attempt(&local_state)?;
     }
-    sync_ops::finish_apply_attempt(&local_state)?;
     performance.record_phase("local_state_save", local_state_save_duration);
     performance.record_phase("remote_state_save_rpc", remote_state_save_duration);
     performance.record_phase("state_save_total", state_save_start.elapsed());
@@ -568,7 +931,18 @@ pub async fn sync(
         }
     }
 
-    Ok(())
+    Ok(SyncOutcome::Success)
+    }
+    .await;
+
+    let server_wait = server.wait().await;
+    interrupt.clear_local_server();
+    let result = finalize_server(sync_result, server_wait);
+    if interrupt.complete() {
+        result.map(|_| SyncOutcome::Interrupted)
+    } else {
+        result
+    }
 }
 
 fn outbound_scan_locations(
@@ -601,40 +975,47 @@ pub async fn recover_remote(target: PathBuf, clear: bool, yes: bool) -> Result<(
             eprintln!("{}", diagnostic.cyan());
             quit::with_code(SERVER_ERROR_CODE);
         });
-    let remote = remote::get_remote(&mut server)?;
-    let remote_info = remote.server_info().await.map_err(server_info_error)?;
-    require_remote_capability(&remote_info, rpc::CAPABILITY_RECOVERY)?;
-    if let Some(remote_state_dir) = remote_state_dir {
-        require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
-        remote
-            .set_remote_state_dir(remote_state_dir)
-            .await
-            .map_err(remote_state_dir_error)?;
-    }
-    let remote_id = select_remote_state_id(&remote, &remote_info, local_id, legacy_local_id).await?;
-
-    match remote
-        .describe_apply_attempt(remote_id.clone())
-        .await
-        .map_err(|e| remote_rpc_error("Failed to inspect remote recovery marker", e))?
-    {
-        Some(description) => {
-            println!("{}", description);
-            if clear && crate::commands::confirm_clear_recovery_marker(yes)? {
-                remote
-                    .clear_apply_attempt(remote_id)
-                    .await
-                    .map_err(|e| remote_rpc_error("Failed to clear remote recovery marker", e))?;
-                println!("Removed remote recovery marker for profile {}", profile_name);
-            }
+    let result = async {
+        let remote = remote::get_remote(&mut server)?;
+        let remote_info = remote.server_info().await.map_err(server_info_error)?;
+        require_remote_capability(&remote_info, rpc::CAPABILITY_RECOVERY)?;
+        if let Some(remote_state_dir) = remote_state_dir {
+            require_remote_capability(&remote_info, rpc::CAPABILITY_PROFILE_FILE_STATE_DIR)?;
+            remote
+                .set_remote_state_dir(remote_state_dir)
+                .await
+                .map_err(remote_state_dir_error)?;
         }
-        None => println!(
-            "No unfinished remote Duet apply attempt for profile {}",
-            profile_name
-        ),
-    }
+        let remote_id =
+            select_remote_state_id(&remote, &remote_info, local_id, legacy_local_id).await?;
 
-    Ok(())
+        match remote
+            .describe_apply_attempt(remote_id.clone())
+            .await
+            .map_err(|e| remote_rpc_error("Failed to inspect remote recovery marker", e))?
+        {
+            Some(description) => {
+                println!("{}", description);
+                if clear && crate::commands::confirm_clear_recovery_marker(yes)? {
+                    remote.clear_apply_attempt(remote_id).await.map_err(|e| {
+                        remote_rpc_error("Failed to clear remote recovery marker", e)
+                    })?;
+                    println!(
+                        "Removed remote recovery marker for profile {}",
+                        profile_name
+                    );
+                }
+            }
+            None => println!(
+                "No unfinished remote Duet apply attempt for profile {}",
+                profile_name
+            ),
+        }
+
+        Ok(())
+    }
+    .await;
+    finalize_server(result, server.wait().await)
 }
 
 fn remote_recovery_profile_name(target: &Path) -> Result<&str> {
@@ -728,6 +1109,76 @@ fn remote_stream_performance_enabled(profiling_enabled: bool, info: &rpc::Server
     profiling_enabled && has_remote_capability(info, rpc::CAPABILITY_STREAM_PERFORMANCE)
 }
 
+fn select_apply_strategy(info: &rpc::ServerInfo, can_stream_details: bool) -> ApplyStrategy {
+    if can_stream_details && has_remote_capability(info, rpc::CAPABILITY_STAGED_APPLY) {
+        ApplyStrategy::StagedStream
+    } else if can_stream_details {
+        ApplyStrategy::LegacyStream
+    } else {
+        ApplyStrategy::LegacyNonStream
+    }
+}
+
+fn validate_prepared_report(
+    side: &str,
+    report: &sync_ops::PreparedApplyReport,
+    expected_actions: usize,
+) -> Result<()> {
+    if report.action_count != expected_actions {
+        return Err(eyre!(
+            "{} staged preparation reported {} actions, expected {}",
+            side,
+            report.action_count,
+            expected_actions
+        ));
+    }
+    if report.prepared_file_count > report.action_count {
+        return Err(eyre!(
+            "{} staged preparation reported {} prepared files for {} actions",
+            side,
+            report.prepared_file_count,
+            report.action_count
+        ));
+    }
+    if report.prepared_file_count == 0 && report.prepared_file_bytes != 0 {
+        return Err(eyre!(
+            "{} staged preparation reported bytes without prepared files",
+            side
+        ));
+    }
+    Ok(())
+}
+
+fn validate_staged_prepare_barrier(
+    local_report: &sync_ops::PreparedApplyReport,
+    local_action_count: usize,
+    remote_report: &sync_ops::PreparedApplyReport,
+    remote_action_count: usize,
+) -> Result<()> {
+    validate_prepared_report("local", local_report, local_action_count)?;
+    validate_prepared_report("remote", remote_report, remote_action_count)
+}
+
+fn finish_staged_commit(
+    local: Result<state::Entries>,
+    remote: std::result::Result<(), RPCError>,
+) -> Result<state::Entries> {
+    match (local, remote) {
+        (Ok(entries), Ok(())) => Ok(entries),
+        (Err(local), Ok(())) => Err(local).wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE),
+        (Ok(_), Err(remote)) => Err(post_preflight_rpc_error(
+            "remote staged commit failed after preflight",
+            remote,
+        )),
+        (Err(local), Err(remote)) => Err(eyre!(
+            "local staged commit failed: {:#}\nremote staged commit failed: {}\n{}",
+            local,
+            sync_error::render_rpc_error(&remote),
+            POST_PREFLIGHT_RECOVERY_ADVICE
+        )),
+    }
+}
+
 async fn resolve_removal_blockers<R>(
     remote: &R,
     remote_info: &rpc::ServerInfo,
@@ -751,11 +1202,12 @@ where
         print_preflight_report("local", &local_report);
     }
 
-    let remote_report = match remote_preflight_report(remote, remote_info, remote_actions, apply_options).await {
-        Ok(report) => report,
-        Err(_) if local_blocked => return Err(preflight_blocker_error("local")),
-        Err(error) => return Err(error),
-    };
+    let remote_report =
+        match remote_preflight_report(remote, remote_info, remote_actions, apply_options).await {
+            Ok(report) => report,
+            Err(_) if local_blocked => return Err(preflight_blocker_error("local")),
+            Err(error) => return Err(error),
+        };
     let remote_blocked = remote_report.has_unprunable_blockers();
     if remote_blocked {
         print_preflight_report("remote", &remote_report);
@@ -781,19 +1233,35 @@ where
 {
     if has_remote_capability(remote_info, rpc::CAPABILITY_REMOVAL_BLOCKER_REPORT) {
         return if has_remote_capability(remote_info, rpc::CAPABILITY_CONTENT_DIGEST_BLAKE2B256) {
-            remote.removal_blocker_report_v2(remote_actions.clone(), apply_options).await
+            remote
+                .removal_blocker_report_v2(remote_actions.clone(), apply_options)
+                .await
         } else {
-            remote.removal_blocker_report(crate::actions::to_legacy(remote_actions.clone()), apply_options).await
-        }.map_err(|e| remote_rpc_error("Failed to get remote removal blocker report", e));
+            remote
+                .removal_blocker_report(
+                    crate::actions::to_legacy(remote_actions.clone()),
+                    apply_options,
+                )
+                .await
+        }
+        .map_err(|e| remote_rpc_error("Failed to get remote removal blocker report", e));
     }
     if !has_remote_capability(remote_info, rpc::CAPABILITY_PREFLIGHT_REPORT) {
         return Ok(sync_ops::ApplyPreflightReport::default());
     }
     if has_remote_capability(remote_info, rpc::CAPABILITY_CONTENT_DIGEST_BLAKE2B256) {
-        remote.preflight_apply_report_v2(remote_actions.clone(), apply_options).await
+        remote
+            .preflight_apply_report_v2(remote_actions.clone(), apply_options)
+            .await
     } else {
-        remote.preflight_apply_report(crate::actions::to_legacy(remote_actions.clone()), apply_options).await
-    }.map_err(|e| remote_rpc_error("Failed to get remote preflight report", e))
+        remote
+            .preflight_apply_report(
+                crate::actions::to_legacy(remote_actions.clone()),
+                apply_options,
+            )
+            .await
+    }
+    .map_err(|e| remote_rpc_error("Failed to get remote preflight report", e))
 }
 
 #[cfg(test)]
@@ -827,7 +1295,11 @@ fn print_preflight_report(side: &str, report: &sync_ops::ApplyPreflightReport) {
             sync_ops::RemovalBlockerType::Excluded => "excluded",
             sync_ops::RemovalBlockerType::Unexpected => "unexpected",
         };
-        let action = if blocker.prunable { "will prune" } else { "blocks removal" };
+        let action = if blocker.prunable {
+            "will prune"
+        } else {
+            "blocks removal"
+        };
         if let Some(pattern) = &blocker.pattern {
             println!(
                 "  {} {} matched {:?}: {}",
@@ -856,13 +1328,68 @@ async fn test_pause_after_remote_apply_prepare() {
 #[cfg(not(debug_assertions))]
 async fn test_pause_after_remote_apply_prepare() {}
 
-fn install_ctrlc_handler() -> Result<()> {
-    ctrlc::set_handler(|| {
-        eprintln!("\nQuitting");
-        quit::with_code(CTRLC_CODE);
+#[cfg(debug_assertions)]
+async fn test_pause_until_interrupt(variable: &str, interrupt: &InterruptState) {
+    let Ok(raw_ms) = std::env::var(variable) else {
+        return;
+    };
+    let Ok(ms) = raw_ms.parse::<u64>() else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    while tokio::time::Instant::now() < deadline {
+        if matches!(
+            interrupt.phase.load(Ordering::SeqCst),
+            x if x == InterruptPhase::CancelRequested as u8
+                || x == InterruptPhase::CommittedInterrupted as u8
+        ) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn test_pause_until_interrupt(_variable: &str, _interrupt: &InterruptState) {}
+
+fn install_ctrlc_handler(interrupt: InterruptState) -> Result<()> {
+    ctrlc::set_handler(move || {
+        handle_interrupt_request(&interrupt);
     })
     .wrap_err("failed to install Ctrl-C handler")?;
     Ok(())
+}
+
+fn handle_interrupt_request(interrupt: &InterruptState) {
+    match interrupt.request_interrupt() {
+        InterruptRequest::Cancel => eprintln!("\nInterrupt requested; stopping safely"),
+        InterruptRequest::Deferred => {
+            eprintln!("\nInterrupt received; finishing committed sync")
+        }
+        InterruptRequest::Force => {
+            eprintln!("\nSecond interrupt; forcing exit");
+            interrupt.force_stop_local_server();
+            std::process::exit(CTRLC_CODE.into());
+        }
+    }
+}
+
+fn finalize_server<T>(primary: Result<T>, wait: Result<ExitStatus>) -> Result<T> {
+    let wait = wait.and_then(|status| {
+        if status.success() {
+            Ok(())
+        } else {
+            Err(eyre!("duet server exited with status {}", status))
+        }
+    });
+    match (primary, wait) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(wait)) => Err(wait),
+        (Err(primary), Err(wait)) => {
+            Err(primary.wrap_err(format!("waiting for duet server also failed: {:#}", wait)))
+        }
+    }
 }
 
 fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncContext> {
@@ -949,8 +1476,17 @@ fn post_state_save_rpc_error(context: &str, error: RPCError) -> color_eyre::eyre
     )
 }
 
+enum StreamApplyOutcome {
+    Legacy(state::Entries),
+    Staged {
+        prepared: sync_ops::PreparedApply,
+        local_report: sync_ops::PreparedApplyReport,
+        remote_report: sync_ops::PreparedApplyReport,
+    },
+}
+
 struct StreamDetailedChangesResult {
-    local_all_old: state::Entries,
+    outcome: StreamApplyOutcome,
     profile: StreamingProfile,
     remote_detail_and_local_apply_duration: Duration,
     local_detail_and_remote_apply_duration: Duration,
@@ -958,6 +1494,32 @@ struct StreamDetailedChangesResult {
     local_apply_duration: Duration,
     local_detail_duration: Duration,
     remote_apply_duration: Duration,
+}
+
+enum StreamDetailedChangesRun {
+    Complete(StreamDetailedChangesResult),
+    Interrupted,
+    InterruptedCleaned,
+}
+
+fn record_stream_performance(
+    performance: &mut PerformanceProfile,
+    result: &mut StreamDetailedChangesResult,
+) {
+    performance.record_phase(
+        "stream_remote_detail_and_local_apply",
+        result.remote_detail_and_local_apply_duration,
+    );
+    performance.record_phase("stream_remote_detail_rpc", result.remote_detail_duration);
+    performance.record_phase("stream_local_apply", result.local_apply_duration);
+    performance.record_phase(
+        "stream_local_detail_and_remote_apply",
+        result.local_detail_and_remote_apply_duration,
+    );
+    performance.record_phase("stream_local_detail", result.local_detail_duration);
+    performance.record_phase("stream_remote_apply_rpc", result.remote_apply_duration);
+    performance.counters.streamed_details = true;
+    performance.counters.streaming = std::mem::take(&mut result.profile);
 }
 
 async fn stream_detailed_changes<R>(
@@ -973,10 +1535,133 @@ async fn stream_detailed_changes<R>(
     apply_options: sync_ops::ApplyOptions,
     remote_stream_performance: bool,
     file_byte_chunks: bool,
-) -> Result<StreamDetailedChangesResult>
+    staged_attempt_id: Option<&str>,
+    interrupt: Option<&InterruptState>,
+) -> Result<StreamDetailedChangesRun>
 where
     R: DuetServerAsync,
 {
+    if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+        return Ok(StreamDetailedChangesRun::Interrupted);
+    }
+    let staged_remote_apply_stream = if let Some(attempt_id) = staged_attempt_id {
+        let stream_id = remote
+            .begin_staged_apply(attempt_id.to_string())
+            .await
+            .map_err(|e| remote_rpc_error("Couldn't begin remote staged apply", e))?;
+        if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+            let cleanup = remote.abort_staged_apply(attempt_id.to_string()).await;
+            return match cleanup {
+                Ok(()) => Ok(StreamDetailedChangesRun::Interrupted),
+                Err(error) => Err(add_staged_cleanup_context(
+                    eyre!("sync interrupted while beginning staged preparation"),
+                    None,
+                    Some(error),
+                )),
+            };
+        }
+        if let Err(error) = sync_ops::start_staged_apply_attempt(
+            "local",
+            local_state,
+            local_base,
+            actions,
+            attempt_id,
+        ) {
+            let cleanup = remote.abort_staged_apply(attempt_id.to_string()).await;
+            return Err(add_staged_cleanup_context(error, None, cleanup.err()));
+        }
+        Some(stream_id)
+    } else {
+        None
+    };
+
+    let result = stream_detailed_changes_started(
+        remote,
+        local_base,
+        local_state,
+        actions,
+        local_all_old,
+        local_signatures,
+        remote_signatures,
+        tuning,
+        scan_policy,
+        apply_options,
+        remote_stream_performance,
+        file_byte_chunks,
+        staged_attempt_id,
+        staged_remote_apply_stream,
+        interrupt,
+    )
+    .await;
+
+    match result {
+        Ok(StreamDetailedChangesRun::Complete(result)) => {
+            Ok(StreamDetailedChangesRun::Complete(result))
+        }
+        Ok(StreamDetailedChangesRun::Interrupted) => {
+            let attempt_id = staged_attempt_id
+                .expect("only staged detail streaming can be interrupted before commit");
+            let local_cleanup = sync_ops::abort_staged_apply_attempt(local_state, attempt_id).err();
+            let remote_cleanup = remote
+                .abort_staged_apply(attempt_id.to_string())
+                .await
+                .err();
+            if local_cleanup.is_some() || remote_cleanup.is_some() {
+                Err(add_staged_cleanup_context(
+                    eyre!("sync interrupted during staged preparation"),
+                    local_cleanup,
+                    remote_cleanup,
+                ))
+            } else {
+                Ok(StreamDetailedChangesRun::Interrupted)
+            }
+        }
+        Ok(StreamDetailedChangesRun::InterruptedCleaned) => {
+            Ok(StreamDetailedChangesRun::Interrupted)
+        }
+        Err(primary) => {
+            if let Some(attempt_id) = staged_attempt_id {
+                let local_cleanup =
+                    sync_ops::abort_staged_apply_attempt(local_state, attempt_id).err();
+                let remote_cleanup = remote
+                    .abort_staged_apply(attempt_id.to_string())
+                    .await
+                    .err();
+                return Err(add_staged_cleanup_context(
+                    primary,
+                    local_cleanup,
+                    remote_cleanup,
+                ));
+            }
+            Err(primary)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_detailed_changes_started<R>(
+    remote: &R,
+    local_base: &PathBuf,
+    local_state: &Path,
+    actions: &Actions,
+    local_all_old: state::Entries,
+    local_signatures: Vec<sync_ops::SignatureWithPath>,
+    remote_signatures: Vec<sync_ops::SignatureWithPath>,
+    tuning: sync_ops::SyncTuning,
+    scan_policy: Option<sync_ops::ScanPolicy>,
+    apply_options: sync_ops::ApplyOptions,
+    remote_stream_performance: bool,
+    file_byte_chunks: bool,
+    staged_attempt_id: Option<&str>,
+    staged_remote_apply_stream: Option<sync_ops::ApplyStreamId>,
+    interrupt: Option<&InterruptState>,
+) -> Result<StreamDetailedChangesRun>
+where
+    R: DuetServerAsync,
+{
+    if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+        return Ok(StreamDetailedChangesRun::Interrupted);
+    }
     let total_transfer_bytes = sync_ops::detail_transfer_bytes(actions);
     let progress = stream_progress_bar(total_transfer_bytes)?;
     let mut progress_position = 0;
@@ -987,24 +1672,42 @@ where
         remote_signatures,
         tuning.detail_chunk_bytes(),
     );
-    let mut local_applier = sync_ops::DetailApplier::new_with_attempt_and_policy(
-        local_base.clone(),
-        actions.clone(),
-        local_all_old,
-        Some(local_state.to_path_buf()),
-        scan_policy,
-        apply_options,
-    );
+    let mut local_applier = if let Some(attempt_id) = staged_attempt_id {
+        sync_ops::DetailApplier::new_staged_with_attempt_and_policy(
+            local_base.clone(),
+            actions.clone(),
+            local_all_old,
+            local_state.to_path_buf(),
+            attempt_id.to_string(),
+            scan_policy,
+            apply_options,
+        )
+    } else {
+        sync_ops::DetailApplier::new_with_attempt_and_policy(
+            local_base.clone(),
+            actions.clone(),
+            local_all_old,
+            Some(local_state.to_path_buf()),
+            scan_policy,
+            apply_options,
+        )
+    };
 
     let remote_detail_stream = remote
         .begin_detail_stream(local_signatures, tuning.detail_chunk_bytes() as u32)
         .await
         .map_err(|e| remote_rpc_error("Couldn't begin remote detail stream", e))?;
-    let remote_apply_stream = remote
-        .begin_apply_stream()
-        .await
-        .map_err(|e| remote_rpc_error("Couldn't begin remote apply stream", e))?;
-
+    if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+        return Ok(StreamDetailedChangesRun::Interrupted);
+    }
+    let remote_apply_stream = if let Some(stream_id) = staged_remote_apply_stream {
+        stream_id
+    } else {
+        remote
+            .begin_apply_stream()
+            .await
+            .map_err(|e| remote_rpc_error("Couldn't begin remote apply stream", e))?
+    };
     let mut local_done = false;
     let mut remote_done = false;
     let mut profile = StreamingProfile::default();
@@ -1013,6 +1716,9 @@ where
     let mut local_detail_duration = Duration::default();
     let mut remote_apply_duration = Duration::default();
     while !local_done || !remote_done {
+        if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+            return Ok(StreamDetailedChangesRun::Interrupted);
+        }
         if !remote_done {
             let start = Instant::now();
             let frames = remote
@@ -1024,6 +1730,9 @@ where
                 .await
                 .map_err(|e| post_preflight_rpc_error("Couldn't read remote detail stream", e))?;
             remote_detail_duration += start.elapsed();
+            if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+                return Ok(StreamDetailedChangesRun::Interrupted);
+            }
             profile.remote_to_local.record_batch(&frames);
             if frames.is_empty() {
                 remote_done = true;
@@ -1046,6 +1755,9 @@ where
         }
 
         if !local_done {
+            if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+                return Ok(StreamDetailedChangesRun::Interrupted);
+            }
             let start = Instant::now();
             let frames = local_producer
                 .next_frames(
@@ -1060,7 +1772,17 @@ where
             } else {
                 let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
                 let start = Instant::now();
-                apply_detail_frames(remote, remote_apply_stream, frames, file_byte_chunks).await?;
+                if !apply_detail_frames(
+                    remote,
+                    remote_apply_stream,
+                    frames,
+                    file_byte_chunks,
+                    interrupt,
+                )
+                .await?
+                {
+                    return Ok(StreamDetailedChangesRun::Interrupted);
+                }
                 advance_stream_progress(
                     &progress,
                     &mut progress_position,
@@ -1073,16 +1795,54 @@ where
     }
 
     let start = Instant::now();
-    let local_all_old = local_applier
-        .finish()
-        .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
-    local_apply_duration += start.elapsed();
-    let start = Instant::now();
-    remote
-        .finish_apply_stream(remote_apply_stream)
-        .await
-        .map_err(|e| post_preflight_rpc_error("Couldn't finish remote apply stream", e))?;
-    remote_apply_duration += start.elapsed();
+    if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+        return Ok(StreamDetailedChangesRun::Interrupted);
+    }
+    let outcome = if let Some(attempt_id) = staged_attempt_id {
+        let prepared = local_applier
+            .finish_preparation()
+            .wrap_err("Couldn't finish local staged preparation")?;
+        if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+            let local_cleanup = prepared.abort().err();
+            let remote_cleanup = remote
+                .abort_staged_apply(attempt_id.to_string())
+                .await
+                .err();
+            if local_cleanup.is_some() || remote_cleanup.is_some() {
+                return Err(add_staged_cleanup_context(
+                    eyre!("sync interrupted while finishing staged preparation"),
+                    local_cleanup,
+                    remote_cleanup,
+                ));
+            }
+            return Ok(StreamDetailedChangesRun::InterruptedCleaned);
+        }
+        let local_report = prepared.report();
+        local_apply_duration += start.elapsed();
+        let start = Instant::now();
+        let remote_report = remote
+            .finish_staged_prepare(remote_apply_stream, attempt_id.to_string())
+            .await
+            .map_err(|e| remote_rpc_error("Couldn't finish remote staged preparation", e))?;
+        remote_apply_duration += start.elapsed();
+        StreamApplyOutcome::Staged {
+            prepared,
+            local_report,
+            remote_report,
+        }
+    } else {
+        let local_all_old = local_applier
+            .finish()
+            .wrap_err(POST_PREFLIGHT_RECOVERY_ADVICE)?;
+        local_apply_duration += start.elapsed();
+        let start = Instant::now();
+        remote
+            .finish_apply_stream(remote_apply_stream)
+            .await
+            .map_err(|e| post_preflight_rpc_error("Couldn't finish remote apply stream", e))?;
+        remote_apply_duration += start.elapsed();
+        StreamApplyOutcome::Legacy(local_all_old)
+    };
     if remote_stream_performance {
         let remote_server_profile = remote
             .stream_performance()
@@ -1093,16 +1853,43 @@ where
         }
     }
     progress.finish_and_clear();
-    Ok(StreamDetailedChangesResult {
-        local_all_old,
-        profile,
-        remote_detail_and_local_apply_duration: remote_detail_duration + local_apply_duration,
-        local_detail_and_remote_apply_duration: local_detail_duration + remote_apply_duration,
-        remote_detail_duration,
-        local_apply_duration,
-        local_detail_duration,
-        remote_apply_duration,
-    })
+    Ok(StreamDetailedChangesRun::Complete(
+        StreamDetailedChangesResult {
+            outcome,
+            profile,
+            remote_detail_and_local_apply_duration: remote_detail_duration + local_apply_duration,
+            local_detail_and_remote_apply_duration: local_detail_duration + remote_apply_duration,
+            remote_detail_duration,
+            local_apply_duration,
+            local_detail_duration,
+            remote_apply_duration,
+        },
+    ))
+}
+
+fn add_staged_cleanup_context(
+    primary: color_eyre::eyre::Report,
+    local_cleanup: Option<color_eyre::eyre::Report>,
+    remote_cleanup: Option<RPCError>,
+) -> color_eyre::eyre::Report {
+    let mut cleanup_errors = Vec::new();
+    if let Some(error) = local_cleanup {
+        cleanup_errors.push(format!("local abort: {:#}", error));
+    }
+    if let Some(error) = remote_cleanup {
+        cleanup_errors.push(format!(
+            "remote abort: {}",
+            sync_error::render_rpc_error(&error)
+        ));
+    }
+    if cleanup_errors.is_empty() {
+        primary
+    } else {
+        primary.wrap_err(format!(
+            "staged preparation cleanup also failed ({})",
+            cleanup_errors.join("; ")
+        ))
+    }
 }
 
 async fn apply_detail_frames<R>(
@@ -1110,15 +1897,17 @@ async fn apply_detail_frames<R>(
     remote_apply_stream: sync_ops::ApplyStreamId,
     frames: Vec<sync_ops::DetailFrame>,
     file_byte_chunks: bool,
-) -> Result<()>
+    interrupt: Option<&InterruptState>,
+) -> Result<bool>
 where
     R: DuetServerAsync,
 {
     if !file_byte_chunks {
-        return remote
+        remote
             .apply_detail_chunks(remote_apply_stream, frames)
             .await
-            .map_err(|e| post_preflight_rpc_error("Couldn't apply remote detail stream", e));
+            .map_err(|e| post_preflight_rpc_error("Couldn't apply remote detail stream", e))?;
+        return Ok(!interrupt.is_some_and(InterruptState::is_cancel_requested));
     }
 
     for batch in route_file_byte_frames(frames) {
@@ -1140,9 +1929,12 @@ where
                     })?;
             }
         }
+        if interrupt.is_some_and(InterruptState::is_cancel_requested) {
+            return Ok(false);
+        }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 enum ApplyDetailBatch {
@@ -1161,10 +1953,9 @@ fn route_file_byte_frames(frames: Vec<sync_ops::DetailFrame>) -> Vec<ApplyDetail
                 if !buffered.is_empty() {
                     batches.push(ApplyDetailBatch::Frames(std::mem::take(&mut buffered)));
                 }
-                batches.push(ApplyDetailBatch::FileByteChunk(sync_ops::FileByteChunk::new(
-                    frame.action_index,
-                    bytes,
-                )));
+                batches.push(ApplyDetailBatch::FileByteChunk(
+                    sync_ops::FileByteChunk::new(frame.action_index, bytes),
+                ));
             }
             payload => buffered.push(sync_ops::DetailFrame {
                 action_index: frame.action_index,
@@ -1188,7 +1979,10 @@ fn stream_progress_bar(total_transfer_bytes: u64) -> Result<indicatif::ProgressB
     progress::bytes_bar(total_transfer_bytes, "streaming changes")
 }
 
-fn preflight_non_streamed_detail_size(actions: &[Action], _remote_actions: &[Action]) -> Result<()> {
+fn preflight_non_streamed_detail_size(
+    actions: &[Action],
+    _remote_actions: &[Action],
+) -> Result<()> {
     let detail_bytes = sync_ops::detail_transfer_bytes(actions);
     if detail_bytes > MAX_NON_STREAMED_DETAIL_BYTES {
         return Err(eyre!(
@@ -1320,8 +2114,9 @@ async fn open_remote_session(remote_server: Option<String>) -> Option<Session> {
     if let Some(server) = remote_server {
         let session_result = SessionBuilder::default()
             .control_directory(std::env::temp_dir())
+            .control_persist(ControlPersist::ClosedAfterInitialConnection)
             .known_hosts_check(KnownHosts::Strict)
-            .connect(server)
+            .connect_mux(server)
             .await;
         match session_result {
             Ok(session) => Some(session),
@@ -1401,31 +2196,52 @@ fn build_migration_actions(
     paths.extend(local_changes.iter().map(|change| change.path().clone()));
     paths.extend(remote_changes.iter().map(|change| change.path().clone()));
 
-    paths.into_iter().filter_map(|path| {
-        let local = local_current.binary_search_by(|entry| entry.path().cmp(&path)).ok().map(|i| &local_current[i]);
-        let remote = remote_current.binary_search_by(|entry| entry.path().cmp(&path)).ok().map(|i| &remote_current[i]);
-        let local_change = local_changes.binary_search_by(|change| change.path().cmp(&path)).ok().map(|i| &local_changes[i]);
-        let remote_change = remote_changes.binary_search_by(|change| change.path().cmp(&path)).ok().map(|i| &remote_changes[i]);
-        let equivalent = match (local, remote) {
-            (None, None) => true,
-            (Some(a), Some(b)) => crate::scan::change::same_strong(&Change::Added(a.clone()), &Change::Added(b.clone())),
-            _ => false,
-        };
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let local = local_current
+                .binary_search_by(|entry| entry.path().cmp(&path))
+                .ok()
+                .map(|i| &local_current[i]);
+            let remote = remote_current
+                .binary_search_by(|entry| entry.path().cmp(&path))
+                .ok()
+                .map(|i| &remote_current[i]);
+            let local_change = local_changes
+                .binary_search_by(|change| change.path().cmp(&path))
+                .ok()
+                .map(|i| &local_changes[i]);
+            let remote_change = remote_changes
+                .binary_search_by(|change| change.path().cmp(&path))
+                .ok()
+                .map(|i| &remote_changes[i]);
+            let equivalent = match (local, remote) {
+                (None, None) => true,
+                (Some(a), Some(b)) => crate::scan::change::same_strong(
+                    &Change::Added(a.clone()),
+                    &Change::Added(b.clone()),
+                ),
+                _ => false,
+            };
 
-        match (local_change.is_some(), remote_change.is_some(), equivalent) {
-            (true, false, _) => migration_change(remote, local).map(Action::Remote),
-            (false, true, _) => migration_change(local, remote).map(Action::Local),
-            (true, true, true) => match (local, remote) {
-                (Some(a), Some(b)) => Some(Action::Identical(Change::Added(a.clone()), Change::Added(b.clone()))),
-                (None, None) => None,
-                _ => unreachable!(),
-            },
-            (true, true, false) | (false, false, false) => {
-                Some(migration_conflict(local, remote))
+            match (local_change.is_some(), remote_change.is_some(), equivalent) {
+                (true, false, _) => migration_change(remote, local).map(Action::Remote),
+                (false, true, _) => migration_change(local, remote).map(Action::Local),
+                (true, true, true) => match (local, remote) {
+                    (Some(a), Some(b)) => Some(Action::Identical(
+                        Change::Added(a.clone()),
+                        Change::Added(b.clone()),
+                    )),
+                    (None, None) => None,
+                    _ => unreachable!(),
+                },
+                (true, true, false) | (false, false, false) => {
+                    Some(migration_conflict(local, remote))
+                }
+                (false, false, true) => None,
             }
-            (false, false, true) => None,
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 fn migration_conflict(
@@ -1517,7 +2333,7 @@ fn resolve_actions(actions: &mut Actions, options: SyncOptions) -> Result<AllRes
 
     if actions.is_empty() {
         println!("No changes detected");
-        quit::with_code(OK_CODE);
+        return Ok(AllResolution::Proceed);
     }
 
     let num_conflicts = num_unresolved_conflicts(actions.iter());
@@ -1665,7 +2481,10 @@ fn local_ids(name: &str) -> Result<LocalIds> {
     let (mid, legacy_mid) = match machine_uid::get() {
         Ok(mid) => (mid.clone(), mid),
         Err(e) => {
-            log::warn!("Unable to read machine id: {:?}; using persisted Duet client id", e);
+            log::warn!(
+                "Unable to read machine id: {:?}; using persisted Duet client id",
+                e
+            );
             (profile::client_id()?, "unknown-machine".to_string())
         }
     };
@@ -1701,6 +2520,43 @@ mod tests {
     use super::*;
     use crate::scan;
 
+    #[test]
+    fn precommit_interrupt_wins_over_commit() {
+        let interrupt = InterruptState::new();
+
+        assert_eq!(interrupt.request_interrupt(), InterruptRequest::Cancel);
+        assert!(!interrupt.try_begin_commit());
+        assert!(interrupt.is_cancel_requested());
+    }
+
+    #[test]
+    fn commit_wins_over_later_interrupt() {
+        let interrupt = InterruptState::new();
+
+        assert!(interrupt.try_begin_commit());
+        assert_eq!(interrupt.request_interrupt(), InterruptRequest::Deferred);
+        assert!(!interrupt.is_cancel_requested());
+    }
+
+    #[test]
+    fn second_interrupt_requests_force() {
+        let interrupt = InterruptState::new();
+
+        assert_eq!(interrupt.request_interrupt(), InterruptRequest::Cancel);
+        assert_eq!(interrupt.request_interrupt(), InterruptRequest::Force);
+    }
+
+    #[test]
+    fn postcommit_interrupt_preserves_completed_success() {
+        let interrupt = InterruptState::new();
+
+        assert!(interrupt.try_begin_commit());
+        assert_eq!(interrupt.request_interrupt(), InterruptRequest::Deferred);
+        interrupt.complete();
+        assert!(!interrupt.is_cancel_requested());
+        assert_eq!(interrupt.request_interrupt(), InterruptRequest::Force);
+    }
+
     fn digested_entry(path: &str, contents: &[u8]) -> scan::DirEntryWithMeta {
         let mut entry = scan::DirEntryWithMeta::test_file_with_size(
             PathBuf::from(path),
@@ -1718,7 +2574,8 @@ mod tests {
         assert_eq!(local.checksum(), remote.checksum());
         assert!(!local.same_contents(&remote));
 
-        let actions = build_migration_actions(&Vec::new(), &Vec::new(), &vec![local], &vec![remote]);
+        let actions =
+            build_migration_actions(&Vec::new(), &Vec::new(), &vec![local], &vec![remote]);
 
         assert!(matches!(actions.as_slice(), [Action::Conflict(_, _)]));
     }
@@ -1730,12 +2587,8 @@ mod tests {
         let local_changes = vec![Change::Removed(old.clone())];
         let remote_changes = vec![Change::Modified(old, remote.clone())];
 
-        let actions = build_migration_actions(
-            &local_changes,
-            &remote_changes,
-            &Vec::new(),
-            &vec![remote],
-        );
+        let actions =
+            build_migration_actions(&local_changes, &remote_changes, &Vec::new(), &vec![remote]);
 
         assert!(matches!(
             actions.as_slice(),
@@ -1750,7 +2603,12 @@ mod tests {
         let remote = old.clone();
         let local_changes = vec![Change::Modified(old, local.clone())];
 
-        let actions = build_migration_actions(&local_changes, &Vec::new(), &vec![local.clone()], &vec![remote]);
+        let actions = build_migration_actions(
+            &local_changes,
+            &Vec::new(),
+            &vec![local.clone()],
+            &vec![remote],
+        );
 
         match actions.as_slice() {
             [Action::Remote(Change::Modified(_, new))] => assert_eq!(new.digest(), local.digest()),
@@ -1791,8 +2649,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         std::fs::create_dir_all(&base).unwrap();
-        let normalized =
-            normalize_path(&base, &PathBuf::from("sub/path")).unwrap();
+        let normalized = normalize_path(&base, &PathBuf::from("sub/path")).unwrap();
 
         assert_eq!(normalized, PathBuf::from("sub/path"));
     }
@@ -1824,16 +2681,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         std::fs::create_dir_all(&base).unwrap();
-        assert!(normalize_path(
-            &base,
-            &dir.path().join("other/path"),
-        )
-        .is_err());
-        assert!(normalize_path(
-            &base,
-            &base.join("../other/path"),
-        )
-        .is_err());
+        assert!(normalize_path(&base, &dir.path().join("other/path"),).is_err());
+        assert!(normalize_path(&base, &base.join("../other/path"),).is_err());
     }
 
     #[test]
@@ -1842,8 +2691,7 @@ mod tests {
         let base = dir.path().join("base");
         std::fs::create_dir_all(&base).unwrap();
         assert_eq!(
-            normalize_path(&base, &base.join("sub/../path"))
-            .unwrap(),
+            normalize_path(&base, &base.join("sub/../path")).unwrap(),
             PathBuf::from("path")
         );
         assert_eq!(
@@ -1908,8 +2756,7 @@ mod tests {
         std::fs::create_dir_all(&subdir).unwrap();
 
         assert_eq!(
-            normalize_path_from_cwd(&base, &PathBuf::from("./nested/../secret"), &subdir)
-                .unwrap(),
+            normalize_path_from_cwd(&base, &PathBuf::from("./nested/../secret"), &subdir).unwrap(),
             PathBuf::from("subdir/secret")
         );
         assert_eq!(
@@ -1921,9 +2768,18 @@ mod tests {
 
     #[test]
     fn local_id_is_stable_and_profile_specific() {
-        assert_eq!(stable_local_id("machine", "work"), stable_local_id("machine", "work"));
-        assert_ne!(stable_local_id("machine", "work"), stable_local_id("machine", "personal"));
-        assert_ne!(stable_local_id("machine", "work"), stable_local_id("other", "work"));
+        assert_eq!(
+            stable_local_id("machine", "work"),
+            stable_local_id("machine", "work")
+        );
+        assert_ne!(
+            stable_local_id("machine", "work"),
+            stable_local_id("machine", "personal")
+        );
+        assert_ne!(
+            stable_local_id("machine", "work"),
+            stable_local_id("other", "work")
+        );
         assert_eq!(stable_local_id("machine", "work").len(), 32);
     }
 
@@ -2040,10 +2896,7 @@ mod tests {
             },
             sync_ops::DetailFrame {
                 action_index: 7,
-                payload: sync_ops::DetailPayload::FileBytes(vec![
-                    2;
-                    FILE_BYTE_CHUNK_RPC_THRESHOLD
-                ]),
+                payload: sync_ops::DetailPayload::FileBytes(vec![2; FILE_BYTE_CHUNK_RPC_THRESHOLD]),
             },
             sync_ops::DetailFrame {
                 action_index: 7,
@@ -2076,7 +2929,10 @@ mod tests {
         match &batches[2] {
             ApplyDetailBatch::Frames(frames) => {
                 assert_eq!(frames.len(), 1);
-                assert!(matches!(frames[0].payload, sync_ops::DetailPayload::FileEnd));
+                assert!(matches!(
+                    frames[0].payload,
+                    sync_ops::DetailPayload::FileEnd
+                ));
             }
             ApplyDetailBatch::FileByteChunk(_) => panic!("expected trailing detail frames"),
         }
@@ -2124,7 +2980,55 @@ mod tests {
 
         assert!(remote_stream_performance_enabled(true, &info));
         assert!(!remote_stream_performance_enabled(false, &info));
-        assert!(!remote_stream_performance_enabled(true, &without_capability));
+        assert!(!remote_stream_performance_enabled(
+            true,
+            &without_capability
+        ));
+    }
+
+    #[test]
+    fn staged_apply_requires_capability_and_stream_eligible_plan() {
+        let staged = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "test".to_string(),
+            capabilities: vec![rpc::CAPABILITY_STAGED_APPLY.to_string()],
+        };
+        let legacy = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "test".to_string(),
+            capabilities: Vec::new(),
+        };
+
+        assert_eq!(
+            select_apply_strategy(&staged, true),
+            ApplyStrategy::StagedStream
+        );
+        assert_eq!(
+            select_apply_strategy(&staged, false),
+            ApplyStrategy::LegacyNonStream
+        );
+        assert_eq!(
+            select_apply_strategy(&legacy, true),
+            ApplyStrategy::LegacyStream
+        );
+    }
+
+    #[test]
+    fn staged_prepare_barrier_checks_both_action_counts() {
+        let local = sync_ops::PreparedApplyReport {
+            action_count: 2,
+            prepared_file_count: 1,
+            prepared_file_bytes: 10,
+        };
+        let remote = sync_ops::PreparedApplyReport {
+            action_count: 3,
+            prepared_file_count: 0,
+            prepared_file_bytes: 0,
+        };
+
+        validate_staged_prepare_barrier(&local, 2, &remote, 3).unwrap();
+        assert!(validate_staged_prepare_barrier(&local, 1, &remote, 3).is_err());
+        assert!(validate_staged_prepare_barrier(&local, 2, &remote, 2).is_err());
     }
 
     #[test]

@@ -68,15 +68,49 @@ pub fn show_actions(actions: &Actions, verbose: bool) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum AllResolution {
     Proceed,
     Abort,
     Force,
+    Interrupted,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConflictPromptChoice {
+    Local,
+    Remote,
+    Keep,
+    Abort,
+    Interrupted,
+}
+
+fn conflict_prompt_choice(key: console::Key) -> Option<ConflictPromptChoice> {
+    use console::Key;
+
+    match key {
+        Key::ArrowLeft | Key::Char('l') => Some(ConflictPromptChoice::Local),
+        Key::ArrowRight | Key::Char('r') => Some(ConflictPromptChoice::Remote),
+        Key::Char('c') => Some(ConflictPromptChoice::Keep),
+        Key::Escape | Key::Char('a') | Key::Char('n') => Some(ConflictPromptChoice::Abort),
+        Key::CtrlC => Some(ConflictPromptChoice::Interrupted),
+        _ => None,
+    }
+}
+
+fn confirmation_prompt_resolution(key: console::Key) -> Option<AllResolution> {
+    use console::Key;
+
+    match key {
+        Key::Char('y') | Key::Char('Y') => Some(AllResolution::Proceed),
+        Key::Escape | Key::Char('n') | Key::Char('N') => Some(AllResolution::Abort),
+        Key::CtrlC => Some(AllResolution::Interrupted),
+        _ => None,
+    }
 }
 
 pub fn resolve_sequential(actions: &mut Actions, _verbose: bool) -> Result<AllResolution> {
-    use console::{Key, Term};
+    use console::Term;
     let term = Term::stdout();
     if num_unresolved_conflicts(actions.iter()) > 0 {
         term.write_line("Resolve conflicts:")?;
@@ -88,21 +122,24 @@ pub fn resolve_sequential(actions: &mut Actions, _verbose: bool) -> Result<AllRe
 
                 loop {
                     term.write_line("left/l = update local, right/r = update remote, c = keep conflict, n/a = abort")?;
-                    match term.read_key()? {
-                        Key::ArrowLeft | Key::Char('l') => {
+                    match conflict_prompt_choice(term.read_key()?) {
+                        Some(ConflictPromptChoice::Local) => {
                             *a = resolve_action(&a, Resolution::Local);
                         }
-                        Key::ArrowRight | Key::Char('r') => {
+                        Some(ConflictPromptChoice::Remote) => {
                             *a = resolve_action(&a, Resolution::Remote);
                         }
-                        Key::Char('c') => {
+                        Some(ConflictPromptChoice::Keep) => {
                             // keep as is
                         }
-                        Key::Char('a') => {
+                        Some(ConflictPromptChoice::Abort) => {
                             term.clear_last_lines(1)?;
                             return Ok(AllResolution::Abort);
                         }
-                        _ => {
+                        Some(ConflictPromptChoice::Interrupted) => {
+                            return Ok(AllResolution::Interrupted);
+                        }
+                        None => {
                             term.clear_last_lines(1)?;
                             continue;
                         }
@@ -115,14 +152,16 @@ pub fn resolve_sequential(actions: &mut Actions, _verbose: bool) -> Result<AllRe
         }
     }
 
-    use dialoguer::Confirm;
-    if !Confirm::new()
-        .with_prompt("Do you want to continue?")
-        .interact()?
-    {
-        Ok(AllResolution::Abort)
-    } else {
-        Ok(AllResolution::Proceed)
+    term.write_str("Do you want to continue? [y/n] ")?;
+    term.flush()?;
+    loop {
+        if let Some(resolution) = confirmation_prompt_resolution(term.read_key()?) {
+            if resolution == AllResolution::Interrupted {
+                return Ok(resolution);
+            }
+            term.write_line("")?;
+            return Ok(resolution);
+        }
     }
 }
 
@@ -194,23 +233,18 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
             }
         };
         match key {
-            InteractiveKey::ArrowDown | InteractiveKey::Char('j') => {
-                loop {
-                    sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
-                    if verbose || !actions[sel].is_identical() {
-                        break;
-                    }
+            InteractiveKey::ArrowDown | InteractiveKey::Char('j') => loop {
+                sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
+                if verbose || !actions[sel].is_identical() {
+                    break;
                 }
-            }
-            InteractiveKey::ArrowUp | InteractiveKey::Char('k') => {
-                loop {
-                    sel =
-                        ((sel as i64 - 1 + actions.len() as i64) % (actions.len() as i64)) as usize;
-                    if verbose || !actions[sel].is_identical() {
-                        break;
-                    }
+            },
+            InteractiveKey::ArrowUp | InteractiveKey::Char('k') => loop {
+                sel = ((sel as i64 - 1 + actions.len() as i64) % (actions.len() as i64)) as usize;
+                if verbose || !actions[sel].is_identical() {
+                    break;
                 }
-            }
+            },
             InteractiveKey::Tab => {
                 if let Some(next) = next_conflict_index(&actions, sel, 1) {
                     sel = next;
@@ -270,12 +304,7 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
             }
 
             InteractiveKey::CtrlC => {
-                term.show_cursor()?;
-                term.flush()?;
-                unsafe {
-                    libc::raise(libc::SIGINT);
-                }
-                break AllResolution::Abort;
+                return Ok(AllResolution::Interrupted);
             }
 
             InteractiveKey::Char('f') => {
@@ -364,6 +393,7 @@ fn interactive_escape_sequence_complete(sequence: &[u8]) -> bool {
 
 fn parse_interactive_byte(byte: u8) -> InteractiveKey {
     match byte {
+        b'\x03' => InteractiveKey::CtrlC,
         b'\t' => InteractiveKey::Tab,
         b'\r' | b'\n' => InteractiveKey::Other,
         b if b.is_ascii() && !b.is_ascii_control() => InteractiveKey::Char(b as char),
@@ -485,7 +515,9 @@ fn read_unix_interactive_key() -> std::io::Result<InteractiveKey> {
         let mut byte = 0u8;
         let read = loop {
             let read = unsafe { libc::read(fd, &mut byte as *mut u8 as *mut _, 1) };
-            if read >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            if read >= 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
                 break read;
             }
         };
@@ -517,9 +549,6 @@ fn read_unix_interactive_key() -> std::io::Result<InteractiveKey> {
     let Some(first) = read_byte(fd, None)? else {
         return Ok(InteractiveKey::Other);
     };
-    if first == b'\x03' {
-        return Ok(InteractiveKey::CtrlC);
-    }
     if first != b'\x1b' {
         return Ok(parse_interactive_byte(first));
     }
@@ -590,7 +619,10 @@ mod tests {
         );
 
         match resolved {
-            Action::ResolvedLocal((original_local, original_remote), Change::Modified(from, to)) => {
+            Action::ResolvedLocal(
+                (original_local, original_remote),
+                Change::Modified(from, to),
+            ) => {
                 assert_eq!(original_local.path(), local.path());
                 assert_eq!(original_remote.path(), remote.path());
                 assert_eq!(from.checksum(), 1);
@@ -685,8 +717,48 @@ mod tests {
     }
 
     #[test]
+    fn interactive_byte_parser_recognizes_ctrl_c() {
+        assert_eq!(parse_interactive_byte(b'\x03'), InteractiveKey::CtrlC);
+    }
+
+    #[test]
+    fn sequential_conflict_prompt_classifies_ctrl_c_as_interrupted() {
+        assert_eq!(
+            conflict_prompt_choice(console::Key::CtrlC),
+            Some(ConflictPromptChoice::Interrupted)
+        );
+        assert_eq!(
+            conflict_prompt_choice(console::Key::Escape),
+            Some(ConflictPromptChoice::Abort)
+        );
+        assert_eq!(
+            conflict_prompt_choice(console::Key::Char('n')),
+            Some(ConflictPromptChoice::Abort)
+        );
+    }
+
+    #[test]
+    fn sequential_confirmation_classifies_ctrl_c_separately_from_no() {
+        assert_eq!(
+            confirmation_prompt_resolution(console::Key::CtrlC),
+            Some(AllResolution::Interrupted)
+        );
+        assert_eq!(
+            confirmation_prompt_resolution(console::Key::Char('n')),
+            Some(AllResolution::Abort)
+        );
+        assert_eq!(
+            confirmation_prompt_resolution(console::Key::Char('y')),
+            Some(AllResolution::Proceed)
+        );
+    }
+
+    #[test]
     fn interactive_escape_parser_keeps_existing_navigation_keys() {
-        assert_eq!(parse_interactive_escape_sequence(b"[A"), InteractiveKey::ArrowUp);
+        assert_eq!(
+            parse_interactive_escape_sequence(b"[A"),
+            InteractiveKey::ArrowUp
+        );
         assert_eq!(
             parse_interactive_escape_sequence(b"[B"),
             InteractiveKey::ArrowDown
@@ -699,7 +771,10 @@ mod tests {
             parse_interactive_escape_sequence(b"[D"),
             InteractiveKey::ArrowLeft
         );
-        assert_eq!(parse_interactive_escape_sequence(b"[Z"), InteractiveKey::BackTab);
+        assert_eq!(
+            parse_interactive_escape_sequence(b"[Z"),
+            InteractiveKey::BackTab
+        );
     }
 
     #[test]

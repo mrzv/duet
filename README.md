@@ -164,6 +164,12 @@ duet my_profile .
 
 ## Recovery
 
+For peers supporting staged apply, the first Ctrl+C before commit safely removes
+private staging and exits with code 6 without changing synchronized targets. If
+commit has started, Duet finishes commit, saves both states, removes both markers,
+and exits successfully. Press Ctrl+C a second time to force an immediate code-6
+exit; this can leave recovery markers or staging behind.
+
 If Duet stops after applying filesystem changes but before saving state, it
 leaves an apply recovery marker next to the affected state file and blocks the
 next sync. Run `duet recover <profile>` or `duet recover <statefile>` to inspect
@@ -171,5 +177,7 @@ the local marker, including the side, phase, affected paths, staged temporary
 files, and committed operations. Run `duet recover --remote <profile>` to inspect
 the remote-side marker for a named profile. After you have inspected both sides
 and reconciled any partial changes, add `--clear` to remove the marker and allow
-syncs to resume. Use `--yes` with `--clear` only for non-interactive cleanup after
-that manual inspection.
+syncs to resume. For a V2 `preparing` or `prepared` marker, `--clear` first
+identity-checks and removes only Duet-owned private staging; commit-or-later
+markers still require manual inspection. Use `--yes` with `--clear` only for
+non-interactive cleanup after that inspection.

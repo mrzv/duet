@@ -256,15 +256,15 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
 
         match section {
             ProfileSection::Locations => {
-            if let Some(path) = trimmed.strip_prefix('+') {
-                p.locations
-                    .push(Location::Include(PathBuf::from(path.trim())));
-            } else if let Some(path) = trimmed.strip_prefix('-') {
-                p.locations
-                    .push(Location::Exclude(PathBuf::from(path.trim())));
-            } else {
-                return parse_error(&line);
-            }
+                if let Some(path) = trimmed.strip_prefix('+') {
+                    p.locations
+                        .push(Location::Include(PathBuf::from(path.trim())));
+                } else if let Some(path) = trimmed.strip_prefix('-') {
+                    p.locations
+                        .push(Location::Exclude(PathBuf::from(path.trim())));
+                } else {
+                    return parse_error(&line);
+                }
             }
             ProfileSection::Ignore => p.ignore.push(line),
             ProfileSection::Prune => p.prune.push(line),

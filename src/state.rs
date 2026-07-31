@@ -74,7 +74,10 @@ pub fn decode_entries(contents: &[u8]) -> Result<LoadedEntries> {
         if consumed != payload.len() {
             return Err(eyre!("trailing bytes in V2 snapshot"));
         }
-        Ok(LoadedEntries { entries, format: SnapshotFormat::V2 })
+        Ok(LoadedEntries {
+            entries,
+            format: SnapshotFormat::V2,
+        })
     } else {
         let (legacy, consumed): (Vec<LegacyEntry>, usize) = decode_from_slice(contents, config)?;
         if consumed != contents.len() {
@@ -92,7 +95,10 @@ pub fn load_entries_with_format(statefile: &Path) -> Result<LoadedEntries> {
         .try_exists()
         .wrap_err_with(|| format!("unable to check state file {}", statefile.display()))?
     {
-        return Ok(LoadedEntries { entries: Vec::new(), format: SnapshotFormat::V2 });
+        return Ok(LoadedEntries {
+            entries: Vec::new(),
+            format: SnapshotFormat::V2,
+        });
     }
     log::debug!("Loading: {}", statefile.display());
     let contents = std::fs::read(statefile)
@@ -132,13 +138,21 @@ pub fn save_entries_as(statefile: &Path, entries: &Entries, format: SnapshotForm
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true).mode(0o600);
     AtomicFile::new(statefile, AllowOverwrite)
-        .write_with_options(|file| {
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            let mut writer = BufWriter::new(file);
-            write_entries(&mut writer, entries, format).map_err(std::io::Error::other)?;
-            writer.flush()
-        }, options)
-        .wrap_err_with(|| format!("unable to atomically save state file {}", statefile.display()))?;
+        .write_with_options(
+            |file| {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                let mut writer = BufWriter::new(file);
+                write_entries(&mut writer, entries, format).map_err(std::io::Error::other)?;
+                writer.flush()
+            },
+            options,
+        )
+        .wrap_err_with(|| {
+            format!(
+                "unable to atomically save state file {}",
+                statefile.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -233,11 +247,7 @@ impl Drop for CancelOnDrop {
     }
 }
 
-async fn run_blocking_with_limit<T, U, F>(
-    items: Vec<T>,
-    limit: usize,
-    worker: F,
-) -> Result<Vec<U>>
+async fn run_blocking_with_limit<T, U, F>(items: Vec<T>, limit: usize, worker: F) -> Result<Vec<U>>
 where
     T: Send + 'static,
     U: Send + 'static,
@@ -247,7 +257,13 @@ where
     let item_count = items.len();
     let mut pending: VecDeque<_> = items.into_iter().enumerate().collect();
     let mut active: FuturesUnordered<
-        BoxFuture<'static, (usize, std::result::Result<Result<U>, tokio::task::JoinError>)>,
+        BoxFuture<
+            'static,
+            (
+                usize,
+                std::result::Result<Result<U>, tokio::task::JoinError>,
+            ),
+        >,
     > = FuturesUnordered::new();
     let mut results: Vec<Option<U>> = std::iter::repeat_with(|| None).take(item_count).collect();
     let mut active_positions = std::collections::BTreeSet::new();
@@ -261,7 +277,9 @@ where
 
     while !pending.is_empty() || !active.is_empty() {
         while active.len() < limit {
-            let Some((position, item)) = pending.pop_front() else { break };
+            let Some((position, item)) = pending.pop_front() else {
+                break;
+            };
             let worker = worker.clone();
             let task_cancellation = BlockingCancellation {
                 state: cancellation.clone(),
@@ -275,7 +293,9 @@ where
             );
         }
 
-        let Some((position, joined)) = active.next().await else { break };
+        let Some((position, joined)) = active.next().await else {
+            break;
+        };
         active_positions.remove(&position);
         match joined {
             Ok(Ok(result)) => results[position] = Some(result),
@@ -294,7 +314,10 @@ where
         }
         if let Some((error_position, _)) = &first_error {
             pending.retain(|(position, _)| position < error_position);
-            if !active_positions.iter().any(|position| position < error_position) {
+            if !active_positions
+                .iter()
+                .any(|position| position < error_position)
+            {
                 cancellation.all.store(true, Ordering::Relaxed);
                 return Err(first_error.take().unwrap().1);
             }
@@ -313,13 +336,19 @@ fn record_first_error(
     position: usize,
     error: color_eyre::Report,
 ) {
-    if first_error.as_ref().map(|(first, _)| position < *first).unwrap_or(true) {
+    if first_error
+        .as_ref()
+        .map(|(first, _)| position < *first)
+        .unwrap_or(true)
+    {
         *first_error = Some((position, error));
     }
 }
 
 fn hash_worker_limit() -> usize {
-    let available = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
     hash_worker_limit_from(std::env::var(HASH_WORKERS_ENV).ok().as_deref(), available)
 }
 
@@ -343,9 +372,7 @@ fn hash_worker_limit_from(configured: Option<&str>, available: usize) -> usize {
 fn hash_buffer_size() -> usize {
     let requested = positive_env_usize(HASH_BUFFER_BYTES_ENV, HASH_BUFFER_SIZE);
     if requested > MAX_HASH_BUFFER_SIZE {
-        log::warn!(
-            "limiting content hash buffer from {requested} to {MAX_HASH_BUFFER_SIZE} bytes"
-        );
+        log::warn!("limiting content hash buffer from {requested} to {MAX_HASH_BUFFER_SIZE} bytes");
     }
     requested.min(MAX_HASH_BUFFER_SIZE)
 }
@@ -420,16 +447,27 @@ pub async fn old_and_changes(
     let loaded = async {
         match statefile {
             Some(path) => load_entries_with_format(path),
-            None => Ok(LoadedEntries { entries: Vec::new(), format: SnapshotFormat::V2 }),
+            None => Ok(LoadedEntries {
+                entries: Vec::new(),
+                format: SnapshotFormat::V2,
+            }),
         }
     };
     let (loaded, current) = tokio::join!(loaded, restricted_current_scan);
     let loaded = loaded?;
     let mut current = current?;
-    let restricted_old: Vec<_> = loaded.entries.iter().filter(|e| e.starts_with(restrict)).collect();
-    let mut changes: Changes = scan::changes(restricted_old.iter().copied(), current.iter()).collect();
+    let restricted_old: Vec<_> = loaded
+        .entries
+        .iter()
+        .filter(|e| e.starts_with(restrict))
+        .collect();
+    let mut changes: Changes =
+        scan::changes(restricted_old.iter().copied(), current.iter()).collect();
     for entry in &mut current {
-        if changes.binary_search_by(|change| change.path().cmp(entry.path())).is_err() {
+        if changes
+            .binary_search_by(|change| change.path().cmp(entry.path()))
+            .is_err()
+        {
             if let Ok(index) = restricted_old.binary_search_by(|old| old.path().cmp(entry.path())) {
                 entry.inherit_content_hashes(restricted_old[index]);
             }
@@ -466,7 +504,10 @@ pub async fn old_and_changes(
         }
         // Keep the retained current manifest useful to the V2 migration/action flow.
         for change in &changes {
-            let new = match change { Change::Added(e) | Change::Modified(_, e) => Some(e), _ => None };
+            let new = match change {
+                Change::Added(e) | Change::Modified(_, e) => Some(e),
+                _ => None,
+            };
             if let Some(new) = new {
                 if let Ok(index) = current.binary_search_by(|entry| entry.path().cmp(new.path())) {
                     current[index] = new.clone();
@@ -475,7 +516,12 @@ pub async fn old_and_changes(
         }
     }
 
-    Ok(ScanContext { all_old: loaded.entries, changes, current, migration_needed })
+    Ok(ScanContext {
+        all_old: loaded.entries,
+        changes,
+        current,
+        migration_needed,
+    })
 }
 
 #[cfg(test)]
@@ -535,7 +581,10 @@ mod tests {
         let output = run_blocking_with_limit((0..12).collect(), 3, move |item, _| {
             let active = active_for_worker.clone();
             let maximum = maximum_for_worker.clone();
-            threads_for_worker.lock().unwrap().insert(std::thread::current().id());
+            threads_for_worker
+                .lock()
+                .unwrap()
+                .insert(std::thread::current().id());
             let now = active.fetch_add(1, Ordering::SeqCst) + 1;
             maximum.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -591,14 +640,18 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let started_for_worker = started.clone();
         let stopped_for_worker = stopped.clone();
-        let task = tokio::spawn(run_blocking_with_limit(vec![()], 1, move |(), cancelled| {
-            started_for_worker.store(true, Ordering::SeqCst);
-            while !cancelled.is_cancelled() {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            stopped_for_worker.store(true, Ordering::SeqCst);
-            Err::<(), _>(eyre!("cancelled"))
-        }));
+        let task = tokio::spawn(run_blocking_with_limit(
+            vec![()],
+            1,
+            move |(), cancelled| {
+                started_for_worker.store(true, Ordering::SeqCst);
+                while !cancelled.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                stopped_for_worker.store(true, Ordering::SeqCst);
+                Err::<(), _>(eyre!("cancelled"))
+            },
+        ));
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !started.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
@@ -849,9 +902,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("nested/state");
         save_entries(&state_path, &Vec::new()).unwrap();
-        assert_eq!(std::fs::metadata(state_path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
-
 
     #[tokio::test]
     async fn restricted_migration_hashes_scope_and_preserves_outside_hybrid_entries() {
@@ -874,13 +929,31 @@ mod tests {
             &Vec::new(),
             Some(&state_path),
             true,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert!(context.migration_needed);
-        assert!(context.current.iter().filter(|e| e.is_file()).all(|e| e.digest().is_some()));
+        assert!(context
+            .current
+            .iter()
+            .filter(|e| e.is_file())
+            .all(|e| e.digest().is_some()));
         let mut migrated = context.all_old;
         replace_scope(&mut migrated, Path::new("scope"), &context.current);
-        assert_eq!(migrated.iter().find(|e| e.path() == Path::new("outside")).unwrap().digest(), None);
-        assert!(migrated.iter().find(|e| e.path() == Path::new("scope/in")).unwrap().digest().is_some());
+        assert_eq!(
+            migrated
+                .iter()
+                .find(|e| e.path() == Path::new("outside"))
+                .unwrap()
+                .digest(),
+            None
+        );
+        assert!(migrated
+            .iter()
+            .find(|e| e.path() == Path::new("scope/in"))
+            .unwrap()
+            .digest()
+            .is_some());
     }
 }

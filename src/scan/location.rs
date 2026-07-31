@@ -55,7 +55,7 @@ impl PartialEq for Location {
     }
 }
 
-impl Eq for Location { }
+impl Eq for Location {}
 
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

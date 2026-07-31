@@ -1,11 +1,11 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use tempfile::TempDir;
 use serde::Serialize;
+use tempfile::TempDir;
 
 #[derive(Serialize)]
 struct LegacyEntryFixture {
