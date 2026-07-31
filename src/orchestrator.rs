@@ -13,7 +13,7 @@ use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder};
 
 use crate::actions::{num_identical, num_unresolved_conflicts, reverse, Action, Actions};
 use crate::cli::SyncOptions;
-use crate::performance::{PerformanceProfile, StreamingProfile};
+use crate::performance::{duration_ms, DetailTransferStats, PerformanceProfile, StreamingProfile};
 use crate::profile::{self, ProfileSource};
 use crate::progress;
 use crate::remote;
@@ -124,6 +124,20 @@ impl InterruptState {
                 Ordering::SeqCst,
             )
             .is_ok()
+    }
+
+    fn try_reset_after_checkpoint(&self) -> bool {
+        match self.phase.compare_exchange(
+            InterruptPhase::Committed as u8,
+            InterruptPhase::PreCommit as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => !self.is_cancel_requested(),
+            Err(phase) if phase == InterruptPhase::CommittedInterrupted as u8 => false,
+            Err(phase) if phase == InterruptPhase::CancelRequested as u8 => false,
+            Err(phase) => unreachable!("invalid interrupt phase at checkpoint: {}", phase),
+        }
     }
 
     fn complete(&self) -> bool {
@@ -459,7 +473,6 @@ pub async fn sync(
 
     let preflight_start = Instant::now();
     let remote_actions: Actions = reverse(&actions);
-    let remote_action_count = remote_actions.len();
     apply_options = resolve_removal_blockers(
         &remote,
         &remote_info,
@@ -481,7 +494,22 @@ pub async fn sync(
         has_remote_capability(&remote_info, rpc::CAPABILITY_STREAMED_DETAIL_BATCHES)
             && sync_ops::can_stream_details(&actions)
             && sync_ops::can_stream_details(&remote_actions);
-    let apply_strategy = select_apply_strategy(&remote_info, can_stream_details);
+    let mut apply_strategy = select_apply_strategy(
+        &remote_info,
+        can_stream_details,
+        options.staging_policy_explicit,
+    )?;
+    if apply_strategy == ApplyStrategy::StagedStream
+        && actions_have_directory_to_nondirectory_change(actions.as_ref())
+    {
+        if options.staging_policy_explicit {
+            return Err(eyre!(
+                "--staging-limit/--staging-reserve cannot currently be enforced for directory-to-nondirectory replacements"
+            ));
+        }
+        log::debug!("using legacy stream for a directory-to-nondirectory replacement");
+        apply_strategy = ApplyStrategy::LegacyStream;
+    }
     if !can_stream_details {
         preflight_non_streamed_detail_size(actions.as_ref(), &remote_actions)?;
     }
@@ -495,6 +523,50 @@ pub async fn sync(
     if apply_options.prune_ignored {
         require_remote_capability(&remote_info, rpc::CAPABILITY_APPLY_OPTIONS)?;
     }
+    let staging_plan = if apply_strategy == ApplyStrategy::StagedStream {
+        require_remote_capability(&remote_info, rpc::CAPABILITY_STAGING_CAPACITY)?;
+        let local_filesystem = sync_ops::staging_filesystem_info(&local_base)?;
+        let remote_filesystem = remote
+            .staging_filesystem_info()
+            .await
+            .map_err(|e| remote_rpc_error("Couldn't get remote staging capacity", e))?;
+        let local_budget = options.staging_policy.budget(local_filesystem);
+        let remote_budget = options.staging_policy.budget(remote_filesystem);
+        match sync_ops::plan_staging_waves(actions.as_ref(), local_budget, remote_budget) {
+            Ok(plan) => {
+                for (wave_index, wave) in plan.waves.iter().enumerate() {
+                    validate_wave_capacity(
+                        wave,
+                        options.staging_policy,
+                        local_filesystem,
+                        remote_filesystem,
+                        wave_index,
+                        plan.waves.len(),
+                    )?;
+                }
+                if !can_use_staging_plan(
+                    &remote_info,
+                    plan.waves.len(),
+                    migration,
+                    options.staging_policy_explicit,
+                )? {
+                    log::debug!(
+                        "falling back to legacy streaming because checkpointed staging is unavailable"
+                    );
+                    apply_strategy = ApplyStrategy::LegacyStream;
+                    None
+                } else {
+                    if options.dry_run {
+                        print_staging_plan_summary(&plan, local_budget, remote_budget);
+                    }
+                    Some(plan)
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
     if options.dry_run {
         require_remote_capability(&remote_info, rpc::CAPABILITY_PREFLIGHT_APPLY)?;
         if strong {
@@ -530,12 +602,8 @@ pub async fn sync(
             .await
             .map_err(|e| remote_rpc_error("Failed to set remote apply options", e))?;
     }
-    if strong {
-        remote.set_actions_v2(remote_actions).await
-            .map_err(|e| remote_rpc_error("Failed to set remote actions", e))?;
-    } else {
-        remote.set_actions(crate::actions::to_legacy(remote_actions)).await
-            .map_err(|e| remote_rpc_error("Failed to set remote actions", e))?;
+    if !apply_strategy.is_staged() {
+        set_remote_actions(&remote, remote_actions, strong).await?;
     }
     performance.record_phase("preflight_and_set_actions", preflight_start.elapsed());
     log::debug!("set remote actions");
@@ -543,6 +611,9 @@ pub async fn sync(
         return Ok(SyncOutcome::Interrupted);
     }
 
+    let (local_signatures, remote_signatures) = if apply_strategy.is_staged() {
+        (Vec::new(), Vec::new())
+    } else {
     let local_signatures_fut = {
         let local_base = local_base.clone();
         let actions = actions.clone();
@@ -578,154 +649,322 @@ pub async fn sync(
     if interrupt.is_cancel_requested() {
         return Ok(SyncOutcome::Interrupted);
     }
+    (local_signatures, remote_signatures)
+    };
 
-    let apply_start = Instant::now();
     let local_all_old = if apply_strategy == ApplyStrategy::StagedStream {
-        log::debug!("preparing staged detailed changes");
-        let stream_result = stream_detailed_changes(
-            &remote,
-            &local_base,
-            &local_state,
-            &actions,
-            local_all_old,
-            local_signatures,
-            remote_signatures,
-            tuning,
-            Some(scan_policy.clone()),
-            apply_options,
-            remote_stream_performance_enabled(profiling_enabled, &remote_info),
-            has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
-            Some(&apply_attempt_id),
-            Some(&interrupt),
-        )
-        .await?;
-        let StreamDetailedChangesRun::Complete(mut stream_result) = stream_result else {
-            return Ok(SyncOutcome::Interrupted);
-        };
-        record_stream_performance(&mut performance, &mut stream_result);
-        let StreamApplyOutcome::Staged {
-            prepared,
-            local_report,
-            remote_report,
-        } = stream_result.outcome
-        else {
-            unreachable!("staged stream returned legacy outcome");
-        };
-        if let Err(error) = validate_staged_prepare_barrier(
-            &local_report,
-            actions.len(),
-            &remote_report,
-            remote_action_count,
-        ) {
-            let local_cleanup = prepared.abort().err();
-            let remote_cleanup = remote
-                .abort_staged_apply(apply_attempt_id.clone())
+        let plan = staging_plan
+            .as_ref()
+            .expect("staged strategy must have a staging plan");
+        let mut checkpoint_entries = local_all_old;
+        for (wave_index, wave) in plan.waves.iter().enumerate() {
+            if interrupt.is_cancel_requested() {
+                return Ok(SyncOutcome::Interrupted);
+            }
+            let local_filesystem = sync_ops::staging_filesystem_info(&local_base)?;
+            let remote_filesystem = remote
+                .staging_filesystem_info()
                 .await
-                .err();
-            return Err(add_staged_cleanup_context(
-                error,
-                local_cleanup,
-                remote_cleanup,
-            ));
-        }
-        performance.record_phase("staged_prepare_transfer", apply_start.elapsed());
+                .map_err(|e| remote_rpc_error("Couldn't recheck remote staging capacity", e))?;
+            validate_wave_capacity(
+                wave,
+                options.staging_policy,
+                local_filesystem,
+                remote_filesystem,
+                wave_index,
+                plan.waves.len(),
+            )?;
 
-        test_pause_until_interrupt(TEST_PAUSE_AFTER_STAGED_PREPARE_MS, &interrupt).await;
+            let wave_actions: Arc<Actions> = Arc::new(
+                wave.action_indices
+                    .iter()
+                    .map(|&index| actions[index].clone())
+                    .collect(),
+            );
+            let remote_wave_actions = reverse(&wave_actions);
+            let wave_attempt_id = format!(
+                "{}-wave-{}-of-{}",
+                apply_attempt_id,
+                wave_index + 1,
+                plan.waves.len()
+            );
+            let set_actions_start = Instant::now();
+            set_remote_actions(&remote, remote_wave_actions, strong).await?;
+            record_phase_aggregate(
+                &mut performance,
+                "remote_set_actions_rpc",
+                set_actions_start.elapsed(),
+            );
 
-        let local_validation = tokio::task::spawn_blocking(move || {
-            let result = prepared.validate_commit();
-            (prepared, result)
-        });
-        let remote_validation = remote.validate_staged_apply(apply_attempt_id.clone());
-        let (local_validation, remote_validation) =
-            tokio::join!(local_validation, remote_validation);
-        let (prepared, local_validation) = match local_validation {
-            Ok(validation) => validation,
-            Err(error) => {
-                let local_cleanup = sync_ops::abort_staged_apply_attempt(
-                    &local_state,
-                    &apply_attempt_id,
-                )
-                .err();
+            let local_signatures_fut = {
+                let local_base = local_base.clone();
+                let wave_actions = wave_actions.clone();
+                let window_config = tuning.signature_window_config();
+                tokio::task::spawn_blocking(move || {
+                    let start = Instant::now();
+                    let result = sync_ops::get_signatures_with_config(
+                        &local_base,
+                        &wave_actions,
+                        window_config,
+                    );
+                    (result, start.elapsed())
+                })
+            };
+            let remote_signatures_fut = async {
+                let start = Instant::now();
+                let result = remote.get_signatures().await;
+                (result, start.elapsed())
+            };
+            let (local_signatures, remote_signatures) =
+                tokio::join!(local_signatures_fut, remote_signatures_fut);
+            let (local_signatures, local_signature_duration) =
+                local_signatures.wrap_err("local signature task failed")?;
+            let local_signatures = local_signatures?;
+            let (remote_signatures, remote_signature_duration) = remote_signatures;
+            let remote_signatures = remote_signatures
+                .map_err(|e| remote_rpc_error("couldn't get remote signatures", e))?;
+            record_phase_aggregate(
+                &mut performance,
+                "local_signatures",
+                local_signature_duration,
+            );
+            record_phase_aggregate(
+                &mut performance,
+                "remote_signatures_rpc",
+                remote_signature_duration,
+            );
+            performance.counters.local_signatures += local_signatures.len();
+            performance.counters.remote_signatures += remote_signatures.len();
+
+            let prepare_start = Instant::now();
+            log::debug!(
+                "preparing staged detailed changes for wave {}/{}",
+                wave_index + 1,
+                plan.waves.len()
+            );
+            let stream_result = stream_detailed_changes(
+                &remote,
+                &local_base,
+                &local_state,
+                &wave_actions,
+                checkpoint_entries,
+                local_signatures,
+                remote_signatures,
+                tuning,
+                Some(scan_policy.clone()),
+                apply_options,
+                remote_stream_performance_enabled(profiling_enabled, &remote_info),
+                has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
+                Some(&wave_attempt_id),
+                Some(&interrupt),
+            )
+            .await?;
+            let StreamDetailedChangesRun::Complete(mut stream_result) = stream_result else {
+                return Ok(SyncOutcome::Interrupted);
+            };
+            record_stream_performance(&mut performance, &mut stream_result);
+            let StreamApplyOutcome::Staged {
+                prepared,
+                local_report,
+                remote_report,
+            } = stream_result.outcome
+            else {
+                unreachable!("staged stream returned legacy outcome");
+            };
+            if let Err(error) = validate_staged_prepare_barrier(
+                &local_report,
+                wave_actions.len(),
+                &remote_report,
+                wave_actions.len(),
+            ) {
+                let local_cleanup = prepared.abort().err();
                 let remote_cleanup = remote
-                    .abort_staged_apply(apply_attempt_id.clone())
+                    .abort_staged_apply(wave_attempt_id.clone())
                     .await
                     .err();
                 return Err(add_staged_cleanup_context(
-                    eyre!("local staged validation task failed: {}", error),
+                    error,
                     local_cleanup,
                     remote_cleanup,
                 ));
             }
-        };
-        if let Err(error) = local_validation {
-            let local_cleanup = prepared.abort().err();
-            let remote_cleanup = remote
-                .abort_staged_apply(apply_attempt_id.clone())
-                .await
-                .err();
-            return Err(add_staged_cleanup_context(
-                error,
-                local_cleanup,
-                remote_cleanup,
-            ));
-        }
-        if let Err(error) = remote_validation {
-            let local_cleanup = prepared.abort().err();
-            let remote_cleanup = remote
-                .abort_staged_apply(apply_attempt_id.clone())
-                .await
-                .err();
-            return Err(add_staged_cleanup_context(
-                remote_rpc_error("remote staged validation failed", error),
-                local_cleanup,
-                remote_cleanup,
-            ));
-        }
+            record_phase_aggregate(
+                &mut performance,
+                "staged_prepare_transfer",
+                prepare_start.elapsed(),
+            );
 
-        if !interrupt.try_begin_commit() {
-            let local_cleanup = prepared.abort().err();
-            let remote_cleanup = remote
-                .abort_staged_apply(apply_attempt_id.clone())
-                .await
-                .err();
-            if local_cleanup.is_some() || remote_cleanup.is_some() {
+            test_pause_until_interrupt(TEST_PAUSE_AFTER_STAGED_PREPARE_MS, &interrupt).await;
+            let local_validation = tokio::task::spawn_blocking(move || {
+                let result = prepared.validate_commit();
+                (prepared, result)
+            });
+            let remote_validation = remote.validate_staged_apply(wave_attempt_id.clone());
+            let (local_validation, remote_validation) =
+                tokio::join!(local_validation, remote_validation);
+            let (prepared, local_validation) = match local_validation {
+                Ok(validation) => validation,
+                Err(error) => {
+                    let local_cleanup = sync_ops::abort_staged_apply_attempt(
+                        &local_state,
+                        &wave_attempt_id,
+                    )
+                    .err();
+                    let remote_cleanup = remote
+                        .abort_staged_apply(wave_attempt_id.clone())
+                        .await
+                        .err();
+                    return Err(add_staged_cleanup_context(
+                        eyre!("local staged validation task failed: {}", error),
+                        local_cleanup,
+                        remote_cleanup,
+                    ));
+                }
+            };
+            if let Err(error) = local_validation {
+                let local_cleanup = prepared.abort().err();
+                let remote_cleanup = remote
+                    .abort_staged_apply(wave_attempt_id.clone())
+                    .await
+                    .err();
                 return Err(add_staged_cleanup_context(
-                    eyre!("sync interrupted before staged commit"),
+                    error,
                     local_cleanup,
                     remote_cleanup,
                 ));
             }
-            return Ok(SyncOutcome::Interrupted);
-        }
+            if let Err(error) = remote_validation {
+                let local_cleanup = prepared.abort().err();
+                let remote_cleanup = remote
+                    .abort_staged_apply(wave_attempt_id.clone())
+                    .await
+                    .err();
+                return Err(add_staged_cleanup_context(
+                    remote_rpc_error("remote staged validation failed", error),
+                    local_cleanup,
+                    remote_cleanup,
+                ));
+            }
 
-        let commit_start = Instant::now();
-        let local_commit = tokio::task::spawn_blocking(move || {
-            let start = Instant::now();
-            let result = prepared.commit();
-            (result, start.elapsed())
-        });
-        let remote_commit = async {
-            let start = Instant::now();
-            let result = remote.commit_staged_apply(apply_attempt_id.clone()).await;
-            (result, start.elapsed())
-        };
-        // This join is the bilateral commit barrier. Once entered, both commits must be awaited.
-        let (local_commit, remote_commit) = tokio::join!(local_commit, remote_commit);
-        let (local_commit, local_commit_duration) = match local_commit {
-            Ok(result) => result,
-            Err(error) => (
-                Err(eyre!("local staged commit task failed: {}", error)),
-                Duration::default(),
-            ),
-        };
-        let (remote_commit, remote_commit_duration) = remote_commit;
-        let local_all_old = finish_staged_commit(local_commit, remote_commit)?;
-        performance.record_phase("staged_local_commit", local_commit_duration);
-        performance.record_phase("staged_remote_commit_rpc", remote_commit_duration);
-        performance.record_phase("staged_commit", commit_start.elapsed());
-        test_pause_until_interrupt(TEST_PAUSE_AFTER_STAGED_COMMIT_MS, &interrupt).await;
-        local_all_old
+            if !interrupt.try_begin_commit() {
+                let local_cleanup = prepared.abort().err();
+                let remote_cleanup = remote
+                    .abort_staged_apply(wave_attempt_id.clone())
+                    .await
+                    .err();
+                if local_cleanup.is_some() || remote_cleanup.is_some() {
+                    return Err(add_staged_cleanup_context(
+                        eyre!("sync interrupted before staged commit"),
+                        local_cleanup,
+                        remote_cleanup,
+                    ));
+                }
+                return Ok(SyncOutcome::Interrupted);
+            }
+
+            let commit_start = Instant::now();
+            let local_commit = tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
+                let result = prepared.commit();
+                (result, start.elapsed())
+            });
+            let remote_commit = async {
+                let start = Instant::now();
+                let result = remote.commit_staged_apply(wave_attempt_id.clone()).await;
+                (result, start.elapsed())
+            };
+            // This join is the bilateral commit barrier. Once entered, both commits must be awaited.
+            let (local_commit, remote_commit) = tokio::join!(local_commit, remote_commit);
+            let (local_commit, local_commit_duration) = match local_commit {
+                Ok(result) => result,
+                Err(error) => (
+                    Err(eyre!("local staged commit task failed: {}", error)),
+                    Duration::default(),
+                ),
+            };
+            let (remote_commit, remote_commit_duration) = remote_commit;
+            checkpoint_entries = finish_staged_commit(local_commit, remote_commit)?;
+            record_phase_aggregate(
+                &mut performance,
+                "staged_local_commit",
+                local_commit_duration,
+            );
+            record_phase_aggregate(
+                &mut performance,
+                "staged_remote_commit_rpc",
+                remote_commit_duration,
+            );
+            record_phase_aggregate(
+                &mut performance,
+                "staged_commit",
+                commit_start.elapsed(),
+            );
+            test_pause_until_interrupt(TEST_PAUSE_AFTER_STAGED_COMMIT_MS, &interrupt).await;
+
+            sync_ops::mark_staged_apply_attempt_state_save(&local_state, &wave_attempt_id)?;
+            let state_save_start = Instant::now();
+            let local_state_display = local_state.display().to_string();
+            let local_state_for_save = local_state.clone();
+            let entries_for_save = checkpoint_entries.clone();
+            let (remote_result, local_result) = tokio::join!(
+                async {
+                    let start = Instant::now();
+                    let result = remote
+                        .save_staged_state_pending(wave_attempt_id.clone(), strong)
+                        .await;
+                    (result, start.elapsed())
+                },
+                tokio::task::spawn_blocking(move || {
+                    let start = Instant::now();
+                    let format = if strong {
+                        state::SnapshotFormat::V2
+                    } else {
+                        state::SnapshotFormat::LegacyV1
+                    };
+                    let result =
+                        state::save_entries_as(&local_state_for_save, &entries_for_save, format);
+                    (result, start.elapsed())
+                })
+            );
+            let (local_result, local_state_save_duration) =
+                local_result.wrap_err("local state save task failed")?;
+            local_result.wrap_err_with(|| {
+                format!(
+                    "failed to save local state {}\n{}",
+                    local_state_display, STATE_SAVE_RECOVERY_ADVICE
+                )
+            })?;
+            let (remote_result, remote_state_save_duration) = remote_result;
+            remote_result
+                .map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
+            remote
+                .complete_staged_apply(wave_attempt_id.clone())
+                .await
+                .map_err(|e| {
+                    post_state_save_rpc_error("failed to complete remote staged apply", e)
+                })?;
+            sync_ops::finish_staged_apply_attempt(&local_state, &wave_attempt_id)?;
+            record_phase_aggregate(
+                &mut performance,
+                "local_state_save",
+                local_state_save_duration,
+            );
+            record_phase_aggregate(
+                &mut performance,
+                "remote_state_save_rpc",
+                remote_state_save_duration,
+            );
+            record_phase_aggregate(
+                &mut performance,
+                "state_save_total",
+                state_save_start.elapsed(),
+            );
+
+            if wave_index + 1 < plan.waves.len() && !interrupt.try_reset_after_checkpoint() {
+                return Ok(SyncOutcome::Interrupted);
+            }
+        }
+        checkpoint_entries
     } else if apply_strategy == ApplyStrategy::LegacyStream {
         log::debug!("streaming detailed changes");
         if !interrupt.try_begin_commit() {
@@ -855,9 +1094,7 @@ pub async fn sync(
         local_all_old
     };
 
-    if apply_strategy.is_staged() {
-        sync_ops::mark_staged_apply_attempt_state_save(&local_state, &apply_attempt_id)?;
-    } else {
+    if !apply_strategy.is_staged() {
         sync_ops::mark_apply_attempt_state_save(
             "local",
             &local_state,
@@ -865,61 +1102,58 @@ pub async fn sync(
             actions.as_ref(),
             Some(&apply_attempt_id),
         )?;
-    }
 
-    let state_save_start = Instant::now();
-    let coordinated_cleanup = has_remote_capability(&remote_info, rpc::CAPABILITY_COORDINATED_MARKER_CLEANUP);
-    let local_state_display = local_state.display().to_string();
-    let local_state_for_save = local_state.clone();
-    let (remote_result, local_result) = tokio::join!(
-        async {
-            let start = Instant::now();
-            let result = if apply_strategy.is_staged() {
-                remote
-                    .save_staged_state_pending(apply_attempt_id.clone(), strong)
-                    .await
-            } else if coordinated_cleanup {
-                remote.save_state_pending(strong).await
-            } else if strong {
-                remote.save_state_v2().await
-            } else {
-                remote.save_state().await
-            };
-            (result, start.elapsed())
-        },
-        tokio::task::spawn_blocking(move || {
-            let start = Instant::now();
-            let format = if strong { state::SnapshotFormat::V2 } else { state::SnapshotFormat::LegacyV1 };
-            let result = state::save_entries_as(&local_state_for_save, &local_all_old, format);
-            (result, start.elapsed())
-        })
-    );
-    let (local_result, local_state_save_duration) =
-        local_result.wrap_err("local state save task failed")?;
-    local_result.wrap_err_with(|| {
-        format!(
-            "failed to save local state {}\n{}",
-            local_state_display, STATE_SAVE_RECOVERY_ADVICE
-        )
-    })?;
-    let (remote_result, remote_state_save_duration) = remote_result;
-    remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
-    if apply_strategy.is_staged() {
-        remote
-            .complete_staged_apply(apply_attempt_id.clone())
-            .await
-            .map_err(|e| post_state_save_rpc_error("failed to complete remote staged apply", e))?;
-        sync_ops::finish_staged_apply_attempt(&local_state, &apply_attempt_id)?;
-    } else if coordinated_cleanup {
-        remote.clear_apply_attempt(remote_id).await
-            .map_err(|e| remote_rpc_error("failed to clear remote recovery marker", e))?;
-        sync_ops::finish_apply_attempt(&local_state)?;
-    } else {
-        sync_ops::finish_apply_attempt(&local_state)?;
+        let state_save_start = Instant::now();
+        let coordinated_cleanup = has_remote_capability(
+            &remote_info,
+            rpc::CAPABILITY_COORDINATED_MARKER_CLEANUP,
+        );
+        let local_state_display = local_state.display().to_string();
+        let local_state_for_save = local_state.clone();
+        let (remote_result, local_result) = tokio::join!(
+            async {
+                let start = Instant::now();
+                let result = if coordinated_cleanup {
+                    remote.save_state_pending(strong).await
+                } else if strong {
+                    remote.save_state_v2().await
+                } else {
+                    remote.save_state().await
+                };
+                (result, start.elapsed())
+            },
+            tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
+                let format = if strong {
+                    state::SnapshotFormat::V2
+                } else {
+                    state::SnapshotFormat::LegacyV1
+                };
+                let result = state::save_entries_as(&local_state_for_save, &local_all_old, format);
+                (result, start.elapsed())
+            })
+        );
+        let (local_result, local_state_save_duration) =
+            local_result.wrap_err("local state save task failed")?;
+        local_result.wrap_err_with(|| {
+            format!(
+                "failed to save local state {}\n{}",
+                local_state_display, STATE_SAVE_RECOVERY_ADVICE
+            )
+        })?;
+        let (remote_result, remote_state_save_duration) = remote_result;
+        remote_result.map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
+        if coordinated_cleanup {
+            remote.clear_apply_attempt(remote_id).await
+                .map_err(|e| remote_rpc_error("failed to clear remote recovery marker", e))?;
+            sync_ops::finish_apply_attempt(&local_state)?;
+        } else {
+            sync_ops::finish_apply_attempt(&local_state)?;
+        }
+        performance.record_phase("local_state_save", local_state_save_duration);
+        performance.record_phase("remote_state_save_rpc", remote_state_save_duration);
+        performance.record_phase("state_save_total", state_save_start.elapsed());
     }
-    performance.record_phase("local_state_save", local_state_save_duration);
-    performance.record_phase("remote_state_save_rpc", remote_state_save_duration);
-    performance.record_phase("state_save_total", state_save_start.elapsed());
 
     if profiling_enabled {
         performance.finish(total_start.elapsed());
@@ -1109,14 +1343,164 @@ fn remote_stream_performance_enabled(profiling_enabled: bool, info: &rpc::Server
     profiling_enabled && has_remote_capability(info, rpc::CAPABILITY_STREAM_PERFORMANCE)
 }
 
-fn select_apply_strategy(info: &rpc::ServerInfo, can_stream_details: bool) -> ApplyStrategy {
-    if can_stream_details && has_remote_capability(info, rpc::CAPABILITY_STAGED_APPLY) {
-        ApplyStrategy::StagedStream
-    } else if can_stream_details {
-        ApplyStrategy::LegacyStream
-    } else {
-        ApplyStrategy::LegacyNonStream
+fn select_apply_strategy(
+    info: &rpc::ServerInfo,
+    can_stream_details: bool,
+    staging_policy_explicit: bool,
+) -> Result<ApplyStrategy> {
+    if !can_stream_details {
+        if staging_policy_explicit {
+            return Err(eyre!(
+                "--staging-limit/--staging-reserve requires a streamable staged apply plan"
+            ));
+        }
+        return Ok(ApplyStrategy::LegacyNonStream);
     }
+    if has_remote_capability(info, rpc::CAPABILITY_STAGED_APPLY)
+        && has_remote_capability(info, rpc::CAPABILITY_STAGING_CAPACITY)
+    {
+        return Ok(ApplyStrategy::StagedStream);
+    }
+    if staging_policy_explicit {
+        return Err(eyre!(
+            "remote duet {} cannot enforce --staging-limit/--staging-reserve; upgrade it to a version supporting {}",
+            info.duet_version,
+            rpc::CAPABILITY_STAGING_CAPACITY
+        ));
+    }
+    Ok(ApplyStrategy::LegacyStream)
+}
+
+fn can_use_staging_plan(
+    info: &rpc::ServerInfo,
+    wave_count: usize,
+    migration: bool,
+    staging_policy_explicit: bool,
+) -> Result<bool> {
+    if wave_count <= 1 {
+        return Ok(true);
+    }
+    let unavailable = if migration {
+        Some("strong-digest migration cannot checkpoint partial wave results")
+    } else if !has_remote_capability(info, rpc::CAPABILITY_CHECKPOINTED_STAGING) {
+        Some("the remote peer does not support checkpointed staging")
+    } else {
+        None
+    };
+    let Some(reason) = unavailable else {
+        return Ok(true);
+    };
+    if staging_policy_explicit {
+        return Err(eyre!(
+            "staging policy requires {wave_count} waves, but {reason}; increase --staging-limit/free space or upgrade the remote peer"
+        ));
+    }
+    Ok(false)
+}
+
+async fn set_remote_actions<R>(remote: &R, actions: Actions, strong: bool) -> Result<()>
+where
+    R: DuetServerAsync,
+{
+    if strong {
+        remote.set_actions_v2(actions).await
+    } else {
+        remote.set_actions(crate::actions::to_legacy(actions)).await
+    }
+    .map_err(|e| remote_rpc_error("Failed to set remote actions", e))
+}
+
+fn print_staging_plan_summary(
+    plan: &sync_ops::StagingWavePlan,
+    local_budget: sync_ops::StagingBudget,
+    remote_budget: sync_ops::StagingBudget,
+) {
+    println!(
+        "Staging: {} wave(s), local {} total / {} per-wave budget, remote {} total / {} per-wave budget",
+        plan.waves.len(),
+        indicatif::HumanBytes(plan.local_reconstructed_bytes),
+        indicatif::HumanBytes(local_budget.budget_bytes),
+        indicatif::HumanBytes(plan.remote_reconstructed_bytes),
+        indicatif::HumanBytes(remote_budget.budget_bytes),
+    );
+}
+
+fn validate_wave_capacity(
+    wave: &sync_ops::StagingWave,
+    policy: sync_ops::StagingPolicy,
+    local_filesystem: sync_ops::StagingFilesystemInfo,
+    remote_filesystem: sync_ops::StagingFilesystemInfo,
+    wave_index: usize,
+    wave_count: usize,
+) -> Result<()> {
+    validate_wave_side_capacity(
+        "local",
+        wave.local_reconstructed_bytes,
+        wave.local_staged_regular_outputs,
+        wave.local_exceeds_budget,
+        policy.budget(local_filesystem),
+        local_filesystem.available_inodes,
+        wave_index,
+        wave_count,
+    )?;
+    validate_wave_side_capacity(
+        "remote",
+        wave.remote_reconstructed_bytes,
+        wave.remote_staged_regular_outputs,
+        wave.remote_exceeds_budget,
+        policy.budget(remote_filesystem),
+        remote_filesystem.available_inodes,
+        wave_index,
+        wave_count,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_wave_side_capacity(
+    side: &str,
+    required_bytes: u64,
+    required_outputs: usize,
+    isolated_oversize: bool,
+    budget: sync_ops::StagingBudget,
+    available_inodes: u64,
+    wave_index: usize,
+    wave_count: usize,
+) -> Result<()> {
+    let wave_number = wave_index + 1;
+    if required_bytes > budget.usable_bytes {
+        return Err(eyre!(
+            "staging capacity shrank before wave {wave_number}/{wave_count}: {side} requires {required_bytes} bytes but only {} bytes are usable after reserve",
+            budget.usable_bytes
+        ));
+    }
+    if required_bytes > budget.budget_bytes && !isolated_oversize {
+        return Err(eyre!(
+            "staging capacity shrank before wave {wave_number}/{wave_count}: {side} requires {required_bytes} bytes but the current staging limit is {} bytes",
+            budget.budget_bytes
+        ));
+    }
+    if required_outputs as u128 > available_inodes as u128 {
+        return Err(eyre!(
+            "staging capacity shrank before wave {wave_number}/{wave_count}: {side} requires {required_outputs} staged files but only {available_inodes} inodes are available"
+        ));
+    }
+    Ok(())
+}
+
+fn actions_have_directory_to_nondirectory_change(actions: &[Action]) -> bool {
+    fn replacement(change: &Change) -> bool {
+        matches!(change, Change::Modified(old, new) if old.is_dir() && !new.is_dir())
+    }
+    actions.iter().any(|action| match action {
+        Action::Local(change) | Action::Remote(change) => replacement(change),
+        Action::Identical(left, right) | Action::Conflict(left, right) => {
+            replacement(left) || replacement(right)
+        }
+        Action::ResolvedLocal((left, right), resolved)
+        | Action::ResolvedRemote((left, right), resolved) => {
+            replacement(left) || replacement(right) || replacement(resolved)
+        }
+    })
 }
 
 fn validate_prepared_report(
@@ -1506,20 +1890,116 @@ fn record_stream_performance(
     performance: &mut PerformanceProfile,
     result: &mut StreamDetailedChangesResult,
 ) {
-    performance.record_phase(
+    record_phase_aggregate(
+        performance,
         "stream_remote_detail_and_local_apply",
         result.remote_detail_and_local_apply_duration,
     );
-    performance.record_phase("stream_remote_detail_rpc", result.remote_detail_duration);
-    performance.record_phase("stream_local_apply", result.local_apply_duration);
-    performance.record_phase(
+    record_phase_aggregate(
+        performance,
+        "stream_remote_detail_rpc",
+        result.remote_detail_duration,
+    );
+    record_phase_aggregate(
+        performance,
+        "stream_local_apply",
+        result.local_apply_duration,
+    );
+    record_phase_aggregate(
+        performance,
         "stream_local_detail_and_remote_apply",
         result.local_detail_and_remote_apply_duration,
     );
-    performance.record_phase("stream_local_detail", result.local_detail_duration);
-    performance.record_phase("stream_remote_apply_rpc", result.remote_apply_duration);
+    record_phase_aggregate(
+        performance,
+        "stream_local_detail",
+        result.local_detail_duration,
+    );
+    record_phase_aggregate(
+        performance,
+        "stream_remote_apply_rpc",
+        result.remote_apply_duration,
+    );
     performance.counters.streamed_details = true;
-    performance.counters.streaming = std::mem::take(&mut result.profile);
+    merge_streaming_profile(
+        &mut performance.counters.streaming,
+        std::mem::take(&mut result.profile),
+    );
+}
+
+fn record_phase_aggregate(performance: &mut PerformanceProfile, name: &str, duration: Duration) {
+    if let Some(phase) = performance
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == name)
+    {
+        phase.ms = phase.ms.saturating_add(duration_ms(duration));
+    } else {
+        performance.record_phase(name, duration);
+    }
+}
+
+fn merge_streaming_profile(target: &mut StreamingProfile, source: StreamingProfile) {
+    merge_transfer_stats(&mut target.remote_to_local, source.remote_to_local);
+    merge_transfer_stats(&mut target.local_to_remote, source.local_to_remote);
+    if let Some(source_remote) = source.remote_server {
+        let target_remote = target.remote_server.get_or_insert_with(Default::default);
+        target_remote.detail_generate_ms = target_remote
+            .detail_generate_ms
+            .saturating_add(source_remote.detail_generate_ms);
+        target_remote.detail_batches = target_remote
+            .detail_batches
+            .saturating_add(source_remote.detail_batches);
+        target_remote.apply_frames_ms = target_remote
+            .apply_frames_ms
+            .saturating_add(source_remote.apply_frames_ms);
+        target_remote.apply_finish_ms = target_remote
+            .apply_finish_ms
+            .saturating_add(source_remote.apply_finish_ms);
+        target_remote.apply_batches = target_remote
+            .apply_batches
+            .saturating_add(source_remote.apply_batches);
+        merge_transfer_stats(
+            &mut target_remote.detail_transfer,
+            source_remote.detail_transfer,
+        );
+        merge_transfer_stats(
+            &mut target_remote.apply_transfer,
+            source_remote.apply_transfer,
+        );
+    }
+}
+
+fn merge_transfer_stats(target: &mut DetailTransferStats, source: DetailTransferStats) {
+    target.batches = target.batches.saturating_add(source.batches);
+    target.empty_batches = target.empty_batches.saturating_add(source.empty_batches);
+    target.frames = target.frames.saturating_add(source.frames);
+    target.message_payload_bytes = target
+        .message_payload_bytes
+        .saturating_add(source.message_payload_bytes);
+    target.reconstructed_bytes = target
+        .reconstructed_bytes
+        .saturating_add(source.reconstructed_bytes);
+    target.file_bytes = target.file_bytes.saturating_add(source.file_bytes);
+    target.diff_literal_bytes = target
+        .diff_literal_bytes
+        .saturating_add(source.diff_literal_bytes);
+    target.diff_copy_bytes = target
+        .diff_copy_bytes
+        .saturating_add(source.diff_copy_bytes);
+    target.file_byte_frames = target
+        .file_byte_frames
+        .saturating_add(source.file_byte_frames);
+    target.diff_literal_frames = target
+        .diff_literal_frames
+        .saturating_add(source.diff_literal_frames);
+    target.diff_copy_frames = target
+        .diff_copy_frames
+        .saturating_add(source.diff_copy_frames);
+    target.max_batch_frames = target.max_batch_frames.max(source.max_batch_frames);
+    target.max_batch_payload_bytes = target
+        .max_batch_payload_bytes
+        .max(source.max_batch_payload_bytes);
 }
 
 async fn stream_detailed_changes<R>(
@@ -2540,6 +3020,26 @@ mod tests {
     }
 
     #[test]
+    fn completed_checkpoint_reopens_interrupt_fence() {
+        let interrupt = InterruptState::new();
+
+        assert!(interrupt.try_begin_commit());
+        assert!(interrupt.try_reset_after_checkpoint());
+        assert_eq!(interrupt.request_interrupt(), InterruptRequest::Cancel);
+        assert!(!interrupt.try_begin_commit());
+    }
+
+    #[test]
+    fn deferred_interrupt_wins_over_checkpoint_reset() {
+        let interrupt = InterruptState::new();
+
+        assert!(interrupt.try_begin_commit());
+        assert_eq!(interrupt.request_interrupt(), InterruptRequest::Deferred);
+        assert!(!interrupt.try_reset_after_checkpoint());
+        assert!(!interrupt.is_cancel_requested());
+    }
+
+    #[test]
     fn second_interrupt_requests_force() {
         let interrupt = InterruptState::new();
 
@@ -2992,6 +3492,14 @@ mod tests {
         let staged = rpc::ServerInfo {
             protocol_version: rpc::PROTOCOL_VERSION,
             duet_version: "test".to_string(),
+            capabilities: vec![
+                rpc::CAPABILITY_STAGED_APPLY.to_string(),
+                rpc::CAPABILITY_STAGING_CAPACITY.to_string(),
+            ],
+        };
+        let staged_without_capacity = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "old".to_string(),
             capabilities: vec![rpc::CAPABILITY_STAGED_APPLY.to_string()],
         };
         let legacy = rpc::ServerInfo {
@@ -3001,17 +3509,47 @@ mod tests {
         };
 
         assert_eq!(
-            select_apply_strategy(&staged, true),
+            select_apply_strategy(&staged, true, false).unwrap(),
             ApplyStrategy::StagedStream
         );
         assert_eq!(
-            select_apply_strategy(&staged, false),
+            select_apply_strategy(&staged, false, false).unwrap(),
             ApplyStrategy::LegacyNonStream
         );
+        assert!(select_apply_strategy(&staged, false, true).is_err());
         assert_eq!(
-            select_apply_strategy(&legacy, true),
+            select_apply_strategy(&legacy, true, false).unwrap(),
             ApplyStrategy::LegacyStream
         );
+        assert_eq!(
+            select_apply_strategy(&staged_without_capacity, true, false).unwrap(),
+            ApplyStrategy::LegacyStream
+        );
+        let error = select_apply_strategy(&staged_without_capacity, true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(rpc::CAPABILITY_STAGING_CAPACITY));
+    }
+
+    #[test]
+    fn checkpointed_staging_falls_back_only_for_default_policy() {
+        let legacy_staged = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "test".to_string(),
+            capabilities: vec![rpc::CAPABILITY_STAGING_CAPACITY.to_string()],
+        };
+        let checkpointed = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "test".to_string(),
+            capabilities: vec![rpc::CAPABILITY_CHECKPOINTED_STAGING.to_string()],
+        };
+
+        assert!(can_use_staging_plan(&legacy_staged, 1, false, true).unwrap());
+        assert!(!can_use_staging_plan(&legacy_staged, 2, false, false).unwrap());
+        assert!(can_use_staging_plan(&legacy_staged, 2, false, true).is_err());
+        assert!(!can_use_staging_plan(&checkpointed, 2, true, false).unwrap());
+        assert!(can_use_staging_plan(&checkpointed, 2, true, true).is_err());
+        assert!(can_use_staging_plan(&checkpointed, 2, false, true).unwrap());
     }
 
     #[test]

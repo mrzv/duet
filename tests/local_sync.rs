@@ -139,6 +139,33 @@ fn local_added_file_copies_to_remote() {
 }
 
 #[test]
+fn checkpointed_staging_runs_multiple_bidirectional_waves() {
+    let case = SyncCase::new_with_rules("+.\n");
+    let local_a = vec![b'a'; 3 * 1024];
+    let local_c = vec![b'c'; 3 * 1024];
+    let remote_b = vec![b'b'; 3 * 1024];
+    let remote_d = vec![b'd'; 3 * 1024];
+    write_bytes(&case.local.join("a-local.bin"), &local_a);
+    write_bytes(&case.local.join("c-local.bin"), &local_c);
+    write_bytes(&case.remote.join("b-remote.bin"), &remote_b);
+    write_bytes(&case.remote.join("d-remote.bin"), &remote_d);
+
+    assert_success(case.sync_with_args(&["--staging-limit", "4KiB", "--staging-reserve", "0%"]));
+
+    for (name, expected) in [
+        ("a-local.bin", &local_a),
+        ("b-remote.bin", &remote_b),
+        ("c-local.bin", &local_c),
+        ("d-remote.bin", &remote_d),
+    ] {
+        assert_eq!(fs::read(case.local.join(name)).unwrap(), *expected);
+        assert_eq!(fs::read(case.remote.join(name)).unwrap(), *expected);
+    }
+
+    assert_success(case.sync_with_args(&["--staging-limit", "4KiB", "--staging-reserve", "0%"]));
+}
+
+#[test]
 fn legacy_migration_reports_metadata_hidden_adler_collision() {
     let case = SyncCase::new();
     let original = [10, 10, 10, 10];

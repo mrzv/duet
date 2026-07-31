@@ -42,6 +42,7 @@ pub(crate) const CAPABILITY_CONTENT_DIGEST_BLAKE2B256: &str = "content-digest-bl
 pub(crate) const CAPABILITY_COORDINATED_MARKER_CLEANUP: &str = "coordinated-marker-cleanup-v1";
 pub(crate) const CAPABILITY_STAGED_APPLY: &str = "staged-apply-v1";
 pub(crate) const CAPABILITY_STAGING_CAPACITY: &str = "staging-capacity-v1";
+pub(crate) const CAPABILITY_CHECKPOINTED_STAGING: &str = "checkpointed-staging-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -63,6 +64,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_COORDINATED_MARKER_CLEANUP,
     CAPABILITY_STAGED_APPLY,
     CAPABILITY_STAGING_CAPACITY,
+    CAPABILITY_CHECKPOINTED_STAGING,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -1665,6 +1667,7 @@ mod tests {
                 CAPABILITY_COORDINATED_MARKER_CLEANUP.to_string(),
                 CAPABILITY_STAGED_APPLY.to_string(),
                 CAPABILITY_STAGING_CAPACITY.to_string(),
+                CAPABILITY_CHECKPOINTED_STAGING.to_string(),
             ]
         );
     }

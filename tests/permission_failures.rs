@@ -48,9 +48,14 @@ impl SyncCase {
     }
 
     fn sync(&self) -> Output {
+        self.sync_with_args(&[])
+    }
+
+    fn sync_with_args(&self, args: &[&str]) -> Output {
         Command::new(duet_bin())
             .arg("--profile-file")
             .arg(&self.profile)
+            .args(args)
             .arg("-b")
             .env("NO_COLOR", "1")
             .output()
@@ -62,9 +67,14 @@ impl SyncCase {
     }
 
     fn sync_child_with_pause(&self, variable: &str) -> Child {
+        self.sync_child_with_pause_and_args(variable, &[])
+    }
+
+    fn sync_child_with_pause_and_args(&self, variable: &str, args: &[&str]) -> Child {
         Command::new(duet_bin())
             .arg("--profile-file")
             .arg(&self.profile)
+            .args(args)
             .arg("-b")
             .env("NO_COLOR", "1")
             .env(variable, "30000")
@@ -600,6 +610,51 @@ fn sigint_after_staged_commit_finishes_state_and_exits_successfully() {
     assert!(!remote_marker.exists());
     assert_no_staging_directory(&case.local);
     assert_no_staging_directory(&case.remote);
+}
+
+#[test]
+fn sigint_after_intermediate_wave_checkpoint_stops_before_next_wave() {
+    let case = SyncCase::new(&["+."]);
+    write(&case.local.join("seed.txt"), "baseline");
+    assert_success(case.sync());
+
+    let local_a = "a".repeat(3 * 1024);
+    let local_c = "c".repeat(3 * 1024);
+    let remote_b = "b".repeat(3 * 1024);
+    let remote_d = "d".repeat(3 * 1024);
+    write(&case.local.join("a-local.bin"), &local_a);
+    write(&case.local.join("c-local.bin"), &local_c);
+    write(&case.remote.join("b-remote.bin"), &remote_b);
+    write(&case.remote.join("d-remote.bin"), &remote_d);
+
+    let args = ["--staging-limit", "4KiB", "--staging-reserve", "0%"];
+    let remote_marker = apply_marker_for(&remote_state_file(&case));
+    let mut child =
+        case.sync_child_with_pause_and_args("DUET_TEST_PAUSE_AFTER_STAGED_COMMIT_MS", &args);
+    wait_for_marker_phase_while_child_runs(&remote_marker, "committed", &mut child);
+    send_sigint(&child);
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(&case.local.join("a-local.bin")), local_a);
+    assert_eq!(read(&case.remote.join("a-local.bin")), local_a);
+    assert_eq!(read(&case.local.join("b-remote.bin")), remote_b);
+    assert_eq!(read(&case.remote.join("b-remote.bin")), remote_b);
+    assert!(!case.remote.join("c-local.bin").exists());
+    assert!(!case.local.join("d-remote.bin").exists());
+    assert!(!apply_marker_for(&case.local_state()).exists());
+    assert!(!remote_marker.exists());
+    assert_no_staging_directory(&case.local);
+    assert_no_staging_directory(&case.remote);
+
+    assert_success(case.sync_with_args(&args));
+    assert_eq!(read(&case.remote.join("c-local.bin")), local_c);
+    assert_eq!(read(&case.local.join("d-remote.bin")), remote_d);
 }
 
 #[test]
