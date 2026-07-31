@@ -47,6 +47,25 @@ const ENV_OUTPUT_BATCH_BYTES: &str = "DUET_SYNC_OUTPUT_BATCH_BYTES";
 const ENV_OUTPUT_SYNC_WORKERS: &str = "DUET_SYNC_OUTPUT_SYNC_WORKERS";
 static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_os = "macos")]
+const CLONE_NOOWNERCOPY: u32 = 0x0002;
+#[cfg(target_os = "macos")]
+const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+    fn acl_set_fd_np(fd: libc::c_int, acl: *mut libc::c_void, acl_type: libc::c_int)
+        -> libc::c_int;
+    fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+    fn acl_get_entry(
+        acl: *mut libc::c_void,
+        entry_id: libc::c_int,
+        entry: *mut *mut libc::c_void,
+    ) -> libc::c_int;
+    fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ApplyOptions {
     pub prune_ignored: bool,
@@ -3299,6 +3318,11 @@ struct StagingState {
     published_parents: Mutex<HashMap<PathBuf, DirectoryIdentity>>,
 }
 
+enum CloneOutput {
+    Cloned(PathBuf, std::ffi::CString, fs::File),
+    Unsupported,
+}
+
 impl StagingState {
     fn verify_stage_parent_identity(&self) -> Result<()> {
         verify_path_identity(
@@ -3402,6 +3426,281 @@ impl StagingState {
             self.path.display()
         ))
     }
+
+    #[cfg(target_os = "macos")]
+    fn clone_output(&self, source: &fs::File) -> Result<CloneOutput> {
+        self.verify_identity()?;
+        for _ in 0..128 {
+            let component = format!(
+                "o-{:x}",
+                TEMP_OUTPUT_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+            );
+            let name = path_component_cstring(component.as_ref(), "temporary output name")?;
+            let path = self.path.join(&component);
+            match cvt(unsafe {
+                libc::fclonefileat(
+                    source.as_raw_fd(),
+                    self.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    CLONE_NOOWNERCOPY,
+                )
+            }) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) if clone_error_is_unsupported(&error) => {
+                    return Ok(CloneOutput::Unsupported);
+                }
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!("failed to clone temporary file {}", path.display())
+                    });
+                }
+            }
+
+            let setup = (|| -> Result<fs::File> {
+                let created =
+                    fstatat_nofollow(self.directory.as_raw_fd(), &name).wrap_err_with(|| {
+                        format!("failed to inspect cloned file {}", path.display())
+                    })?;
+                if created.st_mode & libc::S_IFMT != libc::S_IFREG {
+                    return Err(eyre!(
+                        "cloned output {} is not a regular file",
+                        path.display()
+                    ));
+                }
+                let file = openat_file(
+                    self.directory.as_raw_fd(),
+                    &name,
+                    libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                )
+                .wrap_err_with(|| format!("failed to open cloned file {}", path.display()))?;
+                normalize_macos_cloned_file(&file, &path)?;
+                let metadata = file.metadata().wrap_err_with(|| {
+                    format!("failed to inspect cloned file {}", path.display())
+                })?;
+                if !metadata.is_file()
+                    || metadata.dev() != created.st_dev as u64
+                    || metadata.ino() != created.st_ino as u64
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o7777 != 0o600
+                {
+                    return Err(eyre!(
+                        "cloned output {} changed identity or mode during creation",
+                        path.display()
+                    ));
+                }
+                Ok(file)
+            })();
+            match setup {
+                Ok(file) => return Ok(CloneOutput::Cloned(path, name, file)),
+                Err(error) => {
+                    if let Err(cleanup_error) = unlinkat(self.directory.as_raw_fd(), &name, 0) {
+                        return Err(error).wrap_err_with(|| {
+                            format!(
+                                "failed to initialize cloned file {}; additionally failed to remove it: {}",
+                                path.display(), cleanup_error
+                            )
+                        });
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Err(eyre!(
+            "failed to create a unique cloned file in {}",
+            self.path.display()
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clone_output(&self, source: &fs::File) -> Result<CloneOutput> {
+        let (path, name, file) = self.create_output()?;
+        match cvt(unsafe { libc::ioctl(file.as_raw_fd(), libc::FICLONE as _, source.as_raw_fd()) })
+        {
+            Ok(()) => Ok(CloneOutput::Cloned(path, name, file)),
+            Err(error) if clone_error_is_unsupported(&error) => {
+                unlinkat(self.directory.as_raw_fd(), &name, 0).wrap_err_with(|| {
+                    format!(
+                        "failed to remove unsupported cloned output {}",
+                        path.display()
+                    )
+                })?;
+                Ok(CloneOutput::Unsupported)
+            }
+            Err(error) => {
+                if let Err(cleanup_error) = unlinkat(self.directory.as_raw_fd(), &name, 0) {
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "failed to clone temporary file {}; additionally failed to remove it: {}",
+                            path.display(), cleanup_error
+                        )
+                    });
+                }
+                Err(error)
+                    .wrap_err_with(|| format!("failed to clone temporary file {}", path.display()))
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn clone_output(&self, _source: &fs::File) -> Result<CloneOutput> {
+        Ok(CloneOutput::Unsupported)
+    }
+}
+
+fn clone_error_is_unsupported(error: &io::Error) -> bool {
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    if code == libc::EXDEV || code == libc::ENOSYS || code == libc::EOPNOTSUPP {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if code == libc::ENOTTY || code == libc::EINVAL || code == libc::EBADF {
+        return true;
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_cloned_file(file: &fs::File, path: &Path) -> Result<()> {
+    cvt(unsafe { libc::fchflags(file.as_raw_fd(), 0) })
+        .wrap_err_with(|| format!("failed to clear cloned file flags {}", path.display()))?;
+    clear_macos_acl(file, path)?;
+    remove_macos_xattrs(file, path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .wrap_err_with(|| {
+            format!(
+                "failed to normalize cloned file permissions {}",
+                path.display()
+            )
+        })?;
+
+    let metadata = file
+        .metadata()
+        .wrap_err_with(|| format!("failed to verify cloned file metadata {}", path.display()))?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(eyre!(
+            "cloned output {} is not owned by the current user",
+            path.display()
+        ));
+    }
+    let retained_xattrs = macos_xattr_names(file, path)?.collect::<Vec<_>>();
+    if retained_xattrs
+        .iter()
+        .any(|name| name.as_slice() != b"com.apple.provenance")
+    {
+        return Err(eyre!(
+            "cloned output {} retained extended attributes {:?}",
+            path.display(),
+            retained_xattrs
+        ));
+    }
+    if !macos_acl_is_empty(file, path)? {
+        return Err(eyre!(
+            "cloned output {} retained an extended ACL",
+            path.display()
+        ));
+    }
+    let mut stat = std::mem::MaybeUninit::uninit();
+    cvt(unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) })
+        .wrap_err_with(|| format!("failed to inspect cloned file flags {}", path.display()))?;
+    if unsafe { stat.assume_init() }.st_flags != 0 {
+        return Err(eyre!(
+            "cloned output {} retained file flags",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_xattr_names(file: &fs::File, path: &Path) -> Result<std::vec::IntoIter<Vec<u8>>> {
+    let size = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+    if size == -1 {
+        return Err(io::Error::last_os_error())
+            .wrap_err_with(|| format!("failed to list cloned file attributes {}", path.display()));
+    }
+    if size == 0 {
+        return Ok(Vec::new().into_iter());
+    }
+
+    let mut names = vec![0_u8; size as usize];
+    let read =
+        unsafe { libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len(), 0) };
+    if read == -1 {
+        return Err(io::Error::last_os_error())
+            .wrap_err_with(|| format!("failed to read cloned file attributes {}", path.display()));
+    }
+    names.truncate(read as usize);
+    let parsed = names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    Ok(parsed.into_iter())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_xattrs(file: &fs::File, path: &Path) -> Result<()> {
+    for name in macos_xattr_names(file, path)? {
+        let name = std::ffi::CString::new(name)
+            .map_err(|_| eyre!("cloned file attribute name contains an interior NUL byte"))?;
+        cvt(unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr(), 0) }).wrap_err_with(
+            || {
+                format!(
+                    "failed to remove cloned file attribute {:?} from {}",
+                    name,
+                    path.display()
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_macos_acl(file: &fs::File, path: &Path) -> Result<()> {
+    let acl = unsafe { acl_init(0) };
+    if acl.is_null() {
+        return Err(io::Error::last_os_error())
+            .wrap_err_with(|| format!("failed to create an empty ACL for {}", path.display()));
+    }
+    let set_result = cvt(unsafe { acl_set_fd_np(file.as_raw_fd(), acl, ACL_TYPE_EXTENDED) })
+        .wrap_err_with(|| format!("failed to clear cloned file ACL {}", path.display()));
+    let free_result = cvt(unsafe { acl_free(acl) })
+        .wrap_err_with(|| format!("failed to release cloned file ACL {}", path.display()));
+    set_result?;
+    free_result
+}
+
+#[cfg(target_os = "macos")]
+fn macos_acl_is_empty(file: &fs::File, path: &Path) -> Result<bool> {
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(true);
+        }
+        return Err(error)
+            .wrap_err_with(|| format!("failed to inspect cloned file ACL {}", path.display()));
+    }
+    let mut entry = std::ptr::null_mut();
+    let get_result = unsafe { acl_get_entry(acl, 0, &mut entry) };
+    let free_result = cvt(unsafe { acl_free(acl) })
+        .wrap_err_with(|| format!("failed to release cloned file ACL {}", path.display()));
+    let empty = match get_result {
+        0 => true,
+        1 => false,
+        _ => {
+            return Err(io::Error::last_os_error())
+                .wrap_err_with(|| format!("failed to read cloned file ACL {}", path.display()));
+        }
+    };
+    free_result?;
+    Ok(empty)
 }
 
 struct StagingArea {
@@ -3573,6 +3872,45 @@ fn output_parent(path: &Path) -> &Path {
 
 impl TempOutput {
     fn new(final_path: PathBuf, staging: Arc<StagingState>) -> Result<Self> {
+        let created = staging.create_output()?;
+        Self::from_created(final_path, staging, created)
+    }
+
+    fn clone_from(
+        final_path: PathBuf,
+        staging: Arc<StagingState>,
+        source: &fs::File,
+    ) -> Result<Option<Self>> {
+        let created = match staging.clone_output(source)? {
+            CloneOutput::Cloned(path, name, file) => (path, name, file),
+            CloneOutput::Unsupported => return Ok(None),
+        };
+        let cleanup_name = created.1.clone();
+        match Self::from_created(final_path, Arc::clone(&staging), created) {
+            Ok(output) => Ok(Some(output)),
+            Err(error) => {
+                match unlinkat(staging.directory.as_raw_fd(), &cleanup_name, 0) {
+                    Ok(()) => {}
+                    Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {}
+                    Err(cleanup_error) => {
+                        return Err(error).wrap_err_with(|| {
+                            format!(
+                                "failed to initialize cloned temporary output; additionally failed to remove it: {}",
+                                cleanup_error
+                            )
+                        });
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn from_created(
+        final_path: PathBuf,
+        staging: Arc<StagingState>,
+        (temp_path, output_name, file): (PathBuf, std::ffi::CString, fs::File),
+    ) -> Result<Self> {
         let parent = output_parent(&final_path);
         let parent_path = parent.to_path_buf();
         let parent_identity = if parent.try_exists().wrap_err_with(|| {
@@ -3591,7 +3929,6 @@ impl TempOutput {
                 .ok_or_else(|| eyre!("output path {} has no file name", final_path.display()))?,
             "output file name",
         )?;
-        let (temp_path, output_name, file) = staging.create_output()?;
         let output = TempOutput {
             final_path,
             parent_path,
@@ -5402,6 +5739,8 @@ enum ApplyState {
         source: fs::File,
         output: TempOutput,
         verifier: StreamedOutputVerifier,
+        output_position: u64,
+        clone_backed: bool,
     },
 }
 
@@ -5628,6 +5967,8 @@ impl DetailApplier {
                 source,
                 output,
                 verifier,
+                output_position,
+                clone_backed,
             }) => {
                 if *action_index != frame_index {
                     return Err(eyre!(
@@ -5642,17 +5983,31 @@ impl DetailApplier {
                             .file
                             .as_mut()
                             .ok_or_else(|| eyre!("temporary output is closed"))?;
-                        copy_from_source(source, output_file, verifier, offset, len)?;
+                        apply_diff_copy(
+                            source,
+                            output_file,
+                            verifier,
+                            output_position,
+                            *clone_backed,
+                            offset,
+                            len,
+                        )?;
                     }
                     DetailPayload::DiffBytes(bytes) => {
-                        output
+                        let output_file = output
                             .file
                             .as_mut()
-                            .ok_or_else(|| eyre!("temporary output is closed"))?
-                            .write_all(&bytes)?;
-                        verifier.update(&bytes);
+                            .ok_or_else(|| eyre!("temporary output is closed"))?;
+                        apply_diff_bytes(output_file, verifier, output_position, &bytes)?;
                     }
-                    DetailPayload::DiffEnd => self.finish_file_detail()?,
+                    DetailPayload::DiffEnd => {
+                        output
+                            .file
+                            .as_ref()
+                            .ok_or_else(|| eyre!("temporary output is closed"))?
+                            .set_len(*output_position)?;
+                        self.finish_file_detail()?;
+                    }
                     _ => return Err(eyre!("unexpected diff detail frame")),
                 }
                 return Ok(());
@@ -5954,19 +6309,58 @@ impl DetailApplier {
             | Action::ResolvedLocal((_, _), Change::Modified(e, _)) => e,
             _ => return Err(eyre!("diff detail began for non-diff action")),
         };
-        verify_file_matches_entry(&filename, old_entry, "diff source")?;
-        let source = fs::File::open(&filename)?;
-        let output = self.new_output(filename)?;
+        let mut source = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&filename)
+            .wrap_err_with(|| format!("failed to open diff source {}", filename.display()))?;
+        verify_open_file_matches_entry(&mut source, &filename, old_entry, "diff source")?;
+        let (output, clone_backed) = self.new_diff_output(filename, &source)?;
         self.state = Some(ApplyState::Diff {
             action_index,
             source,
             output,
             verifier,
+            output_position: 0,
+            clone_backed,
         });
         Ok(())
     }
 
+    fn new_diff_output(
+        &mut self,
+        final_path: PathBuf,
+        source: &fs::File,
+    ) -> Result<(TempOutput, bool)> {
+        self.ensure_staging()?;
+        let staging = self
+            .staging
+            .as_ref()
+            .expect("staging area is initialized")
+            .shared();
+        let (output, clone_backed) =
+            match TempOutput::clone_from(final_path.clone(), Arc::clone(&staging), source)? {
+                Some(output) => (output, true),
+                None => (TempOutput::new(final_path, staging)?, false),
+            };
+        self.record_new_output(&output)?;
+        Ok((output, clone_backed))
+    }
+
     fn new_output(&mut self, final_path: PathBuf) -> Result<TempOutput> {
+        self.ensure_staging()?;
+        let output = TempOutput::new(
+            final_path,
+            self.staging
+                .as_ref()
+                .expect("staging area is initialized")
+                .shared(),
+        )?;
+        self.record_new_output(&output)?;
+        Ok(output)
+    }
+
+    fn ensure_staging(&mut self) -> Result<()> {
         if self.staging.is_none() {
             let mut staging = StagingArea::new(&self.base)?;
             if let (Some(state_path), Some(attempt_id)) =
@@ -5979,19 +6373,16 @@ impl DetailApplier {
             }
             self.staging = Some(staging);
         }
-        let output = TempOutput::new(
-            final_path,
-            self.staging
-                .as_ref()
-                .expect("staging area is initialized")
-                .shared(),
-        )?;
+        Ok(())
+    }
+
+    fn record_new_output(&self, output: &TempOutput) -> Result<()> {
         if let (Some(state_path), Some(_)) =
             (self.attempt_state.as_deref(), self.attempt_id.as_deref())
         {
-            record_v2_stage_entry(state_path, &output)?;
+            record_v2_stage_entry(state_path, output)?;
         }
-        Ok(output)
+        Ok(())
     }
 
     fn finish_file_detail(&mut self) -> Result<()> {
@@ -6378,15 +6769,56 @@ fn fallback_action_can_follow_pending(action: &Action) -> bool {
     )
 }
 
-fn copy_from_source(
+fn apply_diff_copy(
     source: &mut fs::File,
     output: &mut fs::File,
     verifier: &mut StreamedOutputVerifier,
+    output_position: &mut u64,
+    clone_backed: bool,
     offset: u64,
     len: u64,
 ) -> Result<()> {
+    if clone_backed && offset == *output_position {
+        output.seek(SeekFrom::Start(*output_position))?;
+        let copied = hash_file_range(output, verifier, len)?;
+        *output_position = output_position
+            .checked_add(copied)
+            .ok_or_else(|| eyre!("diff output position overflow"))?;
+        return Ok(());
+    }
+
     source.seek(SeekFrom::Start(offset))?;
+    output.seek(SeekFrom::Start(*output_position))?;
+    let copied = copy_and_hash(source, output, verifier, len)?;
+    *output_position = output_position
+        .checked_add(copied)
+        .ok_or_else(|| eyre!("diff output position overflow"))?;
+    Ok(())
+}
+
+fn apply_diff_bytes(
+    output: &mut fs::File,
+    verifier: &mut StreamedOutputVerifier,
+    output_position: &mut u64,
+    bytes: &[u8],
+) -> Result<()> {
+    output.seek(SeekFrom::Start(*output_position))?;
+    output.write_all(bytes)?;
+    verifier.update(bytes);
+    *output_position = output_position
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| eyre!("diff output position overflow"))?;
+    Ok(())
+}
+
+fn copy_and_hash(
+    source: &mut fs::File,
+    output: &mut fs::File,
+    verifier: &mut StreamedOutputVerifier,
+    len: u64,
+) -> Result<u64> {
     let mut remaining = len;
+    let mut copied = 0u64;
     let mut buf = vec![0; COPY_BUFFER_BYTES];
     while remaining > 0 {
         let want = std::cmp::min(remaining as usize, buf.len());
@@ -6397,8 +6829,30 @@ fn copy_from_source(
         output.write_all(&buf[..n])?;
         verifier.update(&buf[..n]);
         remaining -= n as u64;
+        copied += n as u64;
     }
-    Ok(())
+    Ok(copied)
+}
+
+fn hash_file_range(
+    file: &mut fs::File,
+    verifier: &mut StreamedOutputVerifier,
+    len: u64,
+) -> Result<u64> {
+    let mut remaining = len;
+    let mut hashed = 0u64;
+    let mut buf = vec![0; COPY_BUFFER_BYTES];
+    while remaining > 0 {
+        let want = std::cmp::min(remaining as usize, buf.len());
+        let n = file.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        verifier.update(&buf[..n]);
+        remaining -= n as u64;
+        hashed += n as u64;
+    }
+    Ok(hashed)
 }
 
 #[allow(dead_code)]
@@ -9010,6 +9464,208 @@ mod tests {
         applier.finish().unwrap();
         assert_eq!(mode(&base.join("file.txt")), 0o400);
         assert_eq!(fs::metadata(base.join("file.txt")).unwrap().mtime(), 0);
+    }
+
+    fn run_test_streamed_delta(
+        old: &[u8],
+        expected: &[u8],
+        clone_backed: bool,
+        apply: impl FnOnce(&mut fs::File, &mut fs::File, &mut StreamedOutputVerifier, &mut u64, bool),
+    ) -> (Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("file.txt");
+        fs::write(&target, old).unwrap();
+        let mut source = fs::File::open(&target).unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let mut output = TempOutput::new(target.clone(), staging.shared()).unwrap();
+        if clone_backed {
+            output.file.as_mut().unwrap().write_all(old).unwrap();
+        }
+        let mut entry = test_file_entry("file.txt", expected);
+        entry.set_digest(Some(content_digest(expected)));
+        let mut verifier = StreamedOutputVerifier::new(&entry);
+        let mut output_position = 0;
+
+        apply(
+            &mut source,
+            output.file.as_mut().unwrap(),
+            &mut verifier,
+            &mut output_position,
+            clone_backed,
+        );
+        output
+            .file
+            .as_ref()
+            .unwrap()
+            .set_len(output_position)
+            .unwrap();
+        verifier.verify(&entry).unwrap();
+
+        (
+            fs::read(output.temp_path()).unwrap(),
+            fs::read(target).unwrap(),
+        )
+    }
+
+    #[test]
+    fn clone_backed_localized_replacement_remains_private() {
+        let old = b"abcDEFghi";
+        let expected = b"abcxyzghi";
+        let (staged, target) = run_test_streamed_delta(
+            old,
+            expected,
+            true,
+            |source, output, verifier, position, clone_backed| {
+                apply_diff_copy(source, output, verifier, position, clone_backed, 0, 3).unwrap();
+                apply_diff_bytes(output, verifier, position, b"xyz").unwrap();
+                apply_diff_copy(source, output, verifier, position, clone_backed, 6, 3).unwrap();
+            },
+        );
+
+        assert_eq!(staged, expected);
+        assert_eq!(target, old);
+    }
+
+    #[test]
+    fn clone_backed_delta_materializes_moved_copy_ranges() {
+        let (staged, target) = run_test_streamed_delta(
+            b"abcdef",
+            b"defabc",
+            true,
+            |source, output, verifier, position, clone_backed| {
+                apply_diff_copy(source, output, verifier, position, clone_backed, 3, 3).unwrap();
+                apply_diff_copy(source, output, verifier, position, clone_backed, 0, 3).unwrap();
+            },
+        );
+
+        assert_eq!(staged, b"defabc");
+        assert_eq!(target, b"abcdef");
+    }
+
+    #[test]
+    fn clone_backed_delta_grows_with_literal_bytes() {
+        let (staged, target) = run_test_streamed_delta(
+            b"abc",
+            b"abcdef",
+            true,
+            |source, output, verifier, position, clone_backed| {
+                apply_diff_copy(source, output, verifier, position, clone_backed, 0, 3).unwrap();
+                apply_diff_bytes(output, verifier, position, b"def").unwrap();
+            },
+        );
+
+        assert_eq!(staged, b"abcdef");
+        assert_eq!(target, b"abc");
+    }
+
+    #[test]
+    fn clone_backed_delta_truncates_after_shrink() {
+        let (staged, target) = run_test_streamed_delta(
+            b"abcdef",
+            b"abc",
+            true,
+            |source, output, verifier, position, clone_backed| {
+                apply_diff_copy(source, output, verifier, position, clone_backed, 0, 3).unwrap();
+            },
+        );
+
+        assert_eq!(staged, b"abc");
+        assert_eq!(target, b"abcdef");
+    }
+
+    #[test]
+    fn unsupported_clone_uses_byte_identical_materialized_delta() {
+        assert!(clone_error_is_unsupported(&io::Error::from_raw_os_error(
+            libc::EXDEV
+        )));
+        assert!(clone_error_is_unsupported(&io::Error::from_raw_os_error(
+            libc::EOPNOTSUPP
+        )));
+        assert!(!clone_error_is_unsupported(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!clone_error_is_unsupported(&io::Error::from_raw_os_error(
+            libc::EIO
+        )));
+        #[cfg(target_os = "linux")]
+        assert!(clone_error_is_unsupported(&io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
+
+        let (staged, target) = run_test_streamed_delta(
+            b"abcdef",
+            b"abXYZf",
+            false,
+            |source, output, verifier, position, clone_backed| {
+                apply_diff_copy(source, output, verifier, position, clone_backed, 0, 2).unwrap();
+                apply_diff_bytes(output, verifier, position, b"XYZ").unwrap();
+                apply_diff_copy(source, output, verifier, position, clone_backed, 5, 1).unwrap();
+            },
+        );
+
+        assert_eq!(staged, b"abXYZf");
+        assert_eq!(target, b"abcdef");
+    }
+
+    #[test]
+    fn platform_clone_creates_private_normalized_output_when_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source");
+        fs::write(&source_path, b"clone contents").unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o744)).unwrap();
+        let source = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&source_path)
+            .unwrap();
+
+        #[cfg(target_os = "macos")]
+        {
+            let name = std::ffi::CString::new("user.duet-clone-test").unwrap();
+            let value = b"source-only";
+            assert_eq!(
+                unsafe {
+                    libc::fsetxattr(
+                        source.as_raw_fd(),
+                        name.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                        0,
+                    )
+                },
+                0
+            );
+        }
+
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let (path, name, mut file) = match staging.shared.clone_output(&source).unwrap() {
+            CloneOutput::Unsupported => return,
+            CloneOutput::Cloned(path, name, file) => (path, name, file),
+        };
+
+        assert_eq!(fs::read(&path).unwrap(), b"clone contents");
+        assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(file.metadata().unwrap().uid(), unsafe { libc::geteuid() });
+        #[cfg(target_os = "macos")]
+        {
+            let names = macos_xattr_names(&file, &path).unwrap().collect::<Vec<_>>();
+            assert!(!names
+                .iter()
+                .any(|name| name.as_slice() == b"user.duet-clone-test"));
+            assert!(macos_acl_is_empty(&file, &path).unwrap());
+        }
+
+        file.seek(SeekFrom::Start(6)).unwrap();
+        file.write_all(b"COW").unwrap();
+        file.set_len(9).unwrap();
+        file.flush().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"clone COW");
+        assert_eq!(fs::read(&source_path).unwrap(), b"clone contents");
+        assert_eq!(fs::metadata(&source_path).unwrap().mode() & 0o7777, 0o744);
+
+        drop(file);
+        unlinkat(staging.shared.directory.as_raw_fd(), &name, 0).unwrap();
     }
 
     #[test]
