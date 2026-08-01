@@ -409,8 +409,10 @@ Duet has two detail/apply paths:
   `ChangeDetails`, and `apply_detailed_changes()` applies that vector.
 
 The staged streamed path is preferred when both sides advertise batched
-streaming and `staged-apply-v1`, and `sync::can_stream_details()` says the
-selected actions are supported. The orchestrator interleaves the two directions:
+streaming, `staged-apply-v1`, `staging-capacity-v1`, and
+`staging-reserve-enforcement-v1`, and `sync::can_stream_details()` says the
+selected actions are supported. Multiple waves additionally require
+`checkpointed-staging-v1`. The orchestrator interleaves the two directions:
 it reads remote detail batches and feeds the local preparer, then produces local
 detail batches and sends them to the remote preparer. Older peers and unsupported
 plans retain the legacy immediate-apply path.
@@ -437,6 +439,13 @@ creates one mode-0700 `.duet-stage-*` directory under the synchronization base,
 on the destination filesystem, and records its parent, component, and identity
 in the V2 recovery marker. Preparation does not create missing destination
 parents or otherwise mutate synchronized target paths.
+For a modified regular file, Duet first attempts a same-filesystem copy-on-write
+clone of the verified old destination (`fclonefileat` on macOS, `FICLONE` on
+Linux). It normalizes cloned ownership-related metadata, applies literals and
+moved ranges to the private clone, and leaves same-offset copied ranges shared.
+Unsupported cloning falls back to complete byte materialization. The resulting
+output follows the same digest verification, fsync, identity, and atomic
+publication path in either case.
 Each `TempOutput` uses a unique mode-0600 component inside the shared directory,
 then flushes, verifies the expected BLAKE2b-256 digest (or Adler only in legacy
 mode), and applies final metadata while the output remains hidden. Completed
@@ -469,15 +478,33 @@ with every setting clamped to at least one. The effective file cap is reduced
 further when `RLIMIT_NOFILE` minus 64 reserved descriptors is lower. A single
 file may exceed the byte limit, but it is isolated from other pending outputs.
 
-After all outputs have been sealed, both sides durably transition their V2 marker
-to `prepared`. The client validates both complete plans and every staged identity
-while both sides are still abortable, then atomically chooses cancellation or
-commit. Each commit validates again, durably transitions to `committing`, and only
-then begins target mutation. On successful commit it syncs affected directories,
-transitions to `committed`, saves both snapshots while both markers remain, and
-clears the exact-ID markers only after both saves succeed. A commit failure can
-still leave a partial multi-path result and keeps the recovery marker
-authoritative.
+The client partitions eligible plans into deterministic, path-sorted waves. A
+directory action and all active descendants stay in one dependency group so
+parent creation, reverse removal, and final directory metadata retain their
+ordering. Local and remote reconstructed byte weights are independent. An
+ordinary group must fit each host's wave budget; one oversized regular file may
+form an isolated wave, while a logical file larger than currently usable space is
+admitted only for a verified COW-capable modified-file output.
+
+Within each wave, all outputs are sealed before both sides durably transition
+their V2 marker to `prepared`. The client validates both wave plans and every
+staged identity while both sides are still abortable, then atomically chooses
+cancellation or commit. Each commit validates again, including a fresh reserve
+check, durably transitions to `committing`, and only then begins target mutation.
+On successful commit it syncs affected directories, transitions to `committed`,
+saves both canonical snapshots while both markers remain, and clears the exact-ID
+markers only after both saves succeed. The returned manifests become the baseline
+for the next wave. A commit failure can still leave a partial wave and keeps the
+recovery marker authoritative.
+
+Each host computes `usable = available - reserve` from `fstatvfs`; the default
+reserve is 5% of total filesystem capacity, and an optional staging limit further
+caps the per-wave target. Materialized writes consume block-rounded credit from a
+bounded 64 MiB monitoring window. Duet refreshes capacity after output fsync, after
+the stage-directory durability barrier, and immediately before the commit fence.
+Clone-backed same-offset ranges retain their logical output size but avoid new
+materialization charges and normally share physical blocks. Clone metadata and
+overwritten or moved/materialized ranges remain monitored.
 Any streamed apply error permanently poisons that `DetailApplier`; later frames,
 byte chunks, and finish requests fail closed rather than returning partial state.
 `WritableDirGuard` can temporarily add owner write permission to an already-synced
@@ -503,13 +530,13 @@ Important concurrent phases:
 - local and remote signatures are collected concurrently
 - non-streamed local and remote detailed changes are created concurrently
 - legacy non-streamed local and remote apply phases run concurrently
-- staged streaming interleaves remote-to-local and local-to-remote preparation
-  batches in one loop
+- each checkpointed staging wave interleaves remote-to-local and local-to-remote
+  preparation batches in one loop
 - each staged side syncs bounded batches of private output file handles through
   scoped blocking workers, then publishes all sealed outputs during commit
-- local and remote staged commits run concurrently after the bilateral prepared
+- local and remote staged commits run concurrently after each bilateral prepared
   barrier
-- local and remote snapshot saves run concurrently
+- local and remote snapshot saves run concurrently at every wave checkpoint
 
 Blocking filesystem work that can take time, such as signature generation,
 detail generation, apply operations, and local state save, is moved to
@@ -560,10 +587,12 @@ Permission handling is fail-fast. Scanner errors are propagated through
 and remote state save errors are reported, and apply operations return
 path-aware errors instead of panicking for expected filesystem failures.
 
-For staged peers, the first SIGINT before commit is a cancellation request checked
-between completed RPC/batch operations. It aborts private staging and leaves
-targets and snapshots unchanged. Once commit starts, cancellation is deferred
-through commit, state save, marker cleanup, RPC EOF, and child reaping. A second
+For staged peers, the first SIGINT before a wave commit is a cancellation request
+checked between completed RPC/batch operations. It aborts the current private
+staging and leaves that wave's targets and snapshots unchanged. Once commit
+starts, cancellation is deferred through that wave's state save and marker
+cleanup. After an intermediate checkpoint Duet exits interrupted before the next
+wave; after the final checkpoint a completed sync remains successful. A second
 SIGINT kills an isolated local server process group, if present, then forces an
 immediate exit and can leave recovery artifacts. Legacy peers move the
 non-cancellable boundary to immediately before their existing apply sequence.

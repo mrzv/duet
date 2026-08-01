@@ -86,13 +86,16 @@ helpers.
 
 ### 1. Prepare/Commit Protocol
 
-Peers advertising `staged-apply-v1` now use a prepare/commit protocol for plans
-supported by streamed details. Both sides reconstruct, verify, fsync, seal, and
-close every regular-file output in private side-local staging before either side
-mutates a synchronized target. Deletes, publications, directory/symlink changes,
-metadata changes, and ignored-path pruning are deferred to commit. After both
-sides report `prepared`, the client crosses one atomic cancellation/commit fence
-and starts both commits concurrently.
+Peers advertising `staged-apply-v1`, `staging-capacity-v1`, and
+`staging-reserve-enforcement-v1` now use a prepare/commit protocol for plans
+supported by streamed details; multiple waves additionally require
+`checkpointed-staging-v1`. Both sides reconstruct, verify, fsync, seal, and
+close every regular-file output in one dependency-safe wave before either side
+mutates that wave's synchronized targets. Deletes, publications,
+directory/symlink changes, metadata changes, and ignored-path pruning are deferred
+to commit. After both sides report `prepared`, the client crosses that wave's
+atomic cancellation/commit fence and starts both commits concurrently. Successful
+waves save both canonical snapshots and become clean restartable checkpoints.
 
 Implemented lifecycle:
 
@@ -109,21 +112,30 @@ Implemented lifecycle:
   identity-checks and removes private staging for precommit attempts. Commit or
   later phases remain manual recovery cases; after inspection and reconciliation,
   explicit clear removes their marker without treating them as precommit cleanup.
+- `capacity`: each host independently reserves 5% of its staging filesystem by
+  default, applies an optional CLI wave limit, rechecks space throughout prepare,
+  and reports native no-space/quota failures before commit where possible.
+- `COW modification`: supported filesystems clone the verified old regular file
+  into private staging and apply the delta there, reducing physical space to
+  changed blocks while retaining a complete verified publishable output.
 
-Ctrl+C is cooperative. The first interrupt before the commit fence aborts both
-prepared attempts and exits with code 6. Once commit starts, the first interrupt
-is deferred through commit, state save, coordinated marker cleanup, and server
-shutdown; a successful finalized sync exits 0. A second interrupt forces an
-immediate code-6 exit.
+Ctrl+C is cooperative. The first interrupt before a wave's commit fence aborts
+both prepared attempts and exits with code 6. Once an intermediate commit starts,
+the first interrupt is deferred through that checkpoint and then exits 6 before
+the next wave; a deferred interrupt on the final wave completes successfully. A
+second interrupt forces an immediate code-6 exit.
 
 Remaining work:
 
 - Extend staged transfer to plans that currently require the non-streamed legacy
   path, notably directory-to-nondirectory conversions, and eventually retire the
   immediate-apply compatibility engine.
-- Consider bounded staging or resumable prepare checkpoints. The current protocol
-  may temporarily require space for the complete new contents of every changed
-  regular file, including reconstructed delta outputs.
+- Extend checkpointed staging to migration and directory-to-nondirectory plans,
+  which currently retain legacy fallback unless explicit staging controls require
+  an enforceable staged plan.
+- Improve physical-space prediction for filesystems with compression, quotas, or
+  COW amplification; `statvfs` plus native ENOSPC/EDQUOT remains advisory against
+  concurrent external writers.
 - Persist enough committed-operation metadata to resume automatically after a
   crash. The current marker records completed side-local action summaries, but it
   does not yet support automatic replay/rollback.

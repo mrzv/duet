@@ -21,6 +21,10 @@ FLAGS:
     -n, --dry-run       check what sync would do without applying changes
         --debug-info    print protocol and capability negotiation details
         --prune-ignored delete ignored files/directories that block removing a synced parent
+        --staging-limit <size>
+                         target maximum reconstructed bytes per staging wave
+        --staging-reserve <size|percent>
+                         preserve free space on each staging filesystem; defaults to 5%
         --profile-performance
                          print sync phase timings and transfer counters
         --profile-performance-json <file>
@@ -54,8 +58,9 @@ ARGS:
 
 DRY RUN:
     --dry-run checks what sync would do, reports directory removal blockers on
-    both sides, validates preflight checks, and exits without applying changes
-    or saving state.
+    both sides, reports the staging wave and capacity plan when supported by the
+    peer, validates preflight checks, and exits without applying changes or
+    saving state.
 
 ```
 
@@ -125,6 +130,33 @@ silently skipping unreadable or unwritable paths, because skipping a path can be
 mistaken for a deletion or a legitimate update. Fix the reported permission
 problem and rerun the sync.
 
+## Staging Capacity
+
+Supported peers prepare changes in dependency-safe bilateral waves. Each wave is
+fully prepared and validated on both sides, committed, and saved as a canonical
+checkpoint before the next wave starts. This bounds private staging without
+making the complete invocation atomic: if a later wave is interrupted or fails,
+earlier checkpoints remain synchronized and a normal rerun discovers the
+remaining changes.
+
+`--staging-limit` sets the target reconstructed bytes in one wave on each host.
+One regular file larger than that target is isolated in its own wave, but it may
+never consume the configured reserve. `--staging-reserve` accepts a byte size or
+percentage of total filesystem capacity and defaults to 5% independently on
+each host. Duet checks capacity before every wave, monitors materialized writes,
+and refreshes free space after output durability barriers and immediately before
+commit. A no-space or quota error during preparation aborts the current wave
+without changing synchronized targets. A concurrent writer can race the final
+check, and a later commit or state-save failure can leave a recovery marker and a
+partially applied wave.
+
+For modified regular files, Duet uses APFS clones on macOS or reflinks on Linux
+when supported, applies the delta to the private clone, and publishes it
+atomically. This can make physical staging proportional to changed blocks rather
+than full logical file size. Additions and clone-unavailable modifications still
+require materialized staging. Explicit staging controls require a peer that can
+enforce them; default settings retain legacy fallback for older peers.
+
 ## Caveat
 
 Duet uses [openssh](https://docs.rs/openssh/) crate, which only supports
@@ -164,11 +196,13 @@ duet my_profile .
 
 ## Recovery
 
-For peers supporting staged apply, the first Ctrl+C before commit safely removes
-private staging and exits with code 6 without changing synchronized targets. If
-commit has started, Duet finishes commit, saves both states, removes both markers,
-and exits successfully. Press Ctrl+C a second time to force an immediate code-6
-exit; this can leave recovery markers or staging behind.
+For peers supporting staged apply, the first Ctrl+C before a wave's commit safely
+removes that wave's private staging and exits with code 6 without changing its
+targets. If an intermediate wave commit has started, Duet finishes and saves that
+checkpoint, then exits with code 6 before the next wave. An interrupt after the
+final commit fence is deferred through finalization and a successful completed
+sync exits normally. Press Ctrl+C a second time to force an immediate code-6 exit;
+this can leave recovery markers or staging behind.
 
 If Duet stops after applying filesystem changes but before saving state, it
 leaves an apply recovery marker next to the affected state file and blocks the

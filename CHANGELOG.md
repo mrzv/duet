@@ -6,12 +6,17 @@
 - Added the `staged-apply-v1` capability and append-only RPC methods for bilateral prepare, validation, commit, state save, and exact-attempt completion.
 - Added V2 apply recovery markers with durable prepare/commit phases and identity-checked, retry-safe cleanup of abandoned precommit staging.
 - Added subprocess SIGINT coverage for cancellation at the prepared barrier and deferred interruption after staged commit completes.
+- Added `--staging-limit` and `--staging-reserve`, with a 5% per-filesystem default reserve, dry-run wave reporting, and staging capacity counters in human and JSON performance profiles.
+- Added checkpointed bilateral staging waves so plans larger than one wave save clean canonical checkpoints before continuing.
+- Added prepare-time APFS clone and Linux reflink support for modified regular files, preserving atomic publication while reducing physical staging to changed blocks where supported.
 
 ### Changed
-- Changed supported streamed synchronization to reconstruct, verify, fsync, and seal every regular-file output before either side mutates synchronized targets, then validate both plans before crossing a shared commit fence.
+- Changed supported streamed synchronization to reconstruct, verify, fsync, and seal every regular-file output in the current wave before either side mutates that wave's synchronized targets, then validate both plans before crossing a shared commit fence.
 - Made the first Ctrl+C cooperatively abort before commit or defer through commit, state save, marker cleanup, and server shutdown after the fence; a second Ctrl+C still forces an immediate code-6 exit.
 - Kept legacy peers compatible by retaining their existing apply paths with an earlier non-cancellable boundary.
 - Switched SSH command execution to native multiplexing with a non-persistent control master and explicitly wait for local and remote server children during graceful shutdown.
+- Changed Ctrl+C during an intermediate committed wave to finish that checkpoint and stop before the next wave; a deferred final-wave interrupt still finishes successfully.
+- Enforced host-local staging reserves during materialized writes, after durability barriers, and immediately before commit, while retaining default legacy fallback for peers that cannot negotiate the policy.
 
 ### Fixed
 - Fixed Ctrl+C only terminating the signal-handler thread while synchronization continued in the background.
@@ -20,6 +25,7 @@
 - Corrected commit and state-save recovery guidance to require tree and snapshot reconciliation instead of rerunning against stale state.
 - Batched staged-output recovery-record durability at sealed-output boundaries instead of syncing and reparsing the growing marker for every file, avoiding a severe many-small-file performance regression.
 - Verified streamed output incrementally while writing full-file and delta data, avoiding an extra complete staged-file read while retaining commit-time validation.
+- Classified native no-space and quota errors explicitly and kept reserve failures in the abortable precommit path.
 
 ## 0.9.0 - 2026-07-28
 

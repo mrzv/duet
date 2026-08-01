@@ -68,6 +68,18 @@ impl PerformanceProfile {
             "  signatures: local={}, remote={}",
             self.counters.local_signatures, self.counters.remote_signatures
         );
+        if let Some(staging) = &self.counters.staging {
+            println!(
+                "  staging: waves={}, local-total={} / {} per-wave budget ({} reserve), remote-total={} / {} per-wave budget ({} reserve)",
+                staging.wave_count,
+                indicatif::HumanBytes(staging.local_reconstructed_bytes),
+                indicatif::HumanBytes(staging.local_budget_bytes),
+                indicatif::HumanBytes(staging.local_reserve_bytes),
+                indicatif::HumanBytes(staging.remote_reconstructed_bytes),
+                indicatif::HumanBytes(staging.remote_budget_bytes),
+                indicatif::HumanBytes(staging.remote_reserve_bytes),
+            );
+        }
         if self.counters.streamed_details {
             print_transfer("remote->local", &self.counters.streaming.remote_to_local);
             print_transfer("local->remote", &self.counters.streaming.local_to_remote);
@@ -106,8 +118,28 @@ pub struct ProfileCounters {
     pub identical_actions: usize,
     pub local_signatures: usize,
     pub remote_signatures: usize,
+    pub staging: Option<StagingProfile>,
     pub streamed_details: bool,
     pub streaming: StreamingProfile,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct StagingProfile {
+    pub wave_count: usize,
+    pub local_reconstructed_bytes: u64,
+    pub remote_reconstructed_bytes: u64,
+    pub local_staged_regular_outputs: usize,
+    pub remote_staged_regular_outputs: usize,
+    pub local_budget_bytes: u64,
+    pub remote_budget_bytes: u64,
+    pub local_usable_bytes: u64,
+    pub remote_usable_bytes: u64,
+    pub local_reserve_bytes: u64,
+    pub remote_reserve_bytes: u64,
+    pub local_cow_clone_supported: bool,
+    pub remote_cow_clone_supported: bool,
+    pub local_cow_oversize_waves: usize,
+    pub remote_cow_oversize_waves: usize,
 }
 
 #[derive(Debug, Default, Serialize)]

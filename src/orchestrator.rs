@@ -13,7 +13,9 @@ use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder};
 
 use crate::actions::{num_identical, num_unresolved_conflicts, reverse, Action, Actions};
 use crate::cli::SyncOptions;
-use crate::performance::{duration_ms, DetailTransferStats, PerformanceProfile, StreamingProfile};
+use crate::performance::{
+    duration_ms, DetailTransferStats, PerformanceProfile, StagingProfile, StreamingProfile,
+};
 use crate::profile::{self, ProfileSource};
 use crate::progress;
 use crate::remote;
@@ -564,6 +566,31 @@ pub async fn sync(
                     apply_strategy = ApplyStrategy::LegacyStream;
                     None
                 } else {
+                    performance.counters.staging = Some(StagingProfile {
+                        wave_count: plan.waves.len(),
+                        local_reconstructed_bytes: plan.local_reconstructed_bytes,
+                        remote_reconstructed_bytes: plan.remote_reconstructed_bytes,
+                        local_staged_regular_outputs: plan.local_staged_regular_outputs,
+                        remote_staged_regular_outputs: plan.remote_staged_regular_outputs,
+                        local_budget_bytes: local_budget.budget_bytes,
+                        remote_budget_bytes: remote_budget.budget_bytes,
+                        local_usable_bytes: local_budget.usable_bytes,
+                        remote_usable_bytes: remote_budget.usable_bytes,
+                        local_reserve_bytes: local_budget.reserve_bytes,
+                        remote_reserve_bytes: remote_budget.reserve_bytes,
+                        local_cow_clone_supported: local_budget.cow_clone_supported,
+                        remote_cow_clone_supported: remote_budget.cow_clone_supported,
+                        local_cow_oversize_waves: plan
+                            .waves
+                            .iter()
+                            .filter(|wave| wave.local_requires_cow_capacity)
+                            .count(),
+                        remote_cow_oversize_waves: plan
+                            .waves
+                            .iter()
+                            .filter(|wave| wave.remote_requires_cow_capacity)
+                            .count(),
+                    });
                     if options.dry_run {
                         print_staging_plan_summary(&plan, local_budget, remote_budget);
                     }

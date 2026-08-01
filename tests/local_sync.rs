@@ -149,8 +149,27 @@ fn checkpointed_staging_runs_multiple_bidirectional_waves() {
     write_bytes(&case.local.join("c-local.bin"), &local_c);
     write_bytes(&case.remote.join("b-remote.bin"), &remote_b);
     write_bytes(&case.remote.join("d-remote.bin"), &remote_d);
+    let profile_json = case.local.parent().unwrap().join("wave-performance.json");
 
-    assert_success(case.sync_with_args(&["--staging-limit", "4KiB", "--staging-reserve", "0%"]));
+    assert_success(case.sync_with_args(&[
+        "--staging-limit",
+        "4KiB",
+        "--staging-reserve",
+        "0%",
+        "--profile-performance-json",
+        profile_json.to_str().unwrap(),
+    ]));
+
+    let profile: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&profile_json).unwrap()).unwrap();
+    let staging = &profile["counters"]["staging"];
+    assert_eq!(staging["wave_count"], 2);
+    assert_eq!(staging["local_reconstructed_bytes"], 6 * 1024);
+    assert_eq!(staging["remote_reconstructed_bytes"], 6 * 1024);
+    assert_eq!(staging["local_staged_regular_outputs"], 2);
+    assert_eq!(staging["remote_staged_regular_outputs"], 2);
+    assert_eq!(staging["local_budget_bytes"], 4 * 1024);
+    assert_eq!(staging["remote_budget_bytes"], 4 * 1024);
 
     for (name, expected) in [
         ("a-local.bin", &local_a),
@@ -498,18 +517,25 @@ fn performance_profile_reports_human_and_json_output() {
     assert!(stdout.contains("local_scan"), "{}", stdout);
     assert!(stdout.contains("remote_scan_rpc"), "{}", stdout);
     assert!(stdout.contains("signatures:"), "{}", stdout);
+    assert!(stdout.contains("staging: waves="), "{}", stdout);
     assert!(stdout.contains("stream remote->local"), "{}", stdout);
     assert!(stdout.contains("stream local->remote"), "{}", stdout);
     assert!(stdout.contains("remote server stream:"), "{}", stdout);
 
     let json = fs::read_to_string(profile_json).unwrap();
-    assert!(json.contains("\"total_ms\""), "{}", json);
-    assert!(json.contains("\"phases\""), "{}", json);
-    assert!(json.contains("\"sync_tuning\""), "{}", json);
-    assert!(json.contains("\"streamed_details\": true"), "{}", json);
-    assert!(json.contains("\"local_to_remote\""), "{}", json);
-    assert!(json.contains("\"remote_server\""), "{}", json);
-    assert!(json.contains("\"apply_frames_ms\""), "{}", json);
+    let profile: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(profile["total_ms"].is_u64());
+    assert!(profile["phases"].is_array());
+    assert!(profile["sync_tuning"].is_object());
+    let counters = &profile["counters"];
+    assert_eq!(counters["streamed_details"], true);
+    assert_eq!(counters["staging"]["wave_count"], 1);
+    assert_eq!(counters["staging"]["local_staged_regular_outputs"], 0);
+    assert_eq!(counters["staging"]["remote_staged_regular_outputs"], 1);
+    assert!(counters["staging"]["remote_budget_bytes"].as_u64().unwrap() > 0);
+    assert!(counters["streaming"]["local_to_remote"].is_object());
+    assert!(counters["streaming"]["remote_server"].is_object());
+    assert!(counters["streaming"]["remote_server"]["apply_frames_ms"].is_u64());
     assert_eq!(read(&case.remote.join("a.txt")), "from local");
 }
 
