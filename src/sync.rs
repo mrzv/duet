@@ -82,6 +82,7 @@ pub struct StagingBudget {
     pub reserve_bytes: u64,
     pub usable_bytes: u64,
     pub budget_bytes: u64,
+    pub cow_clone_supported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +95,8 @@ pub struct StagingWave {
     pub remote_staged_regular_outputs: usize,
     pub local_exceeds_budget: bool,
     pub remote_exceeds_budget: bool,
+    pub local_requires_cow_capacity: bool,
+    pub remote_requires_cow_capacity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +117,10 @@ struct StagingDependencyGroup {
     remote_reconstructed_bytes: u64,
     local_staged_regular_outputs: usize,
     remote_staged_regular_outputs: usize,
+    local_cow_candidate_outputs: usize,
+    remote_cow_candidate_outputs: usize,
+    local_requires_cow_capacity: bool,
+    remote_requires_cow_capacity: bool,
     isolated: bool,
 }
 
@@ -288,6 +295,10 @@ fn staging_dependency_group(
         remote_reconstructed_bytes: 0,
         local_staged_regular_outputs: 0,
         remote_staged_regular_outputs: 0,
+        local_cow_candidate_outputs: 0,
+        remote_cow_candidate_outputs: 0,
+        local_requires_cow_capacity: false,
+        remote_requires_cow_capacity: false,
         isolated: false,
     };
     for action in &actions[start..end] {
@@ -299,7 +310,8 @@ fn staging_dependency_group(
             Action::Identical(_, _) => (None, action_change(action)),
             Action::Conflict(_, _) => unreachable!("unresolved conflicts were rejected"),
         };
-        if local.is_none() || apply_detail_kind_for_change(change).is_none() {
+        let detail_kind = apply_detail_kind_for_change(change);
+        if local.is_none() || detail_kind.is_none() {
             continue;
         }
         // Diff staging is planned pessimistically at the full reconstructed logical size.
@@ -314,6 +326,9 @@ fn staging_dependency_group(
                 .local_staged_regular_outputs
                 .checked_add(1)
                 .ok_or_else(|| eyre!("staging wave local group output count overflow"))?;
+            if detail_kind == Some(ApplyDetailKind::Diff) {
+                group.local_cow_candidate_outputs += 1;
+            }
         } else {
             group.remote_reconstructed_bytes = checked_staging_add(
                 group.remote_reconstructed_bytes,
@@ -324,22 +339,32 @@ fn staging_dependency_group(
                 .remote_staged_regular_outputs
                 .checked_add(1)
                 .ok_or_else(|| eyre!("staging wave remote group output count overflow"))?;
+            if detail_kind == Some(ApplyDetailKind::Diff) {
+                group.remote_cow_candidate_outputs += 1;
+            }
         }
     }
-    group.isolated |= validate_staging_group_side(
+    let (local_isolated, local_requires_cow_capacity) = validate_staging_group_side(
         "local",
         group.local_reconstructed_bytes,
         group.local_staged_regular_outputs,
+        group.local_cow_candidate_outputs == 1,
+        local_budget.cow_clone_supported,
         local_budget,
         actions[start].path(),
     )?;
-    group.isolated |= validate_staging_group_side(
+    let (remote_isolated, remote_requires_cow_capacity) = validate_staging_group_side(
         "remote",
         group.remote_reconstructed_bytes,
         group.remote_staged_regular_outputs,
+        group.remote_cow_candidate_outputs == 1,
+        remote_budget.cow_clone_supported,
         remote_budget,
         actions[start].path(),
     )?;
+    group.isolated |= local_isolated || remote_isolated;
+    group.local_requires_cow_capacity = local_requires_cow_capacity;
+    group.remote_requires_cow_capacity = remote_requires_cow_capacity;
     Ok(group)
 }
 
@@ -347,19 +372,24 @@ fn validate_staging_group_side(
     side: &str,
     required: u64,
     outputs: usize,
+    single_cow_candidate: bool,
+    cow_clone_supported: bool,
     budget: StagingBudget,
     path: &Path,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     if required > budget.usable_bytes {
+        if outputs == 1 && single_cow_candidate && cow_clone_supported {
+            return Ok((true, true));
+        }
         return Err(eyre!(
-            "{side} staging dependency group at {} requires {required} bytes, but only {} bytes are usable after reserving {} bytes",
+            "{side} staging dependency group at {} requires {required} logical bytes, but only {} bytes are usable after reserving {} bytes; only an isolated single COW diff may rely on prepare-time physical-space monitoring",
             path.display(),
             budget.usable_bytes,
             budget.reserve_bytes
         ));
     }
     if required <= budget.budget_bytes {
-        return Ok(false);
+        return Ok((false, false));
     }
     if outputs != 1 {
         return Err(eyre!(
@@ -368,7 +398,7 @@ fn validate_staging_group_side(
             budget.budget_bytes
         ));
     }
-    Ok(true)
+    Ok((true, false))
 }
 
 fn staging_wave_from_group(
@@ -384,6 +414,8 @@ fn staging_wave_from_group(
         remote_staged_regular_outputs: group.remote_staged_regular_outputs,
         local_exceeds_budget: group.local_reconstructed_bytes > local_budget.budget_bytes,
         remote_exceeds_budget: group.remote_reconstructed_bytes > remote_budget.budget_bytes,
+        local_requires_cow_capacity: group.local_requires_cow_capacity,
+        remote_requires_cow_capacity: group.remote_requires_cow_capacity,
     }
 }
 
@@ -410,8 +442,126 @@ impl StagingPolicy {
             reserve_bytes,
             usable_bytes,
             budget_bytes,
+            cow_clone_supported: filesystem.cow_clone_supported,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StagingWriteCapacity {
+    reserve_bytes: u64,
+    required_bytes: u64,
+    available_above_reserve: u64,
+}
+
+const STAGING_CAPACITY_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+
+fn staging_write_capacity(
+    policy: StagingPolicy,
+    filesystem: StagingFilesystemInfo,
+    requested_bytes: u64,
+) -> StagingWriteCapacity {
+    let block_size = filesystem.block_size.max(1);
+    let rounded_bytes = requested_bytes
+        .checked_add(block_size - 1)
+        .map(|bytes| bytes / block_size)
+        .and_then(|blocks| blocks.checked_mul(block_size))
+        .unwrap_or(u64::MAX);
+    let required_bytes = rounded_bytes.saturating_add(block_size);
+    let reserve_bytes = policy.budget(filesystem).reserve_bytes;
+    StagingWriteCapacity {
+        reserve_bytes,
+        required_bytes,
+        available_above_reserve: filesystem.available_bytes.saturating_sub(reserve_bytes),
+    }
+}
+
+#[derive(Clone)]
+struct StagingSpaceMonitor {
+    base: PathBuf,
+    policy: StagingPolicy,
+    state: Arc<Mutex<StagingSpaceMonitorState>>,
+}
+
+#[derive(Default)]
+struct StagingSpaceMonitorState {
+    block_size: u64,
+    remaining_credit: u64,
+}
+
+impl StagingSpaceMonitor {
+    fn check(&self, path: &Path, requested_bytes: u64) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| eyre!("staging capacity monitor lock was poisoned"))?;
+        if state.block_size != 0 {
+            let charged_bytes = round_staging_charge(requested_bytes, state.block_size);
+            if charged_bytes <= state.remaining_credit {
+                state.remaining_credit -= charged_bytes;
+                return Ok(());
+            }
+        }
+
+        self.refresh_locked(path, requested_bytes, &mut state)
+    }
+
+    fn recheck(&self, path: &Path) -> Result<()> {
+        let filesystem = staging_filesystem_info(&self.base)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| eyre!("staging capacity monitor lock was poisoned"))?;
+        self.refresh_with_filesystem_locked(path, 0, filesystem, &mut state)
+    }
+
+    fn refresh_locked(
+        &self,
+        path: &Path,
+        requested_bytes: u64,
+        state: &mut StagingSpaceMonitorState,
+    ) -> Result<()> {
+        let filesystem = staging_filesystem_info(&self.base)?;
+        self.refresh_with_filesystem_locked(path, requested_bytes, filesystem, state)
+    }
+
+    fn refresh_with_filesystem_locked(
+        &self,
+        path: &Path,
+        requested_bytes: u64,
+        filesystem: StagingFilesystemInfo,
+        state: &mut StagingSpaceMonitorState,
+    ) -> Result<()> {
+        let block_size = filesystem.block_size.max(1);
+        let charged_bytes = round_staging_charge(requested_bytes, block_size);
+        let capacity = staging_write_capacity(self.policy, filesystem, requested_bytes);
+        if capacity.required_bytes > capacity.available_above_reserve {
+            return Err(eyre!(
+                "staged preparation for {} was aborted before commit: requested {} bytes requires {} bytes with block rounding and safety allowance, but {} bytes are available and {} bytes are reserved",
+                path.display(),
+                requested_bytes,
+                capacity.required_bytes,
+                filesystem.available_bytes,
+                capacity.reserve_bytes
+            ));
+        }
+        let spendable = capacity.available_above_reserve.saturating_sub(block_size);
+        let window = STAGING_CAPACITY_WINDOW_BYTES.max(charged_bytes);
+        state.block_size = block_size;
+        state.remaining_credit = spendable.min(window).saturating_sub(charged_bytes);
+        // statvfs is authoritative for policy enforcement at this instant, but a concurrent
+        // writer can still consume space before the write. Native ENOSPC remains precommit.
+        Ok(())
+    }
+}
+
+fn round_staging_charge(requested_bytes: u64, block_size: u64) -> u64 {
+    requested_bytes
+        .checked_add(block_size - 1)
+        .map(|bytes| bytes / block_size)
+        .and_then(|blocks| blocks.checked_mul(block_size))
+        .unwrap_or(u64::MAX)
+        .max(block_size)
 }
 
 pub fn staging_filesystem_info(base: &Path) -> Result<StagingFilesystemInfo> {
@@ -434,6 +584,22 @@ pub fn staging_filesystem_info(base: &Path) -> Result<StagingFilesystemInfo> {
         stats.f_bsize as u64,
         base,
     )
+}
+
+pub fn staging_filesystem_info_with_clone_probe(base: &Path) -> Result<StagingFilesystemInfo> {
+    let mut info = staging_filesystem_info(base)?;
+    info.cow_clone_supported = match probe_cow_clone(base) {
+        Ok(supported) => supported,
+        Err(error) => {
+            log::debug!(
+                "copy-on-write staging probe failed for {}: {:#}",
+                base.display(),
+                error
+            );
+            false
+        }
+    };
+    Ok(info)
 }
 
 fn staging_filesystem_info_from_counts(
@@ -6037,6 +6203,23 @@ impl Drop for TempOutput {
     }
 }
 
+fn probe_cow_clone(base: &Path) -> Result<bool> {
+    let staging = StagingArea::new(base)?;
+    let shared = staging.shared();
+    let source_path = base.join(".duet-cow-probe-source");
+    let mut source = TempOutput::new(source_path, Arc::clone(&shared))?;
+    let source_file = source
+        .file
+        .as_mut()
+        .ok_or_else(|| eyre!("COW probe source is closed"))?;
+    source_file.write_all(&[0])?;
+    source_file.sync_all()?;
+
+    let clone_path = base.join(".duet-cow-probe-clone");
+    let cloned = TempOutput::clone_from(clone_path, shared, source_file)?;
+    Ok(cloned.is_some())
+}
+
 struct ApplyRecorder {
     state_path: Option<PathBuf>,
     marker_path: Option<PathBuf>,
@@ -6276,6 +6459,7 @@ pub struct DetailApplier {
     prepared_outputs: Vec<Option<PreparedOutput>>,
     // Drop pending outputs before removing their shared staging directory.
     staging: Option<StagingArea>,
+    staging_space_monitor: Option<StagingSpaceMonitor>,
     failed: Option<String>,
 }
 
@@ -6331,6 +6515,34 @@ impl DetailApplier {
         applier
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_capacity_aware_staged_with_attempt_and_policy(
+        base: PathBuf,
+        actions: Vec<Action>,
+        all_old: Vec<Entry>,
+        attempt_state: PathBuf,
+        attempt_id: String,
+        scan_policy: Option<ScanPolicy>,
+        apply_options: ApplyOptions,
+        staging_policy: StagingPolicy,
+    ) -> Self {
+        let mut applier = Self::new_with_attempt_and_policy(
+            base.clone(),
+            actions,
+            all_old,
+            Some(attempt_state),
+            scan_policy,
+            apply_options,
+        );
+        applier.attempt_id = Some(attempt_id);
+        applier.staging_space_monitor = Some(StagingSpaceMonitor {
+            base,
+            policy: staging_policy,
+            state: Arc::new(Mutex::new(StagingSpaceMonitorState::default())),
+        });
+        applier
+    }
+
     pub fn new_with_attempt_and_policy(
         base: PathBuf,
         actions: Vec<Action>,
@@ -6355,6 +6567,7 @@ impl DetailApplier {
             new_entries: Vec::new(),
             state: None,
             staging: None,
+            staging_space_monitor: None,
             output_batch: FilePublicationBatch::new(),
             prepared_outputs,
             failed: None,
@@ -6381,6 +6594,7 @@ impl DetailApplier {
             ));
         }
 
+        let staging_space_monitor = self.staging_space_monitor.clone();
         match &mut self.state {
             Some(ApplyState::File {
                 action_index,
@@ -6396,6 +6610,9 @@ impl DetailApplier {
                 }
                 match frame.payload {
                     DetailPayload::FileBytes(bytes) => {
+                        if let Some(monitor) = &staging_space_monitor {
+                            monitor.check(&output.final_path, bytes.len() as u64)?;
+                        }
                         output
                             .file
                             .as_mut()
@@ -6425,6 +6642,11 @@ impl DetailApplier {
                 }
                 match frame.payload {
                     DetailPayload::DiffCopy { offset, len } => {
+                        if !(*clone_backed && offset == *output_position) {
+                            if let Some(monitor) = &staging_space_monitor {
+                                monitor.check(&output.final_path, len)?;
+                            }
+                        }
                         let output_file = output
                             .file
                             .as_mut()
@@ -6440,6 +6662,9 @@ impl DetailApplier {
                         )?;
                     }
                     DetailPayload::DiffBytes(bytes) => {
+                        if let Some(monitor) = &staging_space_monitor {
+                            monitor.check(&output.final_path, bytes.len() as u64)?;
+                        }
                         let output_file = output
                             .file
                             .as_mut()
@@ -6515,6 +6740,9 @@ impl DetailApplier {
         self.seal_outputs()?;
         if let Some(staging) = &self.staging {
             staging.seal()?;
+        }
+        if let Some(monitor) = &self.staging_space_monitor {
+            monitor.recheck(&self.base)?;
         }
         validate_actions(&self.actions)?;
         if let (Some(state_path), Some(attempt_id)) =
@@ -6778,6 +7006,9 @@ impl DetailApplier {
         final_path: PathBuf,
         source: &fs::File,
     ) -> Result<(TempOutput, bool)> {
+        if let Some(monitor) = &self.staging_space_monitor {
+            monitor.check(&final_path, 0)?;
+        }
         self.ensure_staging()?;
         let staging = self
             .staging
@@ -6794,6 +7025,9 @@ impl DetailApplier {
     }
 
     fn new_output(&mut self, final_path: PathBuf) -> Result<TempOutput> {
+        if let Some(monitor) = &self.staging_space_monitor {
+            monitor.check(&final_path, 0)?;
+        }
         self.ensure_staging()?;
         let output = TempOutput::new(
             final_path,
@@ -6889,7 +7123,11 @@ impl DetailApplier {
             self.attempt_state
                 .as_deref()
                 .zip(self.attempt_id.as_deref()),
-        )
+        )?;
+        if let Some(monitor) = &self.staging_space_monitor {
+            monitor.recheck(&self.base)?;
+        }
+        Ok(())
     }
 
     fn publish_prepared_output(&mut self, action_index: usize) -> Result<()> {
@@ -7050,6 +7288,9 @@ impl PreparedApply {
                     verify_current_matches_entry(&path, old, "staged commit target")?;
                 }
             }
+        }
+        if let Some(monitor) = &self.inner.staging_space_monitor {
+            monitor.recheck(&self.inner.base)?;
         }
         Ok(())
     }
@@ -8143,6 +8384,7 @@ mod tests {
                 reserve_bytes: 50,
                 usable_bytes: 750,
                 budget_bytes: 750,
+                cow_clone_supported: false,
             }
         );
         assert_eq!(
@@ -8155,6 +8397,7 @@ mod tests {
                 reserve_bytes: 300,
                 usable_bytes: 700,
                 budget_bytes: 200,
+                cow_clone_supported: false,
             }
         );
     }
@@ -8171,6 +8414,7 @@ mod tests {
                 reserve_bytes: u64::MAX,
                 usable_bytes: 0,
                 budget_bytes: 0,
+                cow_clone_supported: false,
             }
         );
         assert_eq!(
@@ -8183,7 +8427,86 @@ mod tests {
                 reserve_bytes: 18_444_899_399_302_180_659,
                 usable_bytes: 1_844_674_407_370_956,
                 budget_bytes: 1_844_674_407_370_956,
+                cow_clone_supported: false,
             }
+        );
+    }
+
+    #[test]
+    fn staging_write_capacity_rounds_and_preserves_exact_boundary() {
+        let policy = StagingPolicy {
+            limit_bytes: None,
+            reserve: StagingReserve::Bytes(4_096),
+        };
+        let exact = staging_write_capacity(policy, filesystem_info(40_000, 12_288), 4_096);
+        assert_eq!(exact.reserve_bytes, 4_096);
+        assert_eq!(exact.required_bytes, 8_192);
+        assert_eq!(exact.available_above_reserve, exact.required_bytes);
+
+        let rounded = staging_write_capacity(policy, filesystem_info(40_000, 12_289), 4_097);
+        assert_eq!(rounded.required_bytes, 12_288);
+        assert_eq!(rounded.available_above_reserve, 8_193);
+    }
+
+    #[test]
+    fn staging_write_capacity_handles_reserve_exhaustion_and_overflow() {
+        let exhausted = staging_write_capacity(
+            StagingPolicy {
+                limit_bytes: None,
+                reserve: StagingReserve::Bytes(10_000),
+            },
+            filesystem_info(20_000, 9_999),
+            0,
+        );
+        assert_eq!(exhausted.available_above_reserve, 0);
+        assert_eq!(exhausted.required_bytes, 4_096);
+
+        let overflow = staging_write_capacity(
+            StagingPolicy {
+                limit_bytes: None,
+                reserve: StagingReserve::Bytes(0),
+            },
+            filesystem_info(u64::MAX, u64::MAX),
+            u64::MAX,
+        );
+        assert_eq!(overflow.required_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn staging_monitor_reserves_metadata_headroom_and_bounds_credit() {
+        let monitor = StagingSpaceMonitor {
+            base: PathBuf::from("unused"),
+            policy: StagingPolicy {
+                limit_bytes: None,
+                reserve: StagingReserve::Bytes(4_096),
+            },
+            state: Arc::new(Mutex::new(StagingSpaceMonitorState::default())),
+        };
+        let path = Path::new("output");
+        let mut state = StagingSpaceMonitorState::default();
+
+        monitor
+            .refresh_with_filesystem_locked(path, 0, filesystem_info(100_000, 12_288), &mut state)
+            .unwrap();
+        assert_eq!(state.block_size, 4_096);
+        assert_eq!(state.remaining_credit, 0);
+
+        let error = monitor
+            .refresh_with_filesystem_locked(path, 0, filesystem_info(100_000, 8_191), &mut state)
+            .unwrap_err();
+        assert!(error.to_string().contains("aborted before commit"));
+
+        monitor
+            .refresh_with_filesystem_locked(
+                path,
+                1,
+                filesystem_info(200_000_000, 100_000_000),
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            state.remaining_credit,
+            STAGING_CAPACITY_WINDOW_BYTES - 4_096
         );
     }
 
@@ -8192,6 +8515,14 @@ mod tests {
             reserve_bytes: 7,
             usable_bytes: usable,
             budget_bytes: target,
+            cow_clone_supported: true,
+        }
+    }
+
+    fn staging_budget_without_cow(target: u64, usable: u64) -> StagingBudget {
+        StagingBudget {
+            cow_clone_supported: false,
+            ..staging_budget(target, usable)
         }
     }
 
@@ -8209,6 +8540,20 @@ mod tests {
             size,
             size as u32,
         )))
+    }
+
+    fn local_modified_file(path: &str, size: u64) -> Action {
+        Action::Local(Change::Modified(
+            Entry::test_file_with_size(PathBuf::from(path), size.saturating_sub(1), 1),
+            Entry::test_file_with_size(PathBuf::from(path), size, 2),
+        ))
+    }
+
+    fn remote_modified_file(path: &str, size: u64) -> Action {
+        Action::Remote(Change::Modified(
+            Entry::test_file_with_size(PathBuf::from(path), size.saturating_sub(1), 1),
+            Entry::test_file_with_size(PathBuf::from(path), size, 2),
+        ))
     }
 
     fn removed_file(path: &str, size: u64) -> Action {
@@ -8264,6 +8609,90 @@ mod tests {
         assert!(message.contains("local"), "{}", message);
         assert!(message.contains("requires 13"), "{}", message);
         assert!(message.contains("usable after reserving 7"), "{}", message);
+    }
+
+    #[test]
+    fn staging_waves_allow_oversized_cow_modification_as_an_isolated_wave() {
+        let actions = vec![local_file("a", 1), local_modified_file("large", 13)];
+        let plan =
+            plan_staging_waves(&actions, staging_budget(10, 12), staging_budget(10, 12)).unwrap();
+
+        assert_eq!(plan.waves.len(), 2);
+        assert_eq!(plan.waves[1].action_indices, vec![1]);
+        assert!(plan.waves[1].local_requires_cow_capacity);
+        assert!(!plan.waves[1].remote_requires_cow_capacity);
+    }
+
+    #[test]
+    fn staging_waves_reject_oversized_modification_without_clone_support() {
+        let error = plan_staging_waves(
+            &[local_modified_file("large", 13)],
+            staging_budget_without_cow(10, 12),
+            staging_budget(10, 12),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("only an isolated single COW diff"));
+    }
+
+    #[test]
+    fn staging_waves_reject_oversized_addition_without_cow_source() {
+        let error = plan_staging_waves(
+            &[local_file("large", 13)],
+            staging_budget(10, 12),
+            staging_budget(10, 12),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("only an isolated single COW diff"));
+    }
+
+    #[test]
+    fn staging_waves_reject_multi_output_subtree_with_one_cow_candidate() {
+        let actions = vec![
+            Action::Local(Change::Added(Entry::test_dir(PathBuf::from("dir")))),
+            local_modified_file("dir/a", 13),
+            local_file("dir/b", 1),
+        ];
+        let error = plan_staging_waves(&actions, staging_budget(10, 12), staging_budget(10, 12))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("only an isolated single COW diff"));
+    }
+
+    #[test]
+    fn staging_waves_track_cow_capacity_per_side() {
+        let local_actions = vec![
+            Action::Local(Change::Added(Entry::test_dir(PathBuf::from("dir")))),
+            local_modified_file("dir/a", 13),
+            remote_file("dir/b", 2),
+        ];
+        let local_plan = plan_staging_waves(
+            &local_actions,
+            staging_budget(10, 12),
+            staging_budget(10, 12),
+        )
+        .unwrap();
+        assert!(local_plan.waves[0].local_requires_cow_capacity);
+        assert!(!local_plan.waves[0].remote_requires_cow_capacity);
+
+        let remote_actions = vec![
+            Action::Remote(Change::Added(Entry::test_dir(PathBuf::from("dir")))),
+            local_file("dir/a", 2),
+            remote_modified_file("dir/b", 13),
+        ];
+        let remote_plan = plan_staging_waves(
+            &remote_actions,
+            staging_budget(10, 12),
+            staging_budget(10, 12),
+        )
+        .unwrap();
+        assert!(!remote_plan.waves[0].local_requires_cow_capacity);
+        assert!(remote_plan.waves[0].remote_requires_cow_capacity);
     }
 
     #[test]
@@ -10577,6 +11006,18 @@ mod tests {
     }
 
     #[test]
+    fn cow_clone_probe_cleans_private_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        let _ = staging_filesystem_info_with_clone_probe(base).unwrap();
+
+        assert!(stage_directories(base).is_empty());
+        assert!(!base.join(".duet-cow-probe-source").exists());
+        assert!(!base.join(".duet-cow-probe-clone").exists());
+    }
+
+    #[test]
     fn fallback_contents_publish_requested_modes() {
         let requested_modes = [0o600, 0o400, 0o000, 0o644];
         for requested_mode in requested_modes {
@@ -12172,6 +12613,78 @@ mod tests {
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("phase: state-save"), "{}", marker);
         finish_staged_apply_attempt(&state, "attempt-1").unwrap();
+        assert!(!apply_attempt_path(&state).unwrap().exists());
+    }
+
+    #[test]
+    fn legacy_staged_constructor_does_not_enable_reserve_enforcement() {
+        let legacy = DetailApplier::new_staged_with_attempt_and_policy(
+            PathBuf::from("base"),
+            Vec::new(),
+            Vec::new(),
+            PathBuf::from("state"),
+            "attempt".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        assert!(legacy.staging_space_monitor.is_none());
+
+        let negotiated = DetailApplier::new_capacity_aware_staged_with_attempt_and_policy(
+            PathBuf::from("base"),
+            Vec::new(),
+            Vec::new(),
+            PathBuf::from("state"),
+            "attempt".to_string(),
+            None,
+            ApplyOptions::default(),
+            StagingPolicy::default(),
+        );
+        assert!(negotiated.staging_space_monitor.is_some());
+    }
+
+    #[test]
+    fn staged_commit_validation_rechecks_reserve_after_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let actions = vec![Action::Local(Change::Added(test_file_entry(
+            "file.txt",
+            b"contents",
+        )))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_capacity_aware_staged_with_attempt_and_policy(
+            base,
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+            StagingPolicy {
+                limit_bytes: None,
+                reserve: StagingReserve::Bytes(0),
+            },
+        );
+        stream_file(&mut applier, 0, b"contents").unwrap();
+        let mut prepared = applier.finish_preparation().unwrap();
+        prepared
+            .inner
+            .staging_space_monitor
+            .as_mut()
+            .unwrap()
+            .policy = StagingPolicy {
+            limit_bytes: None,
+            reserve: StagingReserve::Bytes(u64::MAX),
+        };
+
+        let error = prepared.validate_commit().unwrap_err();
+        assert!(
+            error.to_string().contains("aborted before commit"),
+            "{}",
+            error
+        );
+        prepared.abort().unwrap();
         assert!(!apply_attempt_path(&state).unwrap().exists());
     }
 

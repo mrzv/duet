@@ -202,7 +202,17 @@ pub fn render_message(
 
 fn classify_error_message(message: &str) -> &'static str {
     let message = message.to_lowercase();
-    if message.contains("permission denied")
+    if message.contains("disk quota exceeded")
+        || message.contains("quota exceeded")
+        || message.contains(&format!("os error {}", libc::EDQUOT))
+    {
+        "quota_exceeded"
+    } else if message.contains("no space left on device")
+        || message.contains("no space left")
+        || message.contains(&format!("os error {}", libc::ENOSPC))
+    {
+        "no_space"
+    } else if message.contains("permission denied")
         || message.contains("permissiondenied")
         || message.contains("os error 13")
     {
@@ -350,6 +360,33 @@ mod tests {
         assert_eq!(parsed.sources, vec!["inner permission denied"]);
         assert!(formatted.contains("source: inner permission denied"));
         assert!(rendered.contains("caused by: inner permission denied"));
+    }
+
+    #[test]
+    fn structured_sync_error_classifies_no_space_and_quota() {
+        let no_space = StructuredSyncError::new(
+            "local",
+            "prepare staged output",
+            None,
+            io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        let quota = StructuredSyncError::new(
+            "remote",
+            "prepare staged output",
+            None,
+            io::Error::from_raw_os_error(libc::EDQUOT),
+        );
+
+        assert_eq!(no_space.kind, "no_space");
+        assert_eq!(quota.kind, "quota_exceeded");
+        assert_eq!(
+            StructuredSyncError::from_message("local", "write", None, "No space left").kind,
+            "no_space"
+        );
+        assert_eq!(
+            StructuredSyncError::from_message("local", "write", None, "disk quota exceeded").kind,
+            "quota_exceeded"
+        );
     }
 
     #[test]

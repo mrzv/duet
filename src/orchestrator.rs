@@ -525,7 +525,15 @@ pub async fn sync(
     }
     let staging_plan = if apply_strategy == ApplyStrategy::StagedStream {
         require_remote_capability(&remote_info, rpc::CAPABILITY_STAGING_CAPACITY)?;
-        let local_filesystem = sync_ops::staging_filesystem_info(&local_base)?;
+        require_remote_capability(
+            &remote_info,
+            rpc::CAPABILITY_STAGING_RESERVE_ENFORCEMENT,
+        )?;
+        remote
+            .set_staging_policy(options.staging_policy)
+            .await
+            .map_err(|e| remote_rpc_error("Couldn't set remote staging policy", e))?;
+        let local_filesystem = sync_ops::staging_filesystem_info_with_clone_probe(&local_base)?;
         let remote_filesystem = remote
             .staging_filesystem_info()
             .await
@@ -756,6 +764,7 @@ pub async fn sync(
                 remote_stream_performance_enabled(profiling_enabled, &remote_info),
                 has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
                 Some(&wave_attempt_id),
+                Some(options.staging_policy),
                 Some(&interrupt),
             )
             .await?;
@@ -997,6 +1006,7 @@ pub async fn sync(
             apply_options,
             remote_stream_performance_enabled(profiling_enabled, &remote_info),
             has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
+            None,
             None,
             None,
         )
@@ -1358,6 +1368,7 @@ fn select_apply_strategy(
     }
     if has_remote_capability(info, rpc::CAPABILITY_STAGED_APPLY)
         && has_remote_capability(info, rpc::CAPABILITY_STAGING_CAPACITY)
+        && has_remote_capability(info, rpc::CAPABILITY_STAGING_RESERVE_ENFORCEMENT)
     {
         return Ok(ApplyStrategy::StagedStream);
     }
@@ -1365,7 +1376,7 @@ fn select_apply_strategy(
         return Err(eyre!(
             "remote duet {} cannot enforce --staging-limit/--staging-reserve; upgrade it to a version supporting {}",
             info.duet_version,
-            rpc::CAPABILITY_STAGING_CAPACITY
+            rpc::CAPABILITY_STAGING_RESERVE_ENFORCEMENT
         ));
     }
     Ok(ApplyStrategy::LegacyStream)
@@ -1438,6 +1449,7 @@ fn validate_wave_capacity(
         wave.local_reconstructed_bytes,
         wave.local_staged_regular_outputs,
         wave.local_exceeds_budget,
+        wave.local_requires_cow_capacity,
         policy.budget(local_filesystem),
         local_filesystem.available_inodes,
         wave_index,
@@ -1448,6 +1460,7 @@ fn validate_wave_capacity(
         wave.remote_reconstructed_bytes,
         wave.remote_staged_regular_outputs,
         wave.remote_exceeds_budget,
+        wave.remote_requires_cow_capacity,
         policy.budget(remote_filesystem),
         remote_filesystem.available_inodes,
         wave_index,
@@ -1461,6 +1474,7 @@ fn validate_wave_side_capacity(
     required_bytes: u64,
     required_outputs: usize,
     isolated_oversize: bool,
+    requires_cow_capacity: bool,
     budget: sync_ops::StagingBudget,
     available_inodes: u64,
     wave_index: usize,
@@ -1468,10 +1482,16 @@ fn validate_wave_side_capacity(
 ) -> Result<()> {
     let wave_number = wave_index + 1;
     if required_bytes > budget.usable_bytes {
-        return Err(eyre!(
-            "staging capacity shrank before wave {wave_number}/{wave_count}: {side} requires {required_bytes} bytes but only {} bytes are usable after reserve",
+        if !requires_cow_capacity {
+            return Err(eyre!(
+                "staging capacity shrank before wave {wave_number}/{wave_count}: {side} requires {required_bytes} logical output bytes but only {} bytes fit after reserve",
+                budget.usable_bytes
+            ));
+        }
+        log::debug!(
+            "wave {wave_number}/{wave_count} {side} COW output has {required_bytes} logical bytes exceeding current usable {}; prepare-time physical-space monitoring will enforce reserve",
             budget.usable_bytes
-        ));
+        );
     }
     if required_bytes > budget.budget_bytes && !isolated_oversize {
         return Err(eyre!(
@@ -2016,6 +2036,7 @@ async fn stream_detailed_changes<R>(
     remote_stream_performance: bool,
     file_byte_chunks: bool,
     staged_attempt_id: Option<&str>,
+    staging_policy: Option<sync_ops::StagingPolicy>,
     interrupt: Option<&InterruptState>,
 ) -> Result<StreamDetailedChangesRun>
 where
@@ -2069,6 +2090,7 @@ where
         remote_stream_performance,
         file_byte_chunks,
         staged_attempt_id,
+        staging_policy,
         staged_remote_apply_stream,
         interrupt,
     )
@@ -2133,6 +2155,7 @@ async fn stream_detailed_changes_started<R>(
     remote_stream_performance: bool,
     file_byte_chunks: bool,
     staged_attempt_id: Option<&str>,
+    staging_policy: Option<sync_ops::StagingPolicy>,
     staged_remote_apply_stream: Option<sync_ops::ApplyStreamId>,
     interrupt: Option<&InterruptState>,
 ) -> Result<StreamDetailedChangesRun>
@@ -2153,7 +2176,7 @@ where
         tuning.detail_chunk_bytes(),
     );
     let mut local_applier = if let Some(attempt_id) = staged_attempt_id {
-        sync_ops::DetailApplier::new_staged_with_attempt_and_policy(
+        sync_ops::DetailApplier::new_capacity_aware_staged_with_attempt_and_policy(
             local_base.clone(),
             actions.clone(),
             local_all_old,
@@ -2161,6 +2184,7 @@ where
             attempt_id.to_string(),
             scan_policy,
             apply_options,
+            staging_policy.expect("staged apply must provide a staging policy"),
         )
     } else {
         sync_ops::DetailApplier::new_with_attempt_and_policy(
@@ -3495,12 +3519,16 @@ mod tests {
             capabilities: vec![
                 rpc::CAPABILITY_STAGED_APPLY.to_string(),
                 rpc::CAPABILITY_STAGING_CAPACITY.to_string(),
+                rpc::CAPABILITY_STAGING_RESERVE_ENFORCEMENT.to_string(),
             ],
         };
         let staged_without_capacity = rpc::ServerInfo {
             protocol_version: rpc::PROTOCOL_VERSION,
             duet_version: "old".to_string(),
-            capabilities: vec![rpc::CAPABILITY_STAGED_APPLY.to_string()],
+            capabilities: vec![
+                rpc::CAPABILITY_STAGED_APPLY.to_string(),
+                rpc::CAPABILITY_STAGING_CAPACITY.to_string(),
+            ],
         };
         let legacy = rpc::ServerInfo {
             protocol_version: rpc::PROTOCOL_VERSION,
@@ -3528,7 +3556,31 @@ mod tests {
         let error = select_apply_strategy(&staged_without_capacity, true, true)
             .unwrap_err()
             .to_string();
-        assert!(error.contains(rpc::CAPABILITY_STAGING_CAPACITY));
+        assert!(error.contains(rpc::CAPABILITY_STAGING_RESERVE_ENFORCEMENT));
+    }
+
+    #[test]
+    fn wave_revalidation_allows_only_cow_logical_overage_and_still_requires_inode() {
+        let budget = sync_ops::StagingBudget {
+            reserve_bytes: 10,
+            usable_bytes: 90,
+            budget_bytes: 90,
+            cow_clone_supported: true,
+        };
+
+        validate_wave_side_capacity("local", 100, 1, true, true, budget, 1, 0, 1).unwrap();
+        assert!(
+            validate_wave_side_capacity("local", 100, 1, true, false, budget, 1, 0, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("logical output bytes")
+        );
+        assert!(
+            validate_wave_side_capacity("local", 100, 1, true, true, budget, 0, 0, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("inodes")
+        );
     }
 
     #[test]

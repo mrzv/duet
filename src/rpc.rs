@@ -43,6 +43,7 @@ pub(crate) const CAPABILITY_COORDINATED_MARKER_CLEANUP: &str = "coordinated-mark
 pub(crate) const CAPABILITY_STAGED_APPLY: &str = "staged-apply-v1";
 pub(crate) const CAPABILITY_STAGING_CAPACITY: &str = "staging-capacity-v1";
 pub(crate) const CAPABILITY_CHECKPOINTED_STAGING: &str = "checkpointed-staging-v1";
+pub(crate) const CAPABILITY_STAGING_RESERVE_ENFORCEMENT: &str = "staging-reserve-enforcement-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -65,6 +66,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_STAGED_APPLY,
     CAPABILITY_STAGING_CAPACITY,
     CAPABILITY_CHECKPOINTED_STAGING,
+    CAPABILITY_STAGING_RESERVE_ENFORCEMENT,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -210,6 +212,7 @@ pub trait DuetServer {
     fn complete_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError>;
     fn validate_staged_apply(&self, attempt_id: String) -> Result<(), RPCError>;
     fn staging_filesystem_info(&self) -> Result<sync::StagingFilesystemInfo, RPCError>;
+    fn set_staging_policy(&mut self, policy: sync::StagingPolicy) -> Result<(), RPCError>;
 }
 
 enum ApplyStream {
@@ -267,6 +270,7 @@ struct DuetServerImpl {
     detail_streams: HashMap<DetailStreamId, DetailProducer>,
     apply_streams: HashMap<ApplyStreamId, ApplyStream>,
     staged_apply: Option<StagedApplyState>,
+    staging_policy: Option<sync::StagingPolicy>,
     next_stream_id: u64,
     tuning: sync::SyncTuning,
     stream_performance: RemoteStreamProfile,
@@ -291,6 +295,7 @@ impl DuetServerImpl {
             detail_streams: HashMap::new(),
             apply_streams: HashMap::new(),
             staged_apply: None,
+            staging_policy: None,
             next_stream_id: 1,
             tuning: sync::SyncTuning::legacy(),
             stream_performance: RemoteStreamProfile::default(),
@@ -322,6 +327,7 @@ impl DuetServerImpl {
         self.current_scan.clear();
         self.restrict.clear();
         self.apply_options = sync::ApplyOptions::default();
+        self.staging_policy = None;
         self.reset_actions_context();
     }
 
@@ -1067,15 +1073,30 @@ impl DuetServer for DuetServerImpl {
         .map_err(|e| rpc_report_error("start staged apply", Some(&remote_state), e))?;
 
         let id = self.next_apply_stream_id();
-        let applier = sync::DetailApplier::new_staged_with_attempt_and_policy(
-            self.base.clone(),
-            self.actions.clone(),
-            self.all_old.clone(),
-            remote_state.clone(),
-            attempt_id.clone(),
-            self.scan_policy.clone(),
-            self.apply_options,
-        );
+        let applier = if let Some(staging_policy) = self.staging_policy {
+            sync::DetailApplier::new_capacity_aware_staged_with_attempt_and_policy(
+                self.base.clone(),
+                self.actions.clone(),
+                self.all_old.clone(),
+                remote_state.clone(),
+                attempt_id.clone(),
+                self.scan_policy.clone(),
+                self.apply_options,
+                staging_policy,
+            )
+        } else {
+            // Existing staged-apply clients predate policy negotiation. Preserve their
+            // behavior rather than silently imposing this version's default reserve.
+            sync::DetailApplier::new_staged_with_attempt_and_policy(
+                self.base.clone(),
+                self.actions.clone(),
+                self.all_old.clone(),
+                remote_state.clone(),
+                attempt_id.clone(),
+                self.scan_policy.clone(),
+                self.apply_options,
+            )
+        };
         self.apply_streams.insert(id, ApplyStream::Staged(applier));
         self.staged_apply = Some(StagedApplyState::Preparing {
             attempt_id,
@@ -1396,13 +1417,18 @@ impl DuetServer for DuetServerImpl {
                 "synchronization base is not initialized",
             ));
         }
-        sync::staging_filesystem_info(&self.base).map_err(|error| {
+        sync::staging_filesystem_info_with_clone_probe(&self.base).map_err(|error| {
             rpc_report_error(
                 "report staging filesystem capacity",
                 Some(&self.base),
                 error,
             )
         })
+    }
+
+    fn set_staging_policy(&mut self, policy: sync::StagingPolicy) -> Result<(), RPCError> {
+        self.staging_policy = Some(policy);
+        Ok(())
     }
 }
 
@@ -1594,6 +1620,9 @@ mod tests {
         assert!(client.complete_staged_apply("attempt".to_string()).is_err());
         assert!(client.validate_staged_apply("attempt".to_string()).is_err());
         assert!(client.staging_filesystem_info().is_err());
+        assert!(client
+            .set_staging_policy(sync::StagingPolicy::default())
+            .is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -1627,6 +1656,7 @@ mod tests {
                 ("complete_staged_apply", 43),
                 ("validate_staged_apply", 44),
                 ("staging_filesystem_info", 45),
+                ("set_staging_policy", 46),
             ]
         );
     }
@@ -1668,6 +1698,7 @@ mod tests {
                 CAPABILITY_STAGED_APPLY.to_string(),
                 CAPABILITY_STAGING_CAPACITY.to_string(),
                 CAPABILITY_CHECKPOINTED_STAGING.to_string(),
+                CAPABILITY_STAGING_RESERVE_ENFORCEMENT.to_string(),
             ]
         );
     }
@@ -1692,6 +1723,22 @@ mod tests {
         assert!(info.total_bytes > 0);
         assert!(info.block_size > 0);
         assert!(info.available_bytes <= info.total_bytes);
+    }
+
+    #[test]
+    fn staging_policy_is_host_local_and_survives_wave_action_changes() {
+        let mut server = DuetServerImpl::new().unwrap();
+        let policy = sync::StagingPolicy {
+            limit_bytes: Some(123),
+            reserve: sync::StagingReserve::Bytes(456),
+        };
+
+        server.set_staging_policy(policy).unwrap();
+        server.reset_actions_context();
+        assert_eq!(server.staging_policy, Some(policy));
+
+        server.reset_changes_context();
+        assert_eq!(server.staging_policy, None);
     }
 
     fn staged_server(dir: &tempfile::TempDir) -> DuetServerImpl {
