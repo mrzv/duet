@@ -44,6 +44,7 @@ pub(crate) const CAPABILITY_STAGED_APPLY: &str = "staged-apply-v1";
 pub(crate) const CAPABILITY_STAGING_CAPACITY: &str = "staging-capacity-v1";
 pub(crate) const CAPABILITY_CHECKPOINTED_STAGING: &str = "checkpointed-staging-v1";
 pub(crate) const CAPABILITY_STAGING_RESERVE_ENFORCEMENT: &str = "staging-reserve-enforcement-v1";
+pub(crate) const CAPABILITY_STAGING_INODE_CAPACITY: &str = "staging-inode-capacity-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -67,6 +68,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_STAGING_CAPACITY,
     CAPABILITY_CHECKPOINTED_STAGING,
     CAPABILITY_STAGING_RESERVE_ENFORCEMENT,
+    CAPABILITY_STAGING_INODE_CAPACITY,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -1699,6 +1701,7 @@ mod tests {
                 CAPABILITY_STAGING_CAPACITY.to_string(),
                 CAPABILITY_CHECKPOINTED_STAGING.to_string(),
                 CAPABILITY_STAGING_RESERVE_ENFORCEMENT.to_string(),
+                CAPABILITY_STAGING_INODE_CAPACITY.to_string(),
             ]
         );
     }

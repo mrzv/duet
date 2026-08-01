@@ -542,6 +542,10 @@ pub async fn sync(
             .map_err(|e| remote_rpc_error("Couldn't get remote staging capacity", e))?;
         let local_budget = options.staging_policy.budget(local_filesystem);
         let remote_budget = options.staging_policy.budget(remote_filesystem);
+        let remote_inode_capacity_known = has_remote_capability(
+            &remote_info,
+            rpc::CAPABILITY_STAGING_INODE_CAPACITY,
+        );
         match sync_ops::plan_staging_waves(actions.as_ref(), local_budget, remote_budget) {
             Ok(plan) => {
                 for (wave_index, wave) in plan.waves.iter().enumerate() {
@@ -550,6 +554,7 @@ pub async fn sync(
                         options.staging_policy,
                         local_filesystem,
                         remote_filesystem,
+                        remote_inode_capacity_known,
                         wave_index,
                         plan.waves.len(),
                     )?;
@@ -706,6 +711,7 @@ pub async fn sync(
                 options.staging_policy,
                 local_filesystem,
                 remote_filesystem,
+                has_remote_capability(&remote_info, rpc::CAPABILITY_STAGING_INODE_CAPACITY),
                 wave_index,
                 plan.waves.len(),
             )?;
@@ -1468,6 +1474,7 @@ fn validate_wave_capacity(
     policy: sync_ops::StagingPolicy,
     local_filesystem: sync_ops::StagingFilesystemInfo,
     remote_filesystem: sync_ops::StagingFilesystemInfo,
+    remote_inode_capacity_known: bool,
     wave_index: usize,
     wave_count: usize,
 ) -> Result<()> {
@@ -1479,7 +1486,7 @@ fn validate_wave_capacity(
         wave.local_requires_cow_capacity,
         policy.budget(local_filesystem),
         local_filesystem.available_inodes,
-        local_filesystem.inode_capacity_known,
+        true,
         wave_index,
         wave_count,
     )?;
@@ -1491,7 +1498,7 @@ fn validate_wave_capacity(
         wave.remote_requires_cow_capacity,
         policy.budget(remote_filesystem),
         remote_filesystem.available_inodes,
-        remote_filesystem.inode_capacity_known,
+        remote_inode_capacity_known,
         wave_index,
         wave_count,
     )
@@ -1529,7 +1536,9 @@ fn validate_wave_side_capacity(
             budget.budget_bytes
         ));
     }
-    if inode_capacity_known && required_outputs as u128 > available_inodes as u128 {
+    if (inode_capacity_known || available_inodes != 0)
+        && required_outputs as u128 > available_inodes as u128
+    {
         return Err(eyre!(
             "staging capacity shrank before wave {wave_number}/{wave_count}: {side} requires {required_outputs} staged files but only {available_inodes} inodes are available"
         ));
@@ -3606,12 +3615,24 @@ mod tests {
                 .contains("logical output bytes")
         );
         assert!(
+            validate_wave_side_capacity("local", 100, 2, true, true, budget, 1, true, 0, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("inodes")
+        );
+        assert!(
             validate_wave_side_capacity("local", 100, 1, true, true, budget, 0, true, 0, 1)
                 .unwrap_err()
                 .to_string()
                 .contains("inodes")
         );
-        validate_wave_side_capacity("local", 100, 1, true, true, budget, 0, false, 0, 1).unwrap();
+        validate_wave_side_capacity("remote", 100, 1, true, true, budget, 0, false, 0, 1).unwrap();
+        assert!(
+            validate_wave_side_capacity("remote", 100, 2, true, true, budget, 1, false, 0, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("inodes")
+        );
     }
 
     #[test]

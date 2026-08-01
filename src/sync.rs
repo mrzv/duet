@@ -72,7 +72,6 @@ pub struct StagingFilesystemInfo {
     pub total_bytes: u64,
     pub available_bytes: u64,
     pub available_inodes: u64,
-    pub inode_capacity_known: bool,
     pub block_size: u64,
     pub cow_clone_supported: bool,
 }
@@ -628,9 +627,12 @@ fn staging_filesystem_info_from_counts(
     Ok(StagingFilesystemInfo {
         total_bytes: blocks.saturating_mul(block_size),
         available_bytes: available_blocks.saturating_mul(block_size),
-        available_inodes,
-        // Filesystems without a fixed inode table commonly report both inode counts as zero.
-        inode_capacity_known: total_inodes != 0,
+        // Preserve the v1 wire layout while representing filesystems without a fixed inode table.
+        available_inodes: if total_inodes == 0 {
+            u64::MAX
+        } else {
+            available_inodes
+        },
         block_size,
         // A trustworthy clone-capability check requires creating files on the target filesystem.
         cow_clone_supported: false,
@@ -8376,7 +8378,6 @@ mod tests {
             total_bytes,
             available_bytes,
             available_inodes: 0,
-            inode_capacity_known: false,
             block_size: 4096,
             cow_clone_supported: false,
         }
@@ -8978,6 +8979,48 @@ mod tests {
     }
 
     #[test]
+    fn staging_filesystem_info_preserves_v1_wire_layout() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct WireV1 {
+            total_bytes: u64,
+            available_bytes: u64,
+            available_inodes: u64,
+            block_size: u64,
+            cow_clone_supported: bool,
+        }
+
+        let info = StagingFilesystemInfo {
+            total_bytes: 100,
+            available_bytes: 80,
+            available_inodes: u64::MAX,
+            block_size: 4096,
+            cow_clone_supported: true,
+        };
+        let encoded = bincode::serde::encode_to_vec(info, bincode::config::standard()).unwrap();
+        let (legacy, consumed): (WireV1, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(
+            legacy,
+            WireV1 {
+                total_bytes: 100,
+                available_bytes: 80,
+                available_inodes: u64::MAX,
+                block_size: 4096,
+                cow_clone_supported: true,
+            }
+        );
+
+        let legacy_encoded =
+            bincode::serde::encode_to_vec(legacy, bincode::config::standard()).unwrap();
+        let (decoded, consumed): (StagingFilesystemInfo, usize) =
+            bincode::serde::decode_from_slice(&legacy_encoded, bincode::config::standard())
+                .unwrap();
+        assert_eq!(consumed, legacy_encoded.len());
+        assert_eq!(decoded, info);
+    }
+
+    #[test]
     fn staging_filesystem_count_conversion_falls_back_and_saturates() {
         let info = staging_filesystem_info_from_counts(
             u64::MAX,
@@ -8993,7 +9036,6 @@ mod tests {
         assert_eq!(info.total_bytes, u64::MAX);
         assert_eq!(info.available_bytes, u64::MAX);
         assert_eq!(info.available_inodes, 17);
-        assert!(info.inode_capacity_known);
     }
 
     #[test]
@@ -9002,8 +9044,7 @@ mod tests {
             staging_filesystem_info_from_counts(100, 50, 0, 0, 4096, 4096, Path::new("base"))
                 .unwrap();
 
-        assert_eq!(info.available_inodes, 0);
-        assert!(!info.inode_capacity_known);
+        assert_eq!(info.available_inodes, u64::MAX);
     }
 
     #[test]
