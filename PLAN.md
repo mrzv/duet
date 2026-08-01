@@ -246,9 +246,11 @@ The current policy is fail-fast. That is safer than silently skipping unreadable
 paths, but it means one inaccessible path aborts the sync.
 
 Decision: keep fail-fast as the default and do not add implicit skip behavior.
-Skipping permission-denied paths is only acceptable as a future explicit opt-in
-mode, because both sides must know exactly which paths were skipped so they are
-not interpreted as deletions or legitimate updates.
+Skipping permission-denied paths is only acceptable through the explicit
+CLI-only `--exclude` hard-subtree selection, which skips the named entry before
+metadata and directory access while preserving its state, or through a future
+explicit opt-in mode. Both sides must know exactly which paths were skipped so
+they are not interpreted as deletions or legitimate updates.
 
 Remaining work:
 

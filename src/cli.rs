@@ -15,6 +15,7 @@ pub struct SyncOptions {
     pub verbose: bool,
     pub debug_info: bool,
     pub prune_ignored: bool,
+    pub excludes: Vec<PathBuf>,
     pub profile_performance: bool,
     pub profile_performance_json: Option<PathBuf>,
     pub staging_policy: StagingPolicy,
@@ -90,6 +91,7 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         pargs.opt_value_from_os_str("--profile-performance-json", parse_path)?;
     let staging_limit: Option<StagingLimit> = pargs.opt_value_from_str("--staging-limit")?;
     let staging_reserve = pargs.opt_value_from_str("--staging-reserve")?;
+    let excludes = pargs.values_from_os_str("--exclude", parse_path)?;
 
     let staging_policy_explicit = staging_limit.is_some() || staging_reserve.is_some();
     let options = SyncOptions {
@@ -101,6 +103,7 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
         verbose: pargs.contains(["-v", "--verbose"]),
         debug_info: pargs.contains("--debug-info"),
         prune_ignored: pargs.contains("--prune-ignored"),
+        excludes,
         profile_performance: pargs.contains("--profile-performance"),
         profile_performance_json,
         staging_policy: StagingPolicy {
@@ -200,6 +203,7 @@ fn reject_sync_options(options: &SyncOptions) -> Result<()> {
         || options.verbose
         || options.debug_info
         || options.prune_ignored
+        || !options.excludes.is_empty()
         || options.profile_performance
         || options.profile_performance_json.is_some()
         || options.staging_policy_explicit
@@ -218,6 +222,7 @@ fn reject_recover_options(options: &SyncOptions, clear: bool) -> Result<()> {
         || options.verbose
         || options.debug_info
         || options.prune_ignored
+        || !options.excludes.is_empty()
         || options.profile_performance
         || options.profile_performance_json.is_some()
         || options.staging_policy_explicit
@@ -359,6 +364,7 @@ mod tests {
             verbose: false,
             debug_info: false,
             prune_ignored: false,
+            excludes: Vec::new(),
             profile_performance: false,
             profile_performance_json: None,
             staging_policy: StagingPolicy::default(),
@@ -413,6 +419,7 @@ mod tests {
                     verbose: true,
                     debug_info: false,
                     prune_ignored: true,
+                    excludes: Vec::new(),
                     profile_performance: false,
                     profile_performance_json: None,
                     staging_policy: StagingPolicy::default(),
@@ -420,6 +427,34 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn parses_repeated_sync_excludes_without_normalizing_them() {
+        let Command::Sync { options, path, .. } = parse_args(&[
+            "--exclude",
+            "cache",
+            "--exclude",
+            "../shared/tmp",
+            "work",
+            "docs",
+        ]) else {
+            panic!("expected sync command");
+        };
+
+        assert_eq!(path, Some(PathBuf::from("docs")));
+        assert_eq!(
+            options.excludes,
+            vec![PathBuf::from("cache"), PathBuf::from("../shared/tmp")]
+        );
+    }
+
+    #[test]
+    fn rejects_exclude_for_non_sync_commands() {
+        assert!(parse_args_error(&["--exclude", "cache", "_info", "work"])
+            .contains("sync options are not supported"));
+        assert!(parse_args_error(&["--exclude", "cache", "recover", "work"])
+            .contains("only --clear and --yes"));
     }
 
     #[test]
@@ -438,6 +473,7 @@ mod tests {
                     verbose: false,
                     debug_info: true,
                     prune_ignored: false,
+                    excludes: Vec::new(),
                     profile_performance: false,
                     profile_performance_json: None,
                     staging_policy: StagingPolicy::default(),
@@ -468,6 +504,7 @@ mod tests {
                     verbose: false,
                     debug_info: false,
                     prune_ignored: false,
+                    excludes: Vec::new(),
                     profile_performance: true,
                     profile_performance_json: Some(PathBuf::from("profile.json")),
                     staging_policy: StagingPolicy::default(),
@@ -493,6 +530,7 @@ mod tests {
                     verbose: false,
                     debug_info: false,
                     prune_ignored: false,
+                    excludes: Vec::new(),
                     profile_performance: false,
                     profile_performance_json: None,
                     staging_policy: StagingPolicy::default(),

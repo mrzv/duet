@@ -745,6 +745,7 @@ pub struct ScanPolicy {
     pub locations: Locations,
     pub ignore: Ignore,
     pub prune: Prune,
+    pub excludes: Vec<PathBuf>,
 }
 
 impl ScanPolicy {
@@ -758,7 +759,13 @@ impl ScanPolicy {
             locations,
             ignore,
             prune,
+            excludes: Vec::new(),
         }
+    }
+
+    pub fn with_excludes(mut self, excludes: Vec<PathBuf>) -> Self {
+        self.excludes = excludes;
+        self
     }
 }
 
@@ -2937,6 +2944,7 @@ struct RemovalBlockerPolicy {
     ignore: Vec<(String, regex::Regex)>,
     prune: Vec<(String, regex::Regex)>,
     prune_ignored: bool,
+    excludes: Vec<PathBuf>,
 }
 
 enum RemovalBlockerKind<'a> {
@@ -2974,6 +2982,7 @@ impl RemovalBlockerPolicy {
                 ignore: Vec::new(),
                 prune: Vec::new(),
                 prune_ignored: apply_options.prune_ignored,
+                excludes: Vec::new(),
             });
         };
 
@@ -2999,10 +3008,18 @@ impl RemovalBlockerPolicy {
             ignore,
             prune,
             prune_ignored: apply_options.prune_ignored,
+            excludes: scan_policy.excludes.clone(),
         })
     }
 
     fn classify<'a>(&'a self, relative_path: &Path) -> RemovalBlockerKind<'a> {
+        if self
+            .excludes
+            .iter()
+            .any(|exclude| relative_path.starts_with(exclude))
+        {
+            return RemovalBlockerKind::Excluded;
+        }
         if self.is_excluded(relative_path) {
             return RemovalBlockerKind::Excluded;
         }
@@ -3040,6 +3057,13 @@ impl RemovalBlockerPolicy {
     }
 
     fn is_excluded(&self, relative_path: &Path) -> bool {
+        if self
+            .excludes
+            .iter()
+            .any(|exclude| relative_path.starts_with(exclude))
+        {
+            return true;
+        }
         let mut best: Option<&Location> = None;
         for location in &self.locations {
             if location_applies(location.path(), relative_path) {
@@ -12123,6 +12147,65 @@ mod tests {
 
         assert!(error.contains("excluded child"), "{}", error);
         assert!(base.join("removed/__pycache__").exists());
+    }
+
+    #[test]
+    fn preflight_does_not_prune_cli_excluded_ignored_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/cache")).unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![Location::Include(PathBuf::new())],
+            vec!["cache".to_string()],
+        )
+        .with_excludes(vec![PathBuf::from("removed/cache")]);
+
+        let report = preflight_apply_report(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.blockers[0].kind, RemovalBlockerType::Excluded);
+        assert!(!report.blockers[0].prunable);
+        assert!(base.join("removed/cache").exists());
+    }
+
+    #[test]
+    fn preflight_does_not_prune_ignored_parent_of_cli_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("removed/cache/protected")).unwrap();
+        fs::write(base.join("removed/cache/protected/data"), b"keep").unwrap();
+        let actions = vec![Action::Local(Change::Removed(Entry::test_dir(
+            PathBuf::from("removed"),
+        )))];
+        let policy = ScanPolicy::new(
+            vec![Location::Include(PathBuf::new())],
+            vec!["cache".to_string()],
+        )
+        .with_excludes(vec![PathBuf::from("removed/cache/protected")]);
+
+        let error = preflight_apply_with_policy(
+            &base,
+            &actions,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("excluded child"), "{}", error);
+        assert!(base.join("removed/cache/protected/data").exists());
     }
 
     #[test]

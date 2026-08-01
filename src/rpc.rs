@@ -45,6 +45,7 @@ pub(crate) const CAPABILITY_STAGING_CAPACITY: &str = "staging-capacity-v1";
 pub(crate) const CAPABILITY_CHECKPOINTED_STAGING: &str = "checkpointed-staging-v1";
 pub(crate) const CAPABILITY_STAGING_RESERVE_ENFORCEMENT: &str = "staging-reserve-enforcement-v1";
 pub(crate) const CAPABILITY_STAGING_INODE_CAPACITY: &str = "staging-inode-capacity-v1";
+pub(crate) const CAPABILITY_SCAN_EXCLUDES: &str = "scan-excludes-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -69,6 +70,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_CHECKPOINTED_STAGING,
     CAPABILITY_STAGING_RESERVE_ENFORCEMENT,
     CAPABILITY_STAGING_INODE_CAPACITY,
+    CAPABILITY_SCAN_EXCLUDES,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -215,6 +217,14 @@ pub trait DuetServer {
     fn validate_staged_apply(&self, attempt_id: String) -> Result<(), RPCError>;
     fn staging_filesystem_info(&self) -> Result<sync::StagingFilesystemInfo, RPCError>;
     fn set_staging_policy(&mut self, policy: sync::StagingPolicy) -> Result<(), RPCError>;
+    fn changes_scope(
+        &mut self,
+        scope: crate::scan::ScanScope,
+        locations: Locations,
+        ignore: profile::Ignore,
+        remote_id: String,
+        strong: bool,
+    ) -> Result<ChangesV2, RPCError>;
 }
 
 enum ApplyStream {
@@ -277,7 +287,7 @@ struct DuetServerImpl {
     tuning: sync::SyncTuning,
     stream_performance: RemoteStreamProfile,
     current_scan: Entries,
-    restrict: PathBuf,
+    scope: crate::scan::ScanScope,
 }
 
 impl DuetServerImpl {
@@ -302,7 +312,7 @@ impl DuetServerImpl {
             tuning: sync::SyncTuning::legacy(),
             stream_performance: RemoteStreamProfile::default(),
             current_scan: Vec::new(),
-            restrict: PathBuf::new(),
+            scope: crate::scan::ScanScope::default(),
         })
     }
 
@@ -327,7 +337,7 @@ impl DuetServerImpl {
         self.all_old.clear();
         self.scan_policy = None;
         self.current_scan.clear();
-        self.restrict.clear();
+        self.scope = crate::scan::ScanScope::default();
         self.apply_options = sync::ApplyOptions::default();
         self.staging_policy = None;
         self.reset_actions_context();
@@ -378,26 +388,31 @@ impl DuetServerImpl {
 
     fn scan_changes(
         &mut self,
-        path: PathBuf,
+        scope: crate::scan::ScanScope,
         locations: Locations,
         ignore: profile::Ignore,
         remote_id: String,
         strong: bool,
     ) -> Result<ChangesV2, RPCError> {
-        sync::validate_scan_path(&path)
-            .map_err(|e| rpc_report_error("validate scan path", Some(&path), e))?;
+        self.reset_changes_context();
+        sync::validate_scan_path(&scope.restrict)
+            .map_err(|e| rpc_report_error("validate scan path", Some(&scope.restrict), e))?;
+        for exclude in &scope.excludes {
+            sync::validate_scan_path(exclude)
+                .map_err(|e| rpc_report_error("validate scan exclude", Some(exclude), e))?;
+        }
+        let scope = crate::scan::ScanScope::new(scope.restrict, scope.excludes);
         validate_locations(&locations)
-            .map_err(|e| rpc_report_error("validate scan locations", Some(&path), e))?;
+            .map_err(|e| rpc_report_error("validate scan locations", Some(&scope.restrict), e))?;
         profile::validate_remote_state_id(&remote_id)
             .map_err(|e| RPCError::new(RPCErrorKind::Other, e.to_string()))?;
         self.remote_id = remote_id;
-        self.reset_changes_context();
         let remote_state = profile::remote_state_in(&self.remote_state_dir, &self.remote_id);
         sync::check_apply_attempt_clear(&remote_state)
             .map_err(|e| rpc_report_error("check apply recovery", Some(&remote_state), e))?;
         let result = tokio::runtime::Handle::current().block_on(crate::state::old_and_changes(
             &self.base,
-            &path,
+            &scope,
             &locations,
             &ignore,
             Some(&remote_state),
@@ -407,15 +422,14 @@ impl DuetServerImpl {
             Ok(context) => {
                 self.all_old = context.all_old;
                 if context.migration_needed {
-                    crate::state::replace_scope(&mut self.all_old, &path, &context.current);
+                    crate::state::replace_scope(&mut self.all_old, &scope, &context.current);
                 }
-                self.scan_policy = Some(sync::ScanPolicy::with_prune(
-                    locations,
-                    ignore,
-                    self.prune.clone(),
-                ));
+                self.scan_policy = Some(
+                    sync::ScanPolicy::with_prune(locations, ignore, self.prune.clone())
+                        .with_excludes(scope.excludes.clone()),
+                );
                 self.current_scan = context.current.clone();
-                self.restrict = path.clone();
+                self.scope = scope.clone();
                 self.changes_ready = true;
                 Ok(ChangesV2 {
                     changes: context.changes,
@@ -425,7 +439,7 @@ impl DuetServerImpl {
             }
             Err(e) => Err(rpc_report_error(
                 "scan changes",
-                Some(&self.base.join(path)),
+                Some(&self.base.join(scope.restrict)),
                 e,
             )),
         }
@@ -516,7 +530,13 @@ impl DuetServer for DuetServerImpl {
         remote_id: String,
     ) -> Result<LegacyChanges, RPCError> {
         Ok(self
-            .scan_changes(path, locations, ignore, remote_id, false)?
+            .scan_changes(
+                crate::scan::ScanScope::new(path, Vec::new()),
+                locations,
+                ignore,
+                remote_id,
+                false,
+            )?
             .changes
             .into_iter()
             .map(Into::into)
@@ -963,7 +983,13 @@ impl DuetServer for DuetServerImpl {
         ignore: profile::Ignore,
         remote_id: String,
     ) -> Result<ChangesV2, RPCError> {
-        self.scan_changes(path, locations, ignore, remote_id, true)
+        self.scan_changes(
+            crate::scan::ScanScope::new(path, Vec::new()),
+            locations,
+            ignore,
+            remote_id,
+            true,
+        )
     }
 
     fn set_actions_v2(&mut self, actions: Actions) -> Result<(), RPCError> {
@@ -1024,7 +1050,7 @@ impl DuetServer for DuetServerImpl {
 
     fn prepare_migration_v2(&mut self) -> Result<(), RPCError> {
         self.initialized_remote_state("prepare strong digest migration")?;
-        crate::state::replace_scope(&mut self.all_old, &self.restrict, &self.current_scan);
+        crate::state::replace_scope(&mut self.all_old, &self.scope, &self.current_scan);
         Ok(())
     }
 
@@ -1432,6 +1458,17 @@ impl DuetServer for DuetServerImpl {
         self.staging_policy = Some(policy);
         Ok(())
     }
+
+    fn changes_scope(
+        &mut self,
+        scope: crate::scan::ScanScope,
+        locations: Locations,
+        ignore: profile::Ignore,
+        remote_id: String,
+        strong: bool,
+    ) -> Result<ChangesV2, RPCError> {
+        self.scan_changes(scope, locations, ignore, remote_id, strong)
+    }
 }
 
 pub async fn server() -> Result<()> {
@@ -1625,6 +1662,15 @@ mod tests {
         assert!(client
             .set_staging_policy(sync::StagingPolicy::default())
             .is_err());
+        assert!(client
+            .changes_scope(
+                crate::scan::ScanScope::default(),
+                Vec::new(),
+                Vec::new(),
+                "id".into(),
+                true,
+            )
+            .is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -1659,6 +1705,7 @@ mod tests {
                 ("validate_staged_apply", 44),
                 ("staging_filesystem_info", 45),
                 ("set_staging_policy", 46),
+                ("changes_scope", 47),
             ]
         );
     }
@@ -1702,8 +1749,78 @@ mod tests {
                 CAPABILITY_CHECKPOINTED_STAGING.to_string(),
                 CAPABILITY_STAGING_RESERVE_ENFORCEMENT.to_string(),
                 CAPABILITY_STAGING_INODE_CAPACITY.to_string(),
+                CAPABILITY_SCAN_EXCLUDES.to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn scope_changes_validate_paths_and_hard_exclude_remote_entries() {
+        use std::os::unix::net::UnixListener;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime_guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(base.join("excluded")).unwrap();
+        let _listener = UnixListener::bind(base.join("excluded/socket")).unwrap();
+        std::fs::write(base.join("included"), b"data").unwrap();
+        let mut server = DuetServerImpl::new().unwrap();
+        server
+            .set_base(base.to_string_lossy().into_owned())
+            .unwrap();
+        server.remote_state_dir = dir.path().join("state");
+        let remote_state = profile::remote_state_in(&server.remote_state_dir, "peer");
+        crate::state::save_entries_as(
+            &remote_state,
+            &vec![scan::DirEntryWithMeta::test_file(
+                PathBuf::from("excluded/old"),
+                7,
+            )],
+            SnapshotFormat::LegacyV1,
+        )
+        .unwrap();
+        let locations = vec![Location::Include(PathBuf::new())];
+
+        let changes = server
+            .changes_scope(
+                crate::scan::ScanScope::new(PathBuf::new(), vec![PathBuf::from("excluded")]),
+                locations.clone(),
+                Vec::new(),
+                "peer".to_string(),
+                true,
+            )
+            .unwrap();
+        assert!(changes.migration_needed);
+        assert!(changes
+            .changes
+            .iter()
+            .any(|change| change.path() == Path::new("included")));
+        assert!(changes
+            .changes
+            .iter()
+            .all(|change| !change.path().starts_with("excluded")));
+        assert_eq!(server.scope.excludes, vec![PathBuf::from("excluded")]);
+        assert!(server
+            .all_old
+            .iter()
+            .any(|entry| entry.path() == Path::new("excluded/old") && entry.digest().is_none()));
+        assert_eq!(
+            server.scan_policy.as_ref().unwrap().excludes,
+            server.scope.excludes
+        );
+
+        assert!(server
+            .changes_scope(
+                crate::scan::ScanScope::new(PathBuf::new(), vec![PathBuf::from("../escape")]),
+                locations,
+                Vec::new(),
+                "peer".to_string(),
+                true,
+            )
+            .is_err());
+        assert!(!server.changes_ready);
+        assert!(server.scope.excludes.is_empty());
     }
 
     #[test]

@@ -28,6 +28,8 @@ FLAGS:
     -v, --verbose       verbose output
     -n, --dry-run       check what sync would do without applying changes
         --debug-info    print protocol and capability negotiation details
+        --exclude <path>
+                         exclude a subtree from this sync; may be repeated
         --prune-ignored delete ignored files/directories that block removing a synced parent
         --profile-performance
                          print sync phase timings and transfer counters
@@ -144,7 +146,7 @@ pub(crate) async fn changes(name: String, statefile: Option<PathBuf>) -> Result<
 
     let changes = state::old_and_changes(
         &local_base,
-        &PathBuf::from(""),
+        &scan::ScanScope::default(),
         &prf.locations,
         &scan_ignore,
         Some(&statefile),

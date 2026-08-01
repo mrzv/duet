@@ -20,6 +20,8 @@ FLAGS:
     -v, --verbose       verbose output
     -n, --dry-run       check what sync would do without applying changes
         --debug-info    print protocol and capability negotiation details
+        --exclude <path>
+                         exclude a subtree from this sync; may be repeated
         --prune-ignored delete ignored files/directories that block removing a synced parent
         --staging-limit <size>
                          target maximum reconstructed bytes per staging wave
@@ -187,11 +189,22 @@ the base is automatically stripped. In the latter case, if the path starts with
 `.` or `..`, then it's relative to the current directory; otherwise it's
 relative to the base directory.
 
+`--exclude <path>` may be repeated to hard-exclude subtrees from one
+synchronization. Excludes use the same path rules as the restricted positional
+path. They are normalized, deduplicated, and collapsed; an exclude outside the
+current restriction is a no-op, while excluding the restriction itself or one
+of its ancestors selects nothing. Excluded subtrees are not scanned or treated
+as removed, profile includes cannot re-enter them, and their saved baseline is
+preserved so a later run without the exclusion discovers accumulated changes.
+Absolute excludes must remain under the local synchronization base.
+
 For example,
 ```
 duet my_profile ~/Path1/...
 
 duet my_profile .
+
+duet --exclude build --exclude ./private/cache my_profile src
 ```
 
 ## Recovery

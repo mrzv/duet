@@ -139,6 +139,54 @@ fn local_added_file_copies_to_remote() {
 }
 
 #[test]
+fn excluded_change_is_discovered_when_rerun_without_exclusion() {
+    let case = SyncCase::new_with_rules("+.\n");
+    fs::create_dir(case.local.join("held")).unwrap();
+    write(&case.local.join("held/file.txt"), "baseline");
+    assert_success(case.sync());
+
+    write(&case.local.join("held/file.txt"), "accumulated");
+    assert_success(case.sync_with_args(&["--exclude", "held"]));
+    assert_eq!(read(&case.remote.join("held/file.txt")), "baseline");
+
+    assert_success(case.sync());
+    assert_eq!(read(&case.remote.join("held/file.txt")), "accumulated");
+}
+
+#[test]
+fn exclusion_composes_with_restricted_synchronization() {
+    let case = SyncCase::new_with_rules("+.\n");
+    fs::create_dir(case.local.join("scope")).unwrap();
+    write(&case.local.join("scope/included.txt"), "included baseline");
+    write(&case.local.join("scope/excluded.txt"), "excluded baseline");
+    write(&case.local.join("outside.txt"), "outside baseline");
+    assert_success(case.sync());
+
+    write(&case.local.join("scope/included.txt"), "included updated");
+    write(&case.local.join("scope/excluded.txt"), "excluded updated");
+    write(&case.local.join("outside.txt"), "outside updated");
+
+    assert_success(case.sync_with_args(&["--exclude", "scope/excluded.txt", "scope"]));
+
+    assert_eq!(
+        read(&case.remote.join("scope/included.txt")),
+        "included updated"
+    );
+    assert_eq!(
+        read(&case.remote.join("scope/excluded.txt")),
+        "excluded baseline"
+    );
+    assert_eq!(read(&case.remote.join("outside.txt")), "outside baseline");
+
+    assert_success(case.sync());
+    assert_eq!(
+        read(&case.remote.join("scope/excluded.txt")),
+        "excluded updated"
+    );
+    assert_eq!(read(&case.remote.join("outside.txt")), "outside updated");
+}
+
+#[test]
 fn checkpointed_staging_runs_multiple_bidirectional_waves() {
     let case = SyncCase::new_with_rules("+.\n");
     let local_a = vec![b'a'; 3 * 1024];

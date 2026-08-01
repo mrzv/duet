@@ -11,6 +11,47 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanScope {
+    pub restrict: PathBuf,
+    pub excludes: Vec<PathBuf>,
+}
+
+impl ScanScope {
+    pub fn new(restrict: PathBuf, mut excludes: Vec<PathBuf>) -> Self {
+        excludes.sort();
+        excludes.dedup();
+        let mut compacted: Vec<PathBuf> = Vec::new();
+        for exclude in excludes {
+            if !compacted
+                .iter()
+                .any(|ancestor| exclude.starts_with(ancestor))
+            {
+                compacted.push(exclude);
+            }
+        }
+        Self {
+            restrict,
+            excludes: compacted,
+        }
+    }
+
+    pub fn selected(&self, path: &Path) -> bool {
+        path.starts_with(&self.restrict) && !self.is_excluded(path)
+    }
+
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        self.excludes
+            .iter()
+            .any(|exclude| path.starts_with(exclude))
+    }
+
+    fn relevant(&self, path: &Path) -> bool {
+        (path.starts_with(&self.restrict) || self.restrict.starts_with(path))
+            && !self.is_excluded(path)
+    }
+}
+
 use color_eyre::eyre::{eyre, Result, WrapErr};
 
 use std::sync::Arc;
@@ -216,10 +257,6 @@ impl DirEntryWithMeta {
             && self.target == other.target
             && self.is_dir == other.is_dir
             && (self.is_dir || self.same_scan_identity(other))
-    }
-
-    pub fn starts_with<P: AsRef<Path>>(&self, path: P) -> bool {
-        self.path.starts_with(path)
     }
 
     pub fn path(&self) -> &PathBuf {
@@ -469,7 +506,7 @@ struct ParentFromTo {
 #[derive(Debug)]
 struct ScanContext {
     locations: Arc<Locations>,
-    restrict: Arc<PathBuf>,
+    scope: Arc<ScanScope>,
     base: Arc<PathBuf>,
     ignore: Arc<Regexes>,
     dev: u64,
@@ -525,20 +562,22 @@ fn find_parent<'a>(path: &PathBuf, locations: &'a Locations, pft: &ParentFromTo)
     &locations[parent]
 }
 
-fn is_relevant_to_restrict(path: &Path, restrict: &Path) -> bool {
-    path.starts_with(restrict) || restrict.starts_with(path)
-}
-
 async fn scan_one_directory(context: Arc<ScanContext>, job: ScanJob) -> Result<Vec<ScanJob>> {
     let ScanJob { path, pft } = job;
     log::trace!("Scanning: {}", path.display());
 
+    let relative_path = relative(&context.base, &path);
+    if context.scope.is_excluded(relative_path) {
+        log::trace!("Skipping (CLI excluded): {:?}", path);
+        return Ok(Vec::new());
+    }
+
     // check the restriction
-    if !path.starts_with(&*context.restrict) && !context.restrict.starts_with(&path) {
+    if !context.scope.relevant(relative_path) {
         log::trace!(
             "Skipping (restriction): {:?} vs {:?}",
             path,
-            context.restrict
+            context.scope.restrict
         );
         return Ok(Vec::new());
     }
@@ -564,6 +603,12 @@ async fn scan_one_directory(context: Arc<ScanContext>, job: ScanJob) -> Result<V
         .wrap_err_with(|| format!("unable to read next directory entry in {}", path.display()))?
     {
         let path = child.path();
+
+        let relative_path = relative(&context.base, &path);
+        if context.scope.is_excluded(relative_path) {
+            log::trace!("Skipping (CLI excluded): {:?}", path);
+            continue;
+        }
 
         if is_match(&context.ignore, &path) {
             log::trace!("Skipping (ignored): {:?}", path);
@@ -591,7 +636,7 @@ async fn scan_one_directory(context: Arc<ScanContext>, job: ScanJob) -> Result<V
             || file_type.is_fifo()
             || file_type.is_socket()
         {
-            if path.starts_with(&*context.restrict) {
+            if context.scope.selected(relative_path) {
                 return Err(eyre!(
                     "unsupported special file in sync tree: {}",
                     path.display()
@@ -601,10 +646,7 @@ async fn scan_one_directory(context: Arc<ScanContext>, job: ScanJob) -> Result<V
             continue;
         }
 
-        if meta.is_dir()
-            && context.dev != meta.dev()
-            && is_relevant_to_restrict(&path, &context.restrict)
-        {
+        if meta.is_dir() && context.dev != meta.dev() && context.scope.relevant(relative_path) {
             return Err(eyre!(
                 "refusing to cross filesystem boundary at {}",
                 path.display()
@@ -624,7 +666,7 @@ async fn scan_one_directory(context: Arc<ScanContext>, job: ScanJob) -> Result<V
         }
 
         // check restriction and crossing the filesystem boundary
-        if path.starts_with(&*context.restrict) && context.dev == meta.dev() {
+        if context.scope.selected(relative_path) && context.dev == meta.dev() {
             log::trace!("Reporting: {:?}", path);
             let target = if file_type.is_symlink() {
                 Some(fs::read_link(&path).await.wrap_err_with(|| {
@@ -696,6 +738,30 @@ mod tests {
                 to: 0,
             },
         }
+    }
+
+    #[test]
+    fn scope_compacts_excludes_and_applies_restriction() {
+        let scope = ScanScope::new(
+            PathBuf::from("tree"),
+            vec![
+                PathBuf::from("tree/cache/deep"),
+                PathBuf::from("outside"),
+                PathBuf::from("tree/cache"),
+                PathBuf::from("tree/cache"),
+            ],
+        );
+
+        assert_eq!(
+            scope.excludes,
+            vec![PathBuf::from("outside"), PathBuf::from("tree/cache")]
+        );
+        assert!(scope.selected(Path::new("tree/file")));
+        assert!(!scope.selected(Path::new("tree/cache/file")));
+        assert!(!scope.selected(Path::new("outside/file")));
+
+        let empty = ScanScope::new(PathBuf::from("tree/nested"), vec![PathBuf::from("tree")]);
+        assert!(!empty.selected(Path::new("tree/nested/file")));
     }
 
     #[tokio::test]
@@ -875,6 +941,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_exclusion_hard_skips_before_metadata_and_profile_reentry() {
+        let temp = tempfile::tempdir().unwrap();
+        let excluded = temp.path().join("excluded");
+        tokio::fs::create_dir(&excluded).await.unwrap();
+        let socket_path = excluded.join("socket");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let scope = ScanScope::new(PathBuf::new(), vec![PathBuf::from("excluded")]);
+
+        scan_scope(
+            temp.path(),
+            &scope,
+            &vec![
+                Location::Include(PathBuf::new()),
+                Location::Exclude(PathBuf::from("excluded")),
+                Location::Include(PathBuf::from("excluded/socket")),
+            ],
+            &Vec::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn scan_handles_deep_directory_trees() {
         let temp = tempfile::tempdir().unwrap();
         let mut nested_dir = temp.path().to_path_buf();
@@ -1012,18 +1105,12 @@ mod tests {
 
     #[test]
     fn filesystem_boundary_relevance_includes_restrict_ancestors() {
-        let restrict = Path::new("/base/mount/wanted");
+        let scope = ScanScope::new(PathBuf::from("mount/wanted"), Vec::new());
 
-        assert!(is_relevant_to_restrict(Path::new("/base/mount"), restrict));
-        assert!(is_relevant_to_restrict(
-            Path::new("/base/mount/wanted"),
-            restrict
-        ));
-        assert!(is_relevant_to_restrict(
-            Path::new("/base/mount/wanted/child"),
-            restrict
-        ));
-        assert!(!is_relevant_to_restrict(Path::new("/base/other"), restrict));
+        assert!(scope.relevant(Path::new("mount")));
+        assert!(scope.relevant(Path::new("mount/wanted")));
+        assert!(scope.relevant(Path::new("mount/wanted/child")));
+        assert!(!scope.relevant(Path::new("other")));
     }
 }
 
@@ -1035,6 +1122,7 @@ mod tests {
 /// * `path` - restriction under base, which should be scanned
 /// * `locations` - [locations](Locations) to scan
 /// * `tx` - [Sender](mpsc::Sender) of the channel, where to send the [directory entries](DirEntryWithMeta)
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(
     base: P,
     path: Q,
@@ -1042,12 +1130,29 @@ pub async fn scan<P: AsRef<Path>, Q: AsRef<Path>>(
     ignore: &Ignore,
     tx: mpsc::Sender<DirEntryWithMeta>,
 ) -> Result<()> {
-    scan_with_limit(base, path, locations, ignore, tx, 64).await
+    scan_scope(
+        base,
+        &ScanScope::new(path.as_ref().to_path_buf(), Vec::new()),
+        locations,
+        ignore,
+        tx,
+    )
+    .await
 }
 
-pub(crate) async fn scan_with_limit<P: AsRef<Path>, Q: AsRef<Path>>(
+pub async fn scan_scope<P: AsRef<Path>>(
     base: P,
-    path: Q,
+    scope: &ScanScope,
+    locations: &Locations,
+    ignore: &Ignore,
+    tx: mpsc::Sender<DirEntryWithMeta>,
+) -> Result<()> {
+    scan_scope_with_limit(base, scope, locations, ignore, tx, 64).await
+}
+
+pub(crate) async fn scan_scope_with_limit<P: AsRef<Path>>(
+    base: P,
+    scope: &ScanScope,
     locations: &Locations,
     ignore: &Ignore,
     tx: mpsc::Sender<DirEntryWithMeta>,
@@ -1055,11 +1160,14 @@ pub(crate) async fn scan_with_limit<P: AsRef<Path>, Q: AsRef<Path>>(
 ) -> Result<()> {
     assert!(limit > 0, "scan concurrency limit must be nonzero");
     let base = PathBuf::from(base.as_ref());
-    let mut restrict = Arc::new(PathBuf::from(&base));
-    (*Arc::get_mut(&mut restrict).unwrap()).push(path);
+    let scope = Arc::new(scope.clone());
     let base = Arc::new(base);
 
-    log::info!("Going to scan: {}", restrict.display());
+    log::info!("Going to scan: {}", scope.restrict.display());
+
+    if scope.is_excluded(&scope.restrict) {
+        return Ok(());
+    }
 
     let dev = tokio::fs::symlink_metadata(&*base)
         .await
@@ -1081,7 +1189,7 @@ pub(crate) async fn scan_with_limit<P: AsRef<Path>, Q: AsRef<Path>>(
     let to = locations.len() - 1;
     let context = Arc::new(ScanContext {
         locations,
-        restrict,
+        scope,
         base,
         ignore,
         dev,

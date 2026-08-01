@@ -231,10 +231,11 @@ is local from one process's point of view is remote from the other.
 
 Scanning is asynchronous and implemented in `src/scan/mod.rs`.
 
-`scan::scan()` receives:
+`scan::scan_scope()` receives:
 
 - synchronization base path
-- optional restricted path under the base
+- a serializable `ScanScope` containing the restricted path and compacted hard
+  subtree exclusions
 - include/exclude locations
 - ignore globs
 - a Tokio `mpsc::Sender` for discovered entries
@@ -249,9 +250,11 @@ The scanner:
 1. Prefixes canonical, sorted, unique location rules with the absolute base path.
 2. Converts ignore globs to regexes.
 3. Walks the base directory while honoring include/exclude rules.
-4. Skips ignored entries, special files, and filesystem boundary crossings.
-5. Reads symlink targets as metadata instead of following symlinks.
-6. Sends reported entries through the channel as `DirEntryWithMeta`.
+4. Rejects hard-excluded entries before metadata or directory reads, preventing
+   profile descendant includes from re-entering them.
+5. Skips ignored entries, special files, and filesystem boundary crossings.
+6. Reads symlink targets as metadata instead of following symlinks.
+7. Sends reported entries through the channel as `DirEntryWithMeta`.
 
 `state::scan_entries()` directly owns and polls the scanner future while receiving
 entries from the channel. Cancellation drops the scan instead of detaching it;
@@ -271,9 +274,11 @@ avoid walking unrelated parts of large trees.
 State loading uses `try_exists()` and path-aware read/decode errors so permission
 failures are not mistaken for missing state.
 
-After both inputs are available, `old_and_changes()` filters old snapshot entries
-to the restricted path and calls `scan::changes()`, which merges old and current
-sorted entries:
+After both inputs are available, `old_and_changes()` filters both old and current
+entries through the same scope and calls `scan::changes()`. Excluded baseline
+entries remain in the full snapshot and scope replacement used by strong-digest
+migration replaces only selected entries. The merge of old and current sorted
+entries is:
 
 - old only -> removed
 - current only -> added

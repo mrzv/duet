@@ -21,7 +21,7 @@ use crate::progress;
 use crate::remote;
 use crate::resolution::{self, AllResolution};
 use crate::rpc::{self, DuetServerAsync};
-use crate::scan::Change;
+use crate::scan::{self, Change};
 use crate::state;
 use crate::sync as sync_ops;
 use crate::sync_error;
@@ -202,7 +202,7 @@ struct SyncContext {
     remote_base: String,
     remote_server: Option<String>,
     remote_cmd: String,
-    path: PathBuf,
+    scope: scan::ScanScope,
     local_state: PathBuf,
     remote_state_dir: Option<PathBuf>,
     server_log: PathBuf,
@@ -242,7 +242,7 @@ pub async fn sync(
     let setup_start = Instant::now();
     env_logger::init();
 
-    let context = prepare_context(source, path)?;
+    let context = prepare_context(source, path, &options.excludes)?;
     sync_ops::check_apply_attempt_clear(&context.local_state)?;
     performance.record_phase("setup", setup_start.elapsed());
     if interrupt.is_cancel_requested() {
@@ -257,7 +257,7 @@ pub async fn sync(
         remote_base,
         remote_server,
         remote_cmd,
-        path,
+        scope,
         local_state,
         remote_state_dir,
         server_log,
@@ -266,7 +266,8 @@ pub async fn sync(
     let locations = outbound_scan_locations(&prf.locations);
     let scan_ignore = prf.scan_ignore();
     let scan_policy =
-        sync_ops::ScanPolicy::with_prune(locations.clone(), prf.ignore.clone(), prf.prune.clone());
+        sync_ops::ScanPolicy::with_prune(locations.clone(), prf.ignore.clone(), prf.prune.clone())
+            .with_excludes(scope.excludes.clone());
     let mut apply_options = sync_ops::ApplyOptions {
         prune_ignored: options.prune_ignored,
     };
@@ -295,6 +296,9 @@ pub async fn sync(
         .await
         .map_err(|e| remote_rpc_error("Couldn't set server base", e))?;
     let remote_info = remote.server_info().await.map_err(server_info_error)?;
+    if !scope.excludes.is_empty() {
+        require_remote_capability(&remote_info, rpc::CAPABILITY_SCAN_EXCLUDES)?;
+    }
     if !prf.prune.is_empty() {
         require_remote_capability(&remote_info, rpc::CAPABILITY_PRUNE_PATTERNS)?;
         remote.set_prune_patterns(prf.prune.clone()).await
@@ -316,19 +320,22 @@ pub async fn sync(
 
     let local_fut = async {
         let start = Instant::now();
-        let result = state::old_and_changes(&local_base, &path, &locations, &scan_ignore, Some(&local_state), strong).await;
+        let result = state::old_and_changes(&local_base, &scope, &locations, &scan_ignore, Some(&local_state), strong).await;
         (result, start.elapsed())
     };
-    let remote_path = path.clone();
+    let remote_scope = scope.clone();
     let remote_locations = locations.clone();
     let remote_ignore = scan_ignore.clone();
     let remote_fut = async {
         let start = Instant::now();
-        let result = if strong {
-            remote.changes_v2(remote_path, remote_locations, remote_ignore, remote_id.clone()).await
+        let result = if !remote_scope.excludes.is_empty() {
+            remote.changes_scope(remote_scope, remote_locations, remote_ignore, remote_id.clone(), strong).await
+                .map_err(|e| remote_rpc_error("Couldn't get remote scoped changes", e))
+        } else if strong {
+            remote.changes_v2(remote_scope.restrict, remote_locations, remote_ignore, remote_id.clone()).await
                 .map_err(|e| remote_rpc_error("Couldn't get remote V2 changes", e))
         } else {
-            remote.changes(remote_path, remote_locations, remote_ignore, remote_id.clone()).await
+            remote.changes(remote_scope.restrict, remote_locations, remote_ignore, remote_id.clone()).await
                 .map(|changes| state::ChangesV2 {
                     changes: changes.into_iter().map(Into::into).collect(),
                     current: Vec::new(),
@@ -370,7 +377,7 @@ pub async fn sync(
     let resolve_start = Instant::now();
     let migration = strong && (local_context.migration_needed || remote_context.migration_needed);
     let mut actions = if migration {
-        state::replace_scope(&mut local_all_old, &path, &local_context.current);
+        state::replace_scope(&mut local_all_old, &scope, &local_context.current);
         remote.prepare_migration_v2().await
             .map_err(|e| remote_rpc_error("Couldn't prepare remote strong-digest migration", e))?;
         build_migration_actions(
@@ -1231,7 +1238,7 @@ fn outbound_scan_locations(
 pub async fn recover_remote(target: PathBuf, clear: bool, yes: bool) -> Result<()> {
     env_logger::init();
     let profile_name = remote_recovery_profile_name(&target)?;
-    let context = prepare_context(ProfileSource::Named(profile_name.to_string()), None)?;
+    let context = prepare_context(ProfileSource::Named(profile_name.to_string()), None, &[])?;
 
     let SyncContext {
         local_id,
@@ -1835,7 +1842,11 @@ fn finalize_server<T>(primary: Result<T>, wait: Result<ExitStatus>) -> Result<T>
     }
 }
 
-fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncContext> {
+fn prepare_context(
+    source: ProfileSource,
+    path: Option<PathBuf>,
+    excludes: &[PathBuf],
+) -> Result<SyncContext> {
     let config = profile::load(&source).unwrap_or_else(|e| {
         let diagnostic =
             sync_error::render_error("setup", "load profile", profile_source_path(&source), e);
@@ -1862,11 +1873,11 @@ fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncC
             )
         })?;
 
-    let path = normalize_path(&local_base, &path.unwrap_or(PathBuf::from("")))?;
+    let scope = normalize_scope(&local_base, path, excludes)?;
     println!(
         "Using profile: {} {}",
         config.display_name.cyan(),
-        path.display().to_string().yellow()
+        scope.restrict.display().to_string().yellow()
     );
 
     let remote_state_dir = remote_state_dir_for_source(&source, remote_server.as_deref(), &config)?;
@@ -1880,7 +1891,7 @@ fn prepare_context(source: ProfileSource, path: Option<PathBuf>) -> Result<SyncC
         remote_base,
         remote_server,
         remote_cmd,
-        path,
+        scope,
         local_state: config.local_state,
         remote_state_dir,
         server_log: config.server_log,
@@ -2922,6 +2933,65 @@ fn normalize_path(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
     normalize_path_from_cwd(local_base, path, &cwd)
 }
 
+fn normalize_scope(
+    local_base: &PathBuf,
+    restrict: Option<PathBuf>,
+    excludes: &[PathBuf],
+) -> Result<scan::ScanScope> {
+    let restrict = normalize_path(local_base, &restrict.unwrap_or_default())?;
+    let excludes = excludes
+        .iter()
+        .map(|path| normalize_exclusion(local_base, path))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(scan::ScanScope::new(restrict, excludes))
+}
+
+fn normalize_exclusion(local_base: &PathBuf, path: &PathBuf) -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let absolute = if path.is_absolute() {
+        path.clone()
+    } else {
+        let anchor = if path.starts_with("./")
+            || path.starts_with("../")
+            || path == Path::new(".")
+            || path == Path::new("..")
+        {
+            cwd.as_path()
+        } else {
+            local_base.as_path()
+        };
+        anchor.join(path)
+    };
+
+    // Exclusions identify entries in the scanned namespace. Resolve their
+    // ancestors for containment checks, but preserve the final component so an
+    // existing or broken symlink excludes the symlink rather than its target.
+    let resolved = match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => resolve_existing_prefix(parent)?.join(name),
+        _ => resolve_existing_prefix(&absolute)?,
+    };
+    let relative = match resolved.strip_prefix(local_base) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => {
+            let canonical_base = local_base.canonicalize().wrap_err_with(|| {
+                format!("unable to resolve local base {}", local_base.display())
+            })?;
+            resolved
+                .strip_prefix(&canonical_base)
+                .map(Path::to_path_buf)
+                .wrap_err_with(|| {
+                    format!(
+                        "excluded path {} is outside local base {}",
+                        resolved.display(),
+                        local_base.display()
+                    )
+                })?
+        }
+    };
+    validate_relative_restriction(&relative)?;
+    Ok(relative)
+}
+
 fn normalize_path_from_cwd(local_base: &PathBuf, path: &PathBuf, cwd: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return normalize_absolute_restriction(local_base, path);
@@ -3216,6 +3286,67 @@ mod tests {
         let normalized = normalize_path(&base, &PathBuf::from("sub/path")).unwrap();
 
         assert_eq!(normalized, PathBuf::from("sub/path"));
+    }
+
+    #[test]
+    fn normalize_scope_sorts_deduplicates_and_collapses_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(base.join("tree")).unwrap();
+
+        let scope = normalize_scope(
+            &base,
+            Some(PathBuf::from("tree")),
+            &[
+                PathBuf::from("tree/cache/deep"),
+                PathBuf::from("outside"),
+                PathBuf::from("tree/cache"),
+                PathBuf::from("tree/cache"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(scope.restrict, PathBuf::from("tree"));
+        assert_eq!(
+            scope.excludes,
+            vec![PathBuf::from("outside"), PathBuf::from("tree/cache")]
+        );
+    }
+
+    #[test]
+    fn normalize_scope_accepts_missing_in_base_suffix_and_rejects_outside_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+
+        let scope = normalize_scope(
+            &base,
+            None,
+            &[base.join("missing/deep"), PathBuf::from("ordinary/missing")],
+        )
+        .unwrap();
+        assert_eq!(
+            scope.excludes,
+            vec![
+                PathBuf::from("missing/deep"),
+                PathBuf::from("ordinary/missing")
+            ]
+        );
+        assert!(normalize_scope(&base, None, &[dir.path().join("outside")]).is_err());
+    }
+
+    #[test]
+    fn normalize_scope_preserves_excluded_symlink_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("link")).unwrap();
+
+        let scope = normalize_scope(&base, None, &[PathBuf::from("link")]).unwrap();
+
+        assert_eq!(scope.excludes, vec![PathBuf::from("link")]);
     }
 
     #[test]

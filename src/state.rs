@@ -210,12 +210,27 @@ pub async fn scan_entries(
     locations: &Locations,
     ignore: &profile::Ignore,
 ) -> Result<Entries> {
+    scan_scope_entries(
+        base,
+        &scan::ScanScope::new(path.clone(), Vec::new()),
+        locations,
+        ignore,
+    )
+    .await
+}
+
+pub async fn scan_scope_entries(
+    base: &PathBuf,
+    scope: &scan::ScanScope,
+    locations: &Locations,
+    ignore: &profile::Ignore,
+) -> Result<Entries> {
     let base = base.clone();
-    let path = path.clone();
+    let scope = scope.clone();
     let locations = locations.clone();
     let ignore = ignore.clone();
     let (tx, rx) = mpsc::channel(32);
-    collect_scan(scan::scan(&base, &path, &locations, &ignore, tx), rx).await
+    collect_scan(scan::scan_scope(&base, &scope, &locations, &ignore, tx), rx).await
 }
 
 pub async fn hash_manifest(base: &PathBuf, entries: &mut Entries) -> Result<()> {
@@ -429,21 +444,21 @@ pub(crate) async fn hash_manifest_with_limit(
     Ok(())
 }
 
-pub fn replace_scope(entries: &mut Entries, restrict: &Path, current: &Entries) {
-    entries.retain(|entry| !entry.starts_with(restrict));
+pub fn replace_scope(entries: &mut Entries, scope: &scan::ScanScope, current: &Entries) {
+    entries.retain(|entry| !scope.selected(entry.path()));
     entries.extend(current.iter().cloned());
     entries.sort();
 }
 
 pub async fn old_and_changes(
     base: &PathBuf,
-    restrict: &PathBuf,
+    scope: &scan::ScanScope,
     locations: &Locations,
     ignore: &profile::Ignore,
     statefile: Option<&PathBuf>,
     strong: bool,
 ) -> Result<ScanContext> {
-    let restricted_current_scan = scan_entries(base, restrict, locations, ignore);
+    let restricted_current_scan = scan_scope_entries(base, scope, locations, ignore);
     let loaded = async {
         match statefile {
             Some(path) => load_entries_with_format(path),
@@ -456,10 +471,11 @@ pub async fn old_and_changes(
     let (loaded, current) = tokio::join!(loaded, restricted_current_scan);
     let loaded = loaded?;
     let mut current = current?;
+    current.retain(|entry| scope.selected(entry.path()));
     let restricted_old: Vec<_> = loaded
         .entries
         .iter()
-        .filter(|e| e.starts_with(restrict))
+        .filter(|e| scope.selected(e.path()))
         .collect();
     let mut changes: Changes =
         scan::changes(restricted_old.iter().copied(), current.iter()).collect();
@@ -873,7 +889,7 @@ mod tests {
 
         let context = old_and_changes(
             &dir.path().to_path_buf(),
-            &PathBuf::new(),
+            &scan::ScanScope::default(),
             &locations,
             &Vec::new(),
             Some(&state_path),
@@ -924,7 +940,7 @@ mod tests {
 
         let context = old_and_changes(
             &dir.path().to_path_buf(),
-            &PathBuf::from("scope"),
+            &scan::ScanScope::new(PathBuf::from("scope"), Vec::new()),
             &locations,
             &Vec::new(),
             Some(&state_path),
@@ -940,7 +956,11 @@ mod tests {
             .filter(|e| e.is_file())
             .all(|e| e.digest().is_some()));
         let mut migrated = context.all_old;
-        replace_scope(&mut migrated, Path::new("scope"), &context.current);
+        replace_scope(
+            &mut migrated,
+            &scan::ScanScope::new(PathBuf::from("scope"), Vec::new()),
+            &context.current,
+        );
         assert_eq!(
             migrated
                 .iter()
@@ -955,5 +975,58 @@ mod tests {
             .unwrap()
             .digest()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn excluded_old_entries_are_preserved_and_discovered_on_unexcluded_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("tree")).unwrap();
+        std::fs::write(dir.path().join("tree/keep"), b"keep").unwrap();
+        std::fs::write(dir.path().join("tree/skip"), b"changed").unwrap();
+        let state_path = dir.path().join("state");
+        let old = vec![
+            DirEntryWithMeta::test_file(PathBuf::from("tree/keep"), 1),
+            DirEntryWithMeta::test_file(PathBuf::from("tree/skip"), 2),
+        ];
+        save_entries_as(&state_path, &old, SnapshotFormat::LegacyV1).unwrap();
+        let locations = vec![crate::scan::location::Location::Include(PathBuf::new())];
+        let excluded_scope =
+            scan::ScanScope::new(PathBuf::from("tree"), vec![PathBuf::from("tree/skip")]);
+
+        let excluded = old_and_changes(
+            &dir.path().to_path_buf(),
+            &excluded_scope,
+            &locations,
+            &Vec::new(),
+            Some(&state_path),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(excluded
+            .changes
+            .iter()
+            .all(|change| change.path() != Path::new("tree/skip")));
+        let mut migrated = excluded.all_old;
+        replace_scope(&mut migrated, &excluded_scope, &excluded.current);
+        assert!(migrated
+            .iter()
+            .any(|entry| entry.path() == Path::new("tree/skip") && entry.digest().is_none()));
+        save_entries_as(&state_path, &migrated, SnapshotFormat::V2).unwrap();
+
+        let rerun = old_and_changes(
+            &dir.path().to_path_buf(),
+            &scan::ScanScope::new(PathBuf::from("tree"), Vec::new()),
+            &locations,
+            &Vec::new(),
+            Some(&state_path),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(rerun
+            .changes
+            .iter()
+            .any(|change| change.path() == Path::new("tree/skip")));
     }
 }
