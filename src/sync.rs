@@ -72,6 +72,7 @@ pub struct StagingFilesystemInfo {
     pub total_bytes: u64,
     pub available_bytes: u64,
     pub available_inodes: u64,
+    pub inode_capacity_known: bool,
     pub block_size: u64,
     pub cow_clone_supported: bool,
 }
@@ -579,6 +580,7 @@ pub fn staging_filesystem_info(base: &Path) -> Result<StagingFilesystemInfo> {
     staging_filesystem_info_from_counts(
         stats.f_blocks as u64,
         stats.f_bavail as u64,
+        stats.f_files as u64,
         stats.f_favail as u64,
         stats.f_frsize as u64,
         stats.f_bsize as u64,
@@ -605,6 +607,7 @@ pub fn staging_filesystem_info_with_clone_probe(base: &Path) -> Result<StagingFi
 fn staging_filesystem_info_from_counts(
     blocks: u64,
     available_blocks: u64,
+    total_inodes: u64,
     available_inodes: u64,
     fragment_size: u64,
     block_size_fallback: u64,
@@ -626,6 +629,8 @@ fn staging_filesystem_info_from_counts(
         total_bytes: blocks.saturating_mul(block_size),
         available_bytes: available_blocks.saturating_mul(block_size),
         available_inodes,
+        // Filesystems without a fixed inode table commonly report both inode counts as zero.
+        inode_capacity_known: total_inodes != 0,
         block_size,
         // A trustworthy clone-capability check requires creating files on the target filesystem.
         cow_clone_supported: false,
@@ -8371,6 +8376,7 @@ mod tests {
             total_bytes,
             available_bytes,
             available_inodes: 0,
+            inode_capacity_known: false,
             block_size: 4096,
             cow_clone_supported: false,
         }
@@ -8973,13 +8979,31 @@ mod tests {
 
     #[test]
     fn staging_filesystem_count_conversion_falls_back_and_saturates() {
-        let info =
-            staging_filesystem_info_from_counts(u64::MAX, u64::MAX, 17, 0, 4096, Path::new("base"))
-                .unwrap();
+        let info = staging_filesystem_info_from_counts(
+            u64::MAX,
+            u64::MAX,
+            100,
+            17,
+            0,
+            4096,
+            Path::new("base"),
+        )
+        .unwrap();
         assert_eq!(info.block_size, 4096);
         assert_eq!(info.total_bytes, u64::MAX);
         assert_eq!(info.available_bytes, u64::MAX);
         assert_eq!(info.available_inodes, 17);
+        assert!(info.inode_capacity_known);
+    }
+
+    #[test]
+    fn staging_filesystem_count_conversion_marks_inode_less_filesystems_unknown() {
+        let info =
+            staging_filesystem_info_from_counts(100, 50, 0, 0, 4096, 4096, Path::new("base"))
+                .unwrap();
+
+        assert_eq!(info.available_inodes, 0);
+        assert!(!info.inode_capacity_known);
     }
 
     #[test]

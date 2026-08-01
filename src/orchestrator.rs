@@ -1479,6 +1479,7 @@ fn validate_wave_capacity(
         wave.local_requires_cow_capacity,
         policy.budget(local_filesystem),
         local_filesystem.available_inodes,
+        local_filesystem.inode_capacity_known,
         wave_index,
         wave_count,
     )?;
@@ -1490,6 +1491,7 @@ fn validate_wave_capacity(
         wave.remote_requires_cow_capacity,
         policy.budget(remote_filesystem),
         remote_filesystem.available_inodes,
+        remote_filesystem.inode_capacity_known,
         wave_index,
         wave_count,
     )
@@ -1504,6 +1506,7 @@ fn validate_wave_side_capacity(
     requires_cow_capacity: bool,
     budget: sync_ops::StagingBudget,
     available_inodes: u64,
+    inode_capacity_known: bool,
     wave_index: usize,
     wave_count: usize,
 ) -> Result<()> {
@@ -1526,7 +1529,7 @@ fn validate_wave_side_capacity(
             budget.budget_bytes
         ));
     }
-    if required_outputs as u128 > available_inodes as u128 {
+    if inode_capacity_known && required_outputs as u128 > available_inodes as u128 {
         return Err(eyre!(
             "staging capacity shrank before wave {wave_number}/{wave_count}: {side} requires {required_outputs} staged files but only {available_inodes} inodes are available"
         ));
@@ -3595,19 +3598,20 @@ mod tests {
             cow_clone_supported: true,
         };
 
-        validate_wave_side_capacity("local", 100, 1, true, true, budget, 1, 0, 1).unwrap();
+        validate_wave_side_capacity("local", 100, 1, true, true, budget, 1, true, 0, 1).unwrap();
         assert!(
-            validate_wave_side_capacity("local", 100, 1, true, false, budget, 1, 0, 1)
+            validate_wave_side_capacity("local", 100, 1, true, false, budget, 1, true, 0, 1)
                 .unwrap_err()
                 .to_string()
                 .contains("logical output bytes")
         );
         assert!(
-            validate_wave_side_capacity("local", 100, 1, true, true, budget, 0, 0, 1)
+            validate_wave_side_capacity("local", 100, 1, true, true, budget, 0, true, 0, 1)
                 .unwrap_err()
                 .to_string()
                 .contains("inodes")
         );
+        validate_wave_side_capacity("local", 100, 1, true, true, budget, 0, false, 0, 1).unwrap();
     }
 
     #[test]
