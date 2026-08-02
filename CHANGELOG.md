@@ -22,6 +22,7 @@
 - Enforced host-local staging reserves during materialized writes, after durability barriers, and immediately before commit, while retaining default legacy fallback for peers that cannot negotiate the policy.
 
 ### Fixed
+- Kept destructive directory actions pending when unresolved descendant conflicts are skipped, preventing tracked children from being misreported as unexpected removal blockers.
 - Fixed Ctrl+C only terminating the signal-handler thread while synchronization continued in the background.
 - Added validation checkpoints that detect prepared output identity or content changes before the fence and immediately before publication.
 - Prevented precommit cancellation from orphaning recovery markers or staging, including retries after partially completed cleanup.

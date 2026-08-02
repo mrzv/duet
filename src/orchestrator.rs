@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitStatus;
@@ -454,12 +454,15 @@ pub async fn sync(
 
     log::debug!("synchronizing");
 
-    let actions: Arc<Actions> = Arc::new(
-        actions
-            .into_iter()
-            .filter(|a| !a.is_unresolved_conflict())
-            .collect(),
-    );
+    let (actions, conflict_dependent_paths) =
+        filter_unresolved_conflict_dependencies(actions);
+    for path in conflict_dependent_paths {
+        println!(
+            "Skipping {} because it is structurally dependent on an unresolved conflict",
+            crate::actions::show_path(&path)
+        );
+    }
+    let actions: Arc<Actions> = Arc::new(actions);
     performance.counters.active_actions = actions.len();
 
     if options.dry_run && actions.is_empty() {
@@ -2926,6 +2929,65 @@ fn build_actions(
         .collect()
 }
 
+fn filter_unresolved_conflict_dependencies(actions: Actions) -> (Actions, Vec<PathBuf>) {
+    let unresolved_paths: Vec<PathBuf> = actions
+        .iter()
+        .filter(|action| action.is_unresolved_conflict())
+        .map(|action| action.path().clone())
+        .collect();
+    let unresolved_path_set: HashSet<&Path> =
+        unresolved_paths.iter().map(PathBuf::as_path).collect();
+    let mut skipped = Vec::new();
+    let active = actions
+        .into_iter()
+        .filter_map(|action| {
+            if action.is_unresolved_conflict() {
+                return None;
+            }
+
+            let path = action.path();
+            let below_unresolved = path
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| unresolved_path_set.contains(ancestor));
+            let first_descendant =
+                unresolved_paths.partition_point(|conflict| conflict.as_path() <= path.as_path());
+            let removes_unresolved_subtree = action_removes_directory(&action)
+                && unresolved_paths
+                    .get(first_descendant)
+                    .is_some_and(|conflict| conflict.starts_with(path));
+            if below_unresolved || removes_unresolved_subtree {
+                skipped.push(path.clone());
+                None
+            } else {
+                Some(action)
+            }
+        })
+        .collect();
+    (active, skipped)
+}
+
+fn action_removes_directory(action: &Action) -> bool {
+    match action {
+        Action::Local(change) | Action::Remote(change) => change_removes_directory(change),
+        Action::ResolvedLocal(_, change) | Action::ResolvedRemote(_, change) => {
+            change_removes_directory(change)
+        }
+        Action::Identical(local, remote) => {
+            change_removes_directory(local) || change_removes_directory(remote)
+        }
+        Action::Conflict(_, _) => false,
+    }
+}
+
+fn change_removes_directory(change: &Change) -> bool {
+    match change {
+        Change::Removed(entry) => entry.is_dir(),
+        Change::Modified(old, new) => old.is_dir() && !new.is_dir(),
+        Change::Added(_) => false,
+    }
+}
+
 fn build_migration_actions(
     local_changes: &state::Changes,
     remote_changes: &state::Changes,
@@ -3437,6 +3499,49 @@ mod tests {
             [Action::Remote(Change::Modified(_, new))] => assert_eq!(new.digest(), local.digest()),
             other => panic!("unexpected migration actions: {:?}", other),
         }
+    }
+
+    #[test]
+    fn unresolved_descendant_conflict_suppresses_directory_removal() {
+        let directory = scan::DirEntryWithMeta::test_dir(PathBuf::from("tree"));
+        let old_conflict = digested_entry("tree/conflict.txt", b"old");
+        let new_conflict = digested_entry("tree/conflict.txt", b"remote");
+        let old_independent = digested_entry("independent.txt", b"old");
+        let new_independent = digested_entry("independent.txt", b"local");
+        let actions = vec![
+            Action::Remote(Change::Modified(old_independent, new_independent)),
+            Action::Remote(Change::Removed(directory)),
+            Action::Conflict(
+                Change::Removed(old_conflict.clone()),
+                Change::Modified(old_conflict, new_conflict),
+            ),
+        ];
+
+        let (active, skipped) = filter_unresolved_conflict_dependencies(actions);
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].path(), Path::new("independent.txt"));
+        assert_eq!(skipped, vec![PathBuf::from("tree")]);
+    }
+
+    #[test]
+    fn unresolved_directory_conflict_suppresses_descendant_actions() {
+        let old_directory = scan::DirEntryWithMeta::test_dir(PathBuf::from("tree"));
+        let mut changed_directory = old_directory.clone();
+        changed_directory.set_mode(0o700);
+        let descendant = digested_entry("tree/child.txt", b"old");
+        let actions = vec![
+            Action::Conflict(
+                Change::Removed(old_directory.clone()),
+                Change::Modified(old_directory, changed_directory),
+            ),
+            Action::Remote(Change::Removed(descendant)),
+        ];
+
+        let (active, skipped) = filter_unresolved_conflict_dependencies(actions);
+
+        assert!(active.is_empty());
+        assert_eq!(skipped, vec![PathBuf::from("tree/child.txt")]);
     }
 
     #[test]

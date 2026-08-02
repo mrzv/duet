@@ -449,6 +449,21 @@ fn remote_removed_file_removes_local() {
 }
 
 #[test]
+fn nested_tracked_directory_removal_removes_children_before_parents() {
+    let case = SyncCase::new_with_rules("+.\n");
+    fs::create_dir_all(case.local.join("tree/child/grandchild")).unwrap();
+    write(&case.local.join("tree/root.txt"), "root");
+    write(&case.local.join("tree/child/child.txt"), "child");
+    write(&case.local.join("tree/child/grandchild/leaf.txt"), "leaf");
+    assert_success(case.sync());
+
+    fs::remove_dir_all(case.local.join("tree")).unwrap();
+    assert_success(case.sync());
+
+    assert!(!case.remote.join("tree").exists());
+}
+
+#[test]
 fn batch_conflict_aborts_without_changing_files() {
     let case = SyncCase::new();
     let local_file = case.local.join("a.txt");
@@ -464,6 +479,35 @@ fn batch_conflict_aborts_without_changing_files() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(read(&local_file), "local changed");
     assert_eq!(read(&remote_file), "remote changed");
+}
+
+#[test]
+fn forced_descendant_conflict_keeps_destructive_ancestor_pending() {
+    let case = SyncCase::new_with_rules("+.\n");
+    fs::create_dir(case.local.join("tree")).unwrap();
+    write(&case.local.join("tree/conflict.txt"), "initial");
+    write(&case.local.join("independent.txt"), "initial");
+    assert_success(case.sync());
+
+    fs::remove_dir_all(case.local.join("tree")).unwrap();
+    write(&case.remote.join("tree/conflict.txt"), "remote changed");
+    write(&case.local.join("independent.txt"), "local changed");
+
+    let output = case.sync_with_args(&["--force"]);
+    let text = combined_output(&output);
+
+    assert_success(output);
+    assert!(
+        text.contains("Skipping tree") && text.contains("structurally dependent"),
+        "{}",
+        text
+    );
+    assert!(!case.local.join("tree").exists());
+    assert_eq!(
+        read(&case.remote.join("tree/conflict.txt")),
+        "remote changed"
+    );
+    assert_eq!(read(&case.remote.join("independent.txt")), "local changed");
 }
 
 #[test]
