@@ -1,4 +1,6 @@
 use color_eyre::eyre::Result;
+use std::ops::Deref;
+use std::time::Duration;
 
 const BAR_TEMPLATE: &str = "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {wide_msg}";
 const BYTE_BAR_TEMPLATE: &str =
@@ -37,6 +39,28 @@ pub(crate) fn spinner(message: impl Into<String>) -> Result<indicatif::ProgressB
     Ok(progress)
 }
 
+pub(crate) struct AutoClearProgressBar(indicatif::ProgressBar);
+
+impl Deref for AutoClearProgressBar {
+    type Target = indicatif::ProgressBar;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for AutoClearProgressBar {
+    fn drop(&mut self) {
+        self.0.finish_and_clear();
+    }
+}
+
+pub(crate) fn steady_spinner(message: impl Into<String>) -> Result<AutoClearProgressBar> {
+    let progress = spinner(message)?;
+    progress.enable_steady_tick(Duration::from_millis(100));
+    Ok(AutoClearProgressBar(progress))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,6 +77,19 @@ mod tests {
         let progress = spinner("scanning").unwrap();
         assert_eq!(progress.length(), None);
         assert_eq!(progress.message(), "scanning");
+    }
+
+    #[test]
+    fn steady_spinner_is_auto_clearing_and_keeps_its_message() {
+        let progress = steady_spinner("validating").unwrap();
+        let observed = progress.0.clone();
+        assert_eq!(progress.length(), None);
+        assert_eq!(progress.message(), "validating");
+        assert!(!observed.is_finished());
+
+        drop(progress);
+
+        assert!(observed.is_finished());
     }
 
     #[test]

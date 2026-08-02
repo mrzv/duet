@@ -20,7 +20,17 @@ impl PerformanceProfile {
         self.phases.push(PhaseProfile {
             name: name.to_string(),
             ms: duration_ms(duration),
+            duration,
         });
+    }
+
+    pub fn record_phase_aggregate(&mut self, name: &str, duration: Duration) {
+        if let Some(phase) = self.phases.iter_mut().find(|phase| phase.name == name) {
+            phase.duration = phase.duration.saturating_add(duration);
+            phase.ms = duration_ms(phase.duration);
+        } else {
+            self.record_phase(name, duration);
+        }
     }
 
     pub fn finish(&mut self, total: Duration) {
@@ -103,6 +113,8 @@ impl PerformanceProfile {
 pub struct PhaseProfile {
     pub name: String,
     pub ms: u64,
+    #[serde(skip)]
+    duration: Duration,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -259,4 +271,20 @@ fn print_transfer(label: &str, stats: &DetailTransferStats) {
         stats.max_batch_frames,
         indicatif::HumanBytes(stats.max_batch_payload_bytes)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_phase_retains_sub_millisecond_durations() {
+        let mut profile = PerformanceProfile::default();
+
+        profile.record_phase_aggregate("repeated", Duration::from_micros(600));
+        profile.record_phase_aggregate("repeated", Duration::from_micros(600));
+
+        assert_eq!(profile.phases.len(), 1);
+        assert_eq!(profile.phases[0].ms, 1);
+    }
 }

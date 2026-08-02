@@ -564,6 +564,7 @@ fn performance_profile_reports_human_and_json_output() {
     assert!(stdout.contains("phases:"), "{}", stdout);
     assert!(stdout.contains("local_scan"), "{}", stdout);
     assert!(stdout.contains("remote_scan_rpc"), "{}", stdout);
+    assert!(stdout.contains("staged_validation"), "{}", stdout);
     assert!(stdout.contains("signatures:"), "{}", stdout);
     assert!(stdout.contains("staging: waves="), "{}", stdout);
     assert!(stdout.contains("stream remote->local"), "{}", stdout);
@@ -574,6 +575,11 @@ fn performance_profile_reports_human_and_json_output() {
     let profile: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(profile["total_ms"].is_u64());
     assert!(profile["phases"].is_array());
+    assert!(profile["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|phase| phase["name"] == "staged_validation"));
     assert!(profile["sync_tuning"].is_object());
     let counters = &profile["counters"];
     assert_eq!(counters["streamed_details"], true);

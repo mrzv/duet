@@ -14,7 +14,7 @@ use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder};
 use crate::actions::{num_identical, num_unresolved_conflicts, reverse, Action, Actions};
 use crate::cli::SyncOptions;
 use crate::performance::{
-    duration_ms, DetailTransferStats, PerformanceProfile, StagingProfile, StreamingProfile,
+    DetailTransferStats, PerformanceProfile, StagingProfile, StreamingProfile,
 };
 use crate::profile::{self, ProfileSource};
 use crate::progress;
@@ -848,6 +848,12 @@ pub async fn sync(
             );
 
             test_pause_until_interrupt(TEST_PAUSE_AFTER_STAGED_PREPARE_MS, &interrupt).await;
+            let lifecycle_progress = progress::steady_spinner(staged_lifecycle_message(
+                "validating staged files",
+                wave_index + 1,
+                plan.waves.len(),
+            ))?;
+            let validation_start = Instant::now();
             let local_validation = tokio::task::spawn_blocking(move || {
                 let result = prepared.validate_commit();
                 (prepared, result)
@@ -898,6 +904,11 @@ pub async fn sync(
                     remote_cleanup,
                 ));
             }
+            record_phase_aggregate(
+                &mut performance,
+                "staged_validation",
+                validation_start.elapsed(),
+            );
 
             if !interrupt.try_begin_commit() {
                 let local_cleanup = prepared.abort().err();
@@ -915,6 +926,11 @@ pub async fn sync(
                 return Ok(SyncOutcome::Interrupted);
             }
 
+            lifecycle_progress.set_message(staged_lifecycle_message(
+                "committing changes",
+                wave_index + 1,
+                plan.waves.len(),
+            ));
             let commit_start = Instant::now();
             let local_commit = tokio::task::spawn_blocking(move || {
                 let start = Instant::now();
@@ -954,6 +970,11 @@ pub async fn sync(
             );
             test_pause_until_interrupt(TEST_PAUSE_AFTER_STAGED_COMMIT_MS, &interrupt).await;
 
+            lifecycle_progress.set_message(staged_lifecycle_message(
+                "saving snapshots",
+                wave_index + 1,
+                plan.waves.len(),
+            ));
             sync_ops::mark_staged_apply_attempt_state_save(&local_state, &wave_attempt_id)?;
             let state_save_start = Instant::now();
             let local_state_display = local_state.display().to_string();
@@ -990,6 +1011,11 @@ pub async fn sync(
             let (remote_result, remote_state_save_duration) = remote_result;
             remote_result
                 .map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
+            lifecycle_progress.set_message(staged_lifecycle_message(
+                "finalizing checkpoint",
+                wave_index + 1,
+                plan.waves.len(),
+            ));
             remote
                 .complete_staged_apply(wave_attempt_id.clone())
                 .await
@@ -997,6 +1023,7 @@ pub async fn sync(
                     post_state_save_rpc_error("failed to complete remote staged apply", e)
                 })?;
             sync_ops::finish_staged_apply_attempt(&local_state, &wave_attempt_id)?;
+            drop(lifecycle_progress);
             record_phase_aggregate(
                 &mut performance,
                 "local_state_save",
@@ -2024,15 +2051,7 @@ fn record_stream_performance(
 }
 
 fn record_phase_aggregate(performance: &mut PerformanceProfile, name: &str, duration: Duration) {
-    if let Some(phase) = performance
-        .phases
-        .iter_mut()
-        .find(|phase| phase.name == name)
-    {
-        phase.ms = phase.ms.saturating_add(duration_ms(duration));
-    } else {
-        performance.record_phase(name, duration);
-    }
+    performance.record_phase_aggregate(name, duration);
 }
 
 fn merge_streaming_profile(target: &mut StreamingProfile, source: StreamingProfile) {
@@ -2693,6 +2712,14 @@ fn stream_finishing_message(mode: StreamProgressMode) -> String {
             wave_count,
         } if wave_count > 1 => format!("sealing staged files (wave {wave_number}/{wave_count})"),
         StreamProgressMode::Staged { .. } => "sealing staged files".to_string(),
+    }
+}
+
+fn staged_lifecycle_message(phase: &str, wave_number: usize, wave_count: usize) -> String {
+    if wave_count > 1 {
+        format!("{phase} (wave {wave_number}/{wave_count})")
+    } else {
+        phase.to_string()
     }
 }
 
@@ -3533,6 +3560,18 @@ mod tests {
             &frames,
         );
         assert_eq!(progress.message(), "syncing, local -> remote: dominant.bin");
+    }
+
+    #[test]
+    fn staged_lifecycle_messages_include_wave_only_when_needed() {
+        assert_eq!(
+            staged_lifecycle_message("validating staged files", 1, 1),
+            "validating staged files"
+        );
+        assert_eq!(
+            staged_lifecycle_message("saving snapshots", 2, 3),
+            "saving snapshots (wave 2/3)"
+        );
     }
 
     #[test]

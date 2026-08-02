@@ -13,6 +13,7 @@
 
 ### Changed
 - Made streamed progress identify preparation versus legacy synchronization, transfer direction, current path, staging wave, and final sealing work.
+- Added post-stream staged progress for validation, commit, snapshot saving, and checkpoint finalization, and exposed validation as a separate performance phase.
 - Changed supported streamed synchronization to reconstruct, verify, fsync, and seal every regular-file output in the current wave before either side mutates that wave's synchronized targets, then validate both plans before crossing a shared commit fence.
 - Made the first Ctrl+C cooperatively abort before commit or defer through commit, state save, marker cleanup, and server shutdown after the fence; a second Ctrl+C still forces an immediate code-6 exit.
 - Kept legacy peers compatible by retaining their existing apply paths with an earlier non-cancellable boundary.
