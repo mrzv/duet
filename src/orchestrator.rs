@@ -806,6 +806,10 @@ pub async fn sync(
                 Some(&wave_attempt_id),
                 Some(options.staging_policy),
                 Some(&interrupt),
+                StreamProgressMode::Staged {
+                    wave_number: wave_index + 1,
+                    wave_count: plan.waves.len(),
+                },
             )
             .await?;
             let StreamDetailedChangesRun::Complete(mut stream_result) = stream_result else {
@@ -1049,6 +1053,7 @@ pub async fn sync(
             None,
             None,
             None,
+            StreamProgressMode::Legacy,
         )
         .await?;
         let StreamDetailedChangesRun::Complete(mut stream_result) = stream_result else {
@@ -1956,6 +1961,27 @@ enum StreamDetailedChangesRun {
     InterruptedCleaned,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamProgressMode {
+    Legacy,
+    Staged {
+        wave_number: usize,
+        wave_count: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamDirection {
+    LocalToRemote,
+    RemoteToLocal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamActivity {
+    ReceivingRemote,
+    ReadingLocal,
+}
+
 fn record_stream_performance(
     performance: &mut PerformanceProfile,
     result: &mut StreamDetailedChangesResult,
@@ -2088,6 +2114,7 @@ async fn stream_detailed_changes<R>(
     staged_attempt_id: Option<&str>,
     staging_policy: Option<sync_ops::StagingPolicy>,
     interrupt: Option<&InterruptState>,
+    progress_mode: StreamProgressMode,
 ) -> Result<StreamDetailedChangesRun>
 where
     R: DuetServerAsync,
@@ -2143,6 +2170,7 @@ where
         staging_policy,
         staged_remote_apply_stream,
         interrupt,
+        progress_mode,
     )
     .await;
 
@@ -2208,6 +2236,7 @@ async fn stream_detailed_changes_started<R>(
     staging_policy: Option<sync_ops::StagingPolicy>,
     staged_remote_apply_stream: Option<sync_ops::ApplyStreamId>,
     interrupt: Option<&InterruptState>,
+    progress_mode: StreamProgressMode,
 ) -> Result<StreamDetailedChangesRun>
 where
     R: DuetServerAsync,
@@ -2216,7 +2245,7 @@ where
         return Ok(StreamDetailedChangesRun::Interrupted);
     }
     let total_transfer_bytes = sync_ops::detail_transfer_bytes(actions);
-    let progress = stream_progress_bar(total_transfer_bytes)?;
+    let progress = stream_progress_bar(total_transfer_bytes, progress_mode)?;
     let mut progress_position = 0;
 
     let mut local_producer = sync_ops::DetailProducer::new(
@@ -2274,6 +2303,10 @@ where
             return Ok(StreamDetailedChangesRun::Interrupted);
         }
         if !remote_done {
+            progress.set_message(stream_activity_message(
+                progress_mode,
+                StreamActivity::ReceivingRemote,
+            ));
             let start = Instant::now();
             let frames = remote
                 .next_detail_chunks(
@@ -2291,6 +2324,13 @@ where
             if frames.is_empty() {
                 remote_done = true;
             } else {
+                update_stream_progress_message(
+                    &progress,
+                    progress_mode,
+                    StreamDirection::RemoteToLocal,
+                    actions,
+                    &frames,
+                );
                 let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
                 let start = Instant::now();
                 for frame in frames {
@@ -2312,6 +2352,10 @@ where
             if interrupt.is_some_and(InterruptState::is_cancel_requested) {
                 return Ok(StreamDetailedChangesRun::Interrupted);
             }
+            progress.set_message(stream_activity_message(
+                progress_mode,
+                StreamActivity::ReadingLocal,
+            ));
             let start = Instant::now();
             let frames = local_producer
                 .next_frames(
@@ -2324,6 +2368,13 @@ where
             if frames.is_empty() {
                 local_done = true;
             } else {
+                update_stream_progress_message(
+                    &progress,
+                    progress_mode,
+                    StreamDirection::LocalToRemote,
+                    actions,
+                    &frames,
+                );
                 let transfer_bytes = sync_ops::detail_frames_transfer_bytes(&frames);
                 let start = Instant::now();
                 if !apply_detail_frames(
@@ -2348,6 +2399,7 @@ where
         }
     }
 
+    progress.set_message(stream_finishing_message(progress_mode));
     let start = Instant::now();
     if interrupt.is_some_and(InterruptState::is_cancel_requested) {
         return Ok(StreamDetailedChangesRun::Interrupted);
@@ -2529,8 +2581,119 @@ fn should_apply_file_bytes_as_chunk(len: usize) -> bool {
     len >= FILE_BYTE_CHUNK_RPC_THRESHOLD
 }
 
-fn stream_progress_bar(total_transfer_bytes: u64) -> Result<indicatif::ProgressBar> {
-    progress::bytes_bar(total_transfer_bytes, "streaming changes")
+fn stream_progress_bar(
+    total_transfer_bytes: u64,
+    mode: StreamProgressMode,
+) -> Result<indicatif::ProgressBar> {
+    progress::bytes_bar(total_transfer_bytes, stream_initial_message(mode))
+}
+
+fn stream_initial_message(mode: StreamProgressMode) -> String {
+    match mode {
+        StreamProgressMode::Legacy => "syncing changes".to_string(),
+        StreamProgressMode::Staged {
+            wave_number,
+            wave_count,
+        } if wave_count > 1 => {
+            format!("preparing changes (wave {wave_number}/{wave_count})")
+        }
+        StreamProgressMode::Staged { .. } => "preparing changes".to_string(),
+    }
+}
+
+fn stream_action_message(
+    mode: StreamProgressMode,
+    direction: StreamDirection,
+    path: &PathBuf,
+) -> String {
+    let operation = stream_operation_message(mode);
+    let direction = match direction {
+        StreamDirection::LocalToRemote => "local -> remote",
+        StreamDirection::RemoteToLocal => "remote -> local",
+    };
+    format!(
+        "{operation}, {direction}: {}",
+        crate::actions::show_path(path)
+    )
+}
+
+fn stream_activity_message(mode: StreamProgressMode, activity: StreamActivity) -> String {
+    let operation = stream_operation_message(mode);
+    let activity = match activity {
+        StreamActivity::ReceivingRemote => "receiving remote changes",
+        StreamActivity::ReadingLocal => "reading local changes",
+    };
+    format!("{operation}, {activity}")
+}
+
+fn stream_operation_message(mode: StreamProgressMode) -> String {
+    match mode {
+        StreamProgressMode::Legacy => "syncing".to_string(),
+        StreamProgressMode::Staged {
+            wave_number,
+            wave_count,
+        } if wave_count > 1 => format!("preparing wave {wave_number}/{wave_count}"),
+        StreamProgressMode::Staged { .. } => "preparing".to_string(),
+    }
+}
+
+fn update_stream_progress_message(
+    progress: &indicatif::ProgressBar,
+    mode: StreamProgressMode,
+    direction: StreamDirection,
+    actions: &[Action],
+    frames: &[sync_ops::DetailFrame],
+) {
+    let Some(action) = representative_stream_action_index(frames)
+        .and_then(|action_index| actions.get(action_index))
+    else {
+        return;
+    };
+    progress.set_message(stream_action_message(mode, direction, action.path()));
+}
+
+fn representative_stream_action_index(frames: &[sync_ops::DetailFrame]) -> Option<usize> {
+    let mut current_action = None;
+    let mut current_bytes = 0u64;
+    let mut best = None;
+
+    for frame in frames {
+        if current_action != Some(frame.action_index) {
+            if let Some(action_index) = current_action {
+                if best
+                    .map(|(_, best_bytes)| current_bytes >= best_bytes)
+                    .unwrap_or(true)
+                {
+                    best = Some((action_index, current_bytes));
+                }
+            }
+            current_action = Some(frame.action_index);
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(sync_ops::detail_frame_transfer_bytes(frame));
+    }
+
+    if let Some(action_index) = current_action {
+        if best
+            .map(|(_, best_bytes)| current_bytes >= best_bytes)
+            .unwrap_or(true)
+        {
+            best = Some((action_index, current_bytes));
+        }
+    }
+
+    best.map(|(action_index, _)| action_index as usize)
+}
+
+fn stream_finishing_message(mode: StreamProgressMode) -> String {
+    match mode {
+        StreamProgressMode::Legacy => "finishing synchronization".to_string(),
+        StreamProgressMode::Staged {
+            wave_number,
+            wave_count,
+        } if wave_count > 1 => format!("sealing staged files (wave {wave_number}/{wave_count})"),
+        StreamProgressMode::Staged { .. } => "sealing staged files".to_string(),
+    }
 }
 
 fn preflight_non_streamed_detail_size(
@@ -2564,7 +2727,6 @@ fn advance_stream_progress(
     }
 
     progress.set_position(*position);
-    progress.set_message("streaming changes");
 }
 
 fn has_remote_capability(info: &rpc::ServerInfo, capability: &str) -> bool {
@@ -3269,13 +3431,108 @@ mod tests {
     }
 
     #[test]
-    fn stream_progress_message_does_not_duplicate_byte_counts() {
-        let progress = stream_progress_bar(1024).unwrap();
-        assert_eq!(progress.message(), "streaming changes");
+    fn stream_progress_messages_show_phase_direction_wave_and_safe_path() {
+        let mode = StreamProgressMode::Staged {
+            wave_number: 2,
+            wave_count: 4,
+        };
+        let progress = stream_progress_bar(1024, mode).unwrap();
+        assert_eq!(progress.message(), "preparing changes (wave 2/4)");
+        assert_eq!(
+            stream_activity_message(mode, StreamActivity::ReceivingRemote),
+            "preparing wave 2/4, receiving remote changes"
+        );
+        assert_eq!(
+            stream_activity_message(mode, StreamActivity::ReadingLocal),
+            "preparing wave 2/4, reading local changes"
+        );
+
+        let actions = vec![Action::Local(Change::Added(
+            scan::DirEntryWithMeta::test_file_with_size(PathBuf::from("bad\nname"), 1024, 0),
+        ))];
+        let frames = vec![sync_ops::DetailFrame {
+            action_index: 0,
+            payload: sync_ops::DetailPayload::FileBegin,
+        }];
+        update_stream_progress_message(
+            &progress,
+            mode,
+            StreamDirection::RemoteToLocal,
+            &actions,
+            &frames,
+        );
+        assert_eq!(
+            progress.message(),
+            "preparing wave 2/4, remote -> local: bad\\nname"
+        );
+        assert!(!progress.message().contains('\n'));
 
         let mut position = 0;
         advance_stream_progress(&progress, &mut position, 1024, 512);
-        assert_eq!(progress.message(), "streaming changes");
+        assert_eq!(
+            progress.message(),
+            "preparing wave 2/4, remote -> local: bad\\nname"
+        );
+        assert_eq!(
+            stream_finishing_message(mode),
+            "sealing staged files (wave 2/4)"
+        );
+
+        assert_eq!(
+            stream_action_message(
+                StreamProgressMode::Legacy,
+                StreamDirection::LocalToRemote,
+                &PathBuf::from("file.txt"),
+            ),
+            "syncing, local -> remote: file.txt"
+        );
+        assert_eq!(
+            stream_finishing_message(StreamProgressMode::Legacy),
+            "finishing synchronization"
+        );
+    }
+
+    #[test]
+    fn stream_progress_uses_dominant_action_in_multi_action_batch() {
+        let actions = vec![
+            Action::Local(Change::Added(scan::DirEntryWithMeta::test_file_with_size(
+                PathBuf::from("first.txt"),
+                1,
+                0,
+            ))),
+            Action::Remote(Change::Added(scan::DirEntryWithMeta::test_file_with_size(
+                PathBuf::from("dominant.bin"),
+                64,
+                0,
+            ))),
+        ];
+        let frames = vec![
+            sync_ops::DetailFrame {
+                action_index: 0,
+                payload: sync_ops::DetailPayload::FileEnd,
+            },
+            sync_ops::DetailFrame {
+                action_index: 1,
+                payload: sync_ops::DetailPayload::FileBegin,
+            },
+            sync_ops::DetailFrame {
+                action_index: 1,
+                payload: sync_ops::DetailPayload::FileBytes(vec![0; 64]),
+            },
+        ];
+
+        assert_eq!(representative_stream_action_index(&frames), Some(1));
+        assert_eq!(reverse(&actions)[1].path(), actions[1].path());
+
+        let progress = stream_progress_bar(65, StreamProgressMode::Legacy).unwrap();
+        update_stream_progress_message(
+            &progress,
+            StreamProgressMode::Legacy,
+            StreamDirection::LocalToRemote,
+            &actions,
+            &frames,
+        );
+        assert_eq!(progress.message(), "syncing, local -> remote: dominant.bin");
     }
 
     #[test]

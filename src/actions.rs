@@ -195,7 +195,7 @@ fn abbreviate_hex_components(path: &PathBuf) -> PathBuf {
     result
 }
 
-fn show_path(p: &PathBuf) -> String {
+pub(crate) fn show_path(p: &PathBuf) -> String {
     escape_control_chars(&abbreviate_hex_components(p).display().to_string())
 }
 
