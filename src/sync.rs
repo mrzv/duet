@@ -3146,11 +3146,24 @@ fn preflight_removed_directories(
     let removed_paths = removed_destination_paths(actions);
     for path in removed_paths.iter() {
         let dirname = safe_join(base, path)?;
-        if dirname.is_dir() {
+        if is_directory_without_following(&dirname)? {
             preflight_removed_directory_contents(base, &dirname, &removed_paths, policy)?;
         }
     }
     Ok(())
+}
+
+fn is_directory_without_following(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).wrap_err_with(|| {
+            format!(
+                "unable to inspect directory removal target {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 fn removed_destination_paths(actions: &Vec<Action>) -> HashSet<PathBuf> {
@@ -3179,7 +3192,7 @@ fn removal_blocker_report(
     let mut report = ApplyPreflightReport::default();
     for path in removed_paths.iter() {
         let dirname = safe_join(base, path)?;
-        if dirname.is_dir() {
+        if is_directory_without_following(&dirname)? {
             collect_removed_directory_blockers(
                 base,
                 &dirname,
@@ -11444,6 +11457,42 @@ mod tests {
         apply_detailed_changes(&base, &actions, &Vec::new(), &mut all_old, None).unwrap();
 
         assert!(fs::symlink_metadata(base.join("link")).is_err());
+        assert!(all_old.is_empty());
+    }
+
+    #[test]
+    fn removing_directory_does_not_follow_removed_child_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let target = dir.path().join("target");
+        fs::create_dir_all(base.join("removed")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep.txt"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, base.join("removed/link")).unwrap();
+
+        let removed_dir = synced_existing_dir_entry(&base, "removed");
+        let link_metadata = fs::symlink_metadata(base.join("removed/link")).unwrap();
+        let removed_link = Entry::test_symlink_with_mode_and_mtime(
+            PathBuf::from("removed/link"),
+            target.clone(),
+            link_metadata.mode(),
+            link_metadata.mtime(),
+        );
+        let actions = vec![
+            Action::Local(Change::Removed(removed_dir.clone())),
+            Action::Local(Change::Removed(removed_link.clone())),
+        ];
+
+        preflight_apply(&base, &actions).unwrap();
+        let report =
+            preflight_apply_report(&base, &actions, None, ApplyOptions::default()).unwrap();
+        assert!(report.blockers.is_empty());
+
+        let mut all_old = vec![removed_dir, removed_link];
+        apply_detailed_changes(&base, &actions, &Vec::new(), &mut all_old, None).unwrap();
+
+        assert!(!base.join("removed").exists());
+        assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"keep");
         assert!(all_old.is_empty());
     }
 
