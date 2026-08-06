@@ -132,33 +132,6 @@ silently skipping unreadable or unwritable paths, because skipping a path can be
 mistaken for a deletion or a legitimate update. Fix the reported permission
 problem and rerun the sync.
 
-## Staging Capacity
-
-Supported peers prepare changes in dependency-safe bilateral waves. Each wave is
-fully prepared and validated on both sides, committed, and saved as a canonical
-checkpoint before the next wave starts. This bounds private staging without
-making the complete invocation atomic: if a later wave is interrupted or fails,
-earlier checkpoints remain synchronized and a normal rerun discovers the
-remaining changes.
-
-`--staging-limit` sets the target reconstructed bytes in one wave on each host.
-One regular file larger than that target is isolated in its own wave, but it may
-never consume the configured reserve. `--staging-reserve` accepts a byte size or
-percentage of total filesystem capacity and defaults to 5% independently on
-each host. Duet checks capacity before every wave, monitors materialized writes,
-and refreshes free space after output durability barriers and immediately before
-commit. A no-space or quota error during preparation aborts the current wave
-without changing synchronized targets. A concurrent writer can race the final
-check, and a later commit or state-save failure can leave a recovery marker and a
-partially applied wave.
-
-For modified regular files, Duet uses APFS clones on macOS or reflinks on Linux
-when supported, applies the delta to the private clone, and publishes it
-atomically. This can make physical staging proportional to changed blocks rather
-than full logical file size. Additions and clone-unavailable modifications still
-require materialized staging. Explicit staging controls require a peer that can
-enforce them; default settings retain legacy fallback for older peers.
-
 ## Caveat
 
 Duet uses [openssh](https://docs.rs/openssh/) crate, which only supports
@@ -206,6 +179,33 @@ duet my_profile .
 
 duet --exclude build --exclude ./private/cache my_profile src
 ```
+
+## Staging Capacity
+
+Supported peers prepare changes in dependency-safe bilateral waves. Each wave is
+fully prepared and validated on both sides, committed, and saved as a canonical
+checkpoint before the next wave starts. This bounds private staging without
+making the complete invocation atomic: if a later wave is interrupted or fails,
+earlier checkpoints remain synchronized and a normal rerun discovers the
+remaining changes.
+
+`--staging-limit` sets the target reconstructed bytes in one wave on each host.
+One regular file larger than that target is isolated in its own wave, but it may
+never consume the configured reserve. `--staging-reserve` accepts a byte size or
+percentage of total filesystem capacity and defaults to 5% independently on
+each host. Duet checks capacity before every wave, monitors materialized writes,
+and refreshes free space after output durability barriers and immediately before
+commit. A no-space or quota error during preparation aborts the current wave
+without changing synchronized targets. A concurrent writer can race the final
+check, and a later commit or state-save failure can leave a recovery marker and a
+partially applied wave.
+
+For modified regular files, Duet uses APFS clones on macOS or reflinks on Linux
+when supported, applies the delta to the private clone, and publishes it
+atomically. This can make physical staging proportional to changed blocks rather
+than full logical file size. Additions and clone-unavailable modifications still
+require materialized staging. Explicit staging controls require a peer that can
+enforce them; default settings retain legacy fallback for older peers.
 
 ## Recovery
 
