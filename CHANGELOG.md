@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.2 - 2026-08-09
+
 ### Added
 - Added repeatable CLI-only `--exclude <path>` hard scan exclusions, including restricted-sync composition, preserved excluded baseline state, removal safety, and the append-only `scan-excludes-v1` method-47 RPC.
 - Added the `staged-apply-v1` capability and append-only RPC methods for bilateral prepare, validation, commit, state save, and exact-attempt completion.
