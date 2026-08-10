@@ -937,24 +937,44 @@ pub async fn sync(
             let commit_start = Instant::now();
             let local_commit = tokio::task::spawn_blocking(move || {
                 let start = Instant::now();
-                let result = prepared.commit();
+                let result = prepared.commit_profiled();
                 (result, start.elapsed())
             });
+            let remote_commit_profiled = has_remote_capability(
+                &remote_info,
+                rpc::CAPABILITY_STAGED_COMMIT_PROFILE,
+            );
             let remote_commit = async {
                 let start = Instant::now();
-                let result = remote.commit_staged_apply(wave_attempt_id.clone()).await;
+                let result = if remote_commit_profiled {
+                    remote
+                        .commit_staged_apply_profiled(wave_attempt_id.clone())
+                        .await
+                } else {
+                    remote
+                        .commit_staged_apply(wave_attempt_id.clone())
+                        .await
+                        .map(|()| sync_ops::StagedCommitProfile::default())
+                };
                 (result, start.elapsed())
             };
             // This join is the bilateral commit barrier. Once entered, both commits must be awaited.
             let (local_commit, remote_commit) = tokio::join!(local_commit, remote_commit);
-            let (local_commit, local_commit_duration) = match local_commit {
-                Ok(result) => result,
-                Err(error) => (
-                    Err(eyre!("local staged commit task failed: {}", error)),
-                    Duration::default(),
-                ),
+            let (local_commit, local_commit_profile, local_commit_duration) = match local_commit {
+                Ok((Ok((entries, profile)), duration)) => (Ok(entries), profile, duration),
+                Ok((Err(error), duration)) => {
+                    (Err(error), sync_ops::StagedCommitProfile::default(), duration)
+                }
+                Err(error) => {
+                    let result = Err(eyre!("local staged commit task failed: {}", error));
+                    (result, sync_ops::StagedCommitProfile::default(), Duration::default())
+                }
             };
             let (remote_commit, remote_commit_duration) = remote_commit;
+            let (remote_commit, remote_commit_profile) = match remote_commit {
+                Ok(profile) => (Ok(()), profile),
+                Err(error) => (Err(error), sync_ops::StagedCommitProfile::default()),
+            };
             checkpoint_entries = finish_staged_commit(local_commit, remote_commit)?;
             record_phase_aggregate(
                 &mut performance,
@@ -971,6 +991,18 @@ pub async fn sync(
                 "staged_commit",
                 commit_start.elapsed(),
             );
+            record_staged_commit_profile(
+                &mut performance,
+                "staged_local_commit",
+                local_commit_profile,
+            );
+            if remote_commit_profiled {
+                record_staged_commit_profile(
+                    &mut performance,
+                    "staged_remote_commit",
+                    remote_commit_profile,
+                );
+            }
             test_pause_until_interrupt(TEST_PAUSE_AFTER_STAGED_COMMIT_MS, &interrupt).await;
 
             lifecycle_progress.set_message(staged_lifecycle_message(
@@ -2055,6 +2087,28 @@ fn record_stream_performance(
 
 fn record_phase_aggregate(performance: &mut PerformanceProfile, name: &str, duration: Duration) {
     performance.record_phase_aggregate(name, duration);
+}
+
+fn record_staged_commit_profile(
+    performance: &mut PerformanceProfile,
+    prefix: &str,
+    profile: sync_ops::StagedCommitProfile,
+) {
+    for (suffix, micros) in [
+        ("revalidation", profile.revalidation_us),
+        ("marker_start", profile.committing_marker_transition_us),
+        ("forward_apply", profile.forward_apply_publication_us),
+        ("directory_pass", profile.reverse_directory_pass_us),
+        ("manifest", profile.manifest_finalization_us),
+        ("durability", profile.durability_staging_cleanup_us),
+        ("marker_finish", profile.committed_marker_transition_us),
+    ] {
+        record_phase_aggregate(
+            performance,
+            &format!("{prefix}_{suffix}"),
+            Duration::from_micros(micros),
+        );
+    }
 }
 
 fn merge_streaming_profile(target: &mut StreamingProfile, source: StreamingProfile) {

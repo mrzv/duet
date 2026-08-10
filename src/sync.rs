@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::actions::Action;
 use crate::profile::{Ignore, Prune};
@@ -664,6 +665,9 @@ const OUTPUT_BATCH_FD_HEADROOM: usize = 64;
 const ENV_OUTPUT_BATCH_FILES: &str = "DUET_SYNC_OUTPUT_BATCH_FILES";
 const ENV_OUTPUT_BATCH_BYTES: &str = "DUET_SYNC_OUTPUT_BATCH_BYTES";
 const ENV_OUTPUT_SYNC_WORKERS: &str = "DUET_SYNC_OUTPUT_SYNC_WORKERS";
+const ENV_VALIDATION_WORKERS: &str = "DUET_SYNC_VALIDATION_WORKERS";
+const MAX_VALIDATION_WORKERS: usize = 16;
+const VALIDATION_FD_HEADROOM: usize = 64;
 static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
@@ -2620,9 +2624,11 @@ fn complete_apply_phase(
     // caller saves state; until these barriers complete, the durable apply marker
     // remains authoritative.
     let metadata_synced_directories = metadata_synced_directories(base, actions);
-    let mut directories = HashSet::new();
-    for action in actions {
-        let mut path = base.join(action.path());
+    let mut candidates = HashSet::new();
+    let mut has_local_actions = false;
+    for change in actions.iter().filter_map(applied_change) {
+        has_local_actions = true;
+        let mut path = base.join(change.path());
         if path != base && !path.pop() {
             continue;
         }
@@ -2630,30 +2636,32 @@ fn complete_apply_phase(
             if path == base {
                 break;
             }
-            if !already_synced.contains(&path)
-                && !metadata_synced_directories.contains(&path)
-                && path
-                    .try_exists()
-                    .wrap_err_with(|| format!("unable to check affected path {}", path.display()))?
-                && fs::symlink_metadata(&path)
-                    .wrap_err_with(|| {
-                        format!("unable to inspect affected path {}", path.display())
-                    })?
-                    .is_dir()
-            {
-                directories.insert(path.clone());
+            if !already_synced.contains(&path) && !metadata_synced_directories.contains(&path) {
+                candidates.insert(path.clone());
             }
             if path == base || !path.pop() {
                 break;
             }
         }
     }
-    let mut directories: Vec<_> = directories.into_iter().collect();
+    let mut directories = Vec::new();
+    for path in candidates {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => directories.push(path),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).wrap_err_with(|| {
+                    format!("unable to inspect affected path {}", path.display())
+                });
+            }
+        }
+    }
     directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for directory in directories {
         sync_directory(&directory)?;
     }
-    if !already_synced.contains(base) {
+    if has_local_actions && !already_synced.contains(base) {
         sync_directory(&base.join("."))?;
     }
     if let Some(state_path) = attempt_state {
@@ -6307,6 +6315,22 @@ impl ApplyRecorder {
         )
     }
 
+    fn record_regular_publication(&mut self, action: &Action, entry: &Entry) -> Result<()> {
+        let Some(change) = applied_change(action) else {
+            return Ok(());
+        };
+        self.write_line(
+            "record regular file publication",
+            format!(
+                "committed-step: rename-file {}\ncommitted-step: update-metadata {}\ncommitted-operation: {} {}\n",
+                entry.path().display(),
+                entry.path().display(),
+                change_operation(change),
+                action.path().display()
+            ),
+        )
+    }
+
     fn write_line(&mut self, operation: &str, line: String) -> Result<()> {
         let Some(state_path) = &self.state_path else {
             return Ok(());
@@ -6509,6 +6533,57 @@ pub struct DetailApplier {
 
 pub struct PreparedApply {
     inner: DetailApplier,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedCommitProfile {
+    pub(crate) revalidation_us: u64,
+    pub(crate) committing_marker_transition_us: u64,
+    pub(crate) forward_apply_publication_us: u64,
+    pub(crate) reverse_directory_pass_us: u64,
+    pub(crate) manifest_finalization_us: u64,
+    pub(crate) durability_staging_cleanup_us: u64,
+    pub(crate) committed_marker_transition_us: u64,
+}
+
+impl StagedCommitProfile {
+    #[allow(dead_code)]
+    pub(crate) fn total_us(&self) -> u64 {
+        self.revalidation_us
+            .saturating_add(self.committing_marker_transition_us)
+            .saturating_add(self.forward_apply_publication_us)
+            .saturating_add(self.reverse_directory_pass_us)
+            .saturating_add(self.manifest_finalization_us)
+            .saturating_add(self.durability_staging_cleanup_us)
+            .saturating_add(self.committed_marker_transition_us)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn saturating_add_assign(&mut self, other: Self) {
+        self.revalidation_us = self.revalidation_us.saturating_add(other.revalidation_us);
+        self.committing_marker_transition_us = self
+            .committing_marker_transition_us
+            .saturating_add(other.committing_marker_transition_us);
+        self.forward_apply_publication_us = self
+            .forward_apply_publication_us
+            .saturating_add(other.forward_apply_publication_us);
+        self.reverse_directory_pass_us = self
+            .reverse_directory_pass_us
+            .saturating_add(other.reverse_directory_pass_us);
+        self.manifest_finalization_us = self
+            .manifest_finalization_us
+            .saturating_add(other.manifest_finalization_us);
+        self.durability_staging_cleanup_us = self
+            .durability_staging_cleanup_us
+            .saturating_add(other.durability_staging_cleanup_us);
+        self.committed_marker_transition_us = self
+            .committed_marker_transition_us
+            .saturating_add(other.committed_marker_transition_us);
+    }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
 }
 
 #[allow(dead_code)]
@@ -6850,11 +6925,8 @@ impl DetailApplier {
                     if !e.is_dir() {
                         verify_current_matches_entry(&filename, e, "remove target")?;
                         fs::remove_file(&filename)?;
-                        record_committed_step(
-                            self.attempt_state.as_deref(),
-                            "remove-file",
-                            e.path(),
-                        )?;
+                        self.recorder
+                            .record_committed_step("remove-file", e.path())?;
                     }
                 }
                 Change::Added(e) => {
@@ -6862,24 +6934,15 @@ impl DetailApplier {
                     ensure_parent_directory(&filename)?;
                     if let Some(p) = e.target() {
                         std::os::unix::fs::symlink(p, &filename)?;
-                        record_committed_step(
-                            self.attempt_state.as_deref(),
-                            "create-symlink",
-                            e.path(),
-                        )?;
+                        self.recorder
+                            .record_committed_step("create-symlink", e.path())?;
                         self.new_entries.push(update_meta(&filename, e)?);
-                        record_committed_step(
-                            self.attempt_state.as_deref(),
-                            "update-metadata",
-                            e.path(),
-                        )?;
+                        self.recorder
+                            .record_committed_step("update-metadata", e.path())?;
                     } else if e.is_dir() {
                         create_private_directory(&filename)?;
-                        record_committed_step(
-                            self.attempt_state.as_deref(),
-                            "create-dir",
-                            e.path(),
-                        )?;
+                        self.recorder
+                            .record_committed_step("create-dir", e.path())?;
                     } else {
                         return Err(eyre!("missing file detail for {}", e.path().display()));
                     }
@@ -6897,39 +6960,24 @@ impl DetailApplier {
                                 verify_current_matches_entry(&filename, e1, "metadata target")?;
                             }
                             self.new_entries.push(update_meta(&filename, e2)?);
-                            record_committed_step(
-                                self.attempt_state.as_deref(),
-                                "update-metadata",
-                                e2.path(),
-                            )?;
+                            self.recorder
+                                .record_committed_step("update-metadata", e2.path())?;
                         } else {
                             verify_current_matches_entry(&filename, e1, "replace target")?;
                             fs::remove_file(&filename)?;
-                            record_committed_step(
-                                self.attempt_state.as_deref(),
-                                "remove-file",
-                                e1.path(),
-                            )?;
+                            self.recorder
+                                .record_committed_step("remove-file", e1.path())?;
                             if let Some(p) = e2.target() {
                                 std::os::unix::fs::symlink(p, &filename)?;
-                                record_committed_step(
-                                    self.attempt_state.as_deref(),
-                                    "create-symlink",
-                                    e2.path(),
-                                )?;
+                                self.recorder
+                                    .record_committed_step("create-symlink", e2.path())?;
                                 self.new_entries.push(update_meta(&filename, e2)?);
-                                record_committed_step(
-                                    self.attempt_state.as_deref(),
-                                    "update-metadata",
-                                    e2.path(),
-                                )?;
+                                self.recorder
+                                    .record_committed_step("update-metadata", e2.path())?;
                             } else if e2.is_dir() {
                                 create_private_directory(&filename)?;
-                                record_committed_step(
-                                    self.attempt_state.as_deref(),
-                                    "create-dir",
-                                    e2.path(),
-                                )?;
+                                self.recorder
+                                    .record_committed_step("create-dir", e2.path())?;
                             } else {
                                 return Err(eyre!(
                                     "unsupported new entry for {}",
@@ -6943,31 +6991,19 @@ impl DetailApplier {
                         }
                         verify_current_matches_entry(&filename, e1, "replace target")?;
                         fs::remove_file(&filename)?;
-                        record_committed_step(
-                            self.attempt_state.as_deref(),
-                            "remove-symlink",
-                            e1.path(),
-                        )?;
+                        self.recorder
+                            .record_committed_step("remove-symlink", e1.path())?;
                         if let Some(p) = e2.target() {
                             std::os::unix::fs::symlink(p, &filename)?;
-                            record_committed_step(
-                                self.attempt_state.as_deref(),
-                                "create-symlink",
-                                e2.path(),
-                            )?;
+                            self.recorder
+                                .record_committed_step("create-symlink", e2.path())?;
                             self.new_entries.push(update_meta(&filename, e2)?);
-                            record_committed_step(
-                                self.attempt_state.as_deref(),
-                                "update-metadata",
-                                e2.path(),
-                            )?;
+                            self.recorder
+                                .record_committed_step("update-metadata", e2.path())?;
                         } else if e2.is_dir() {
                             create_private_directory(&filename)?;
-                            record_committed_step(
-                                self.attempt_state.as_deref(),
-                                "create-dir",
-                                e2.path(),
-                            )?;
+                            self.recorder
+                                .record_committed_step("create-dir", e2.path())?;
                         }
                     } else if e1.is_dir() {
                         if e2.is_file() {
@@ -6992,10 +7028,8 @@ impl DetailApplier {
         }
         if let Some(change) = applied_change(&self.actions[action_index]) {
             if !change.is_dir() {
-                record_committed_action(
-                    self.attempt_state.as_deref(),
-                    &self.actions[action_index],
-                )?;
+                self.recorder
+                    .record_committed_action(&self.actions[action_index])?;
             }
         }
         Ok(())
@@ -7189,10 +7223,8 @@ impl DetailApplier {
         #[cfg(test)]
         let post_commit_hook = self.output_batch.post_commit_hook.clone();
         let on_commit = |entry: &Entry| -> Result<()> {
-            recorder.record_committed_step("rename-file", entry.path())?;
+            recorder.record_regular_publication(action, entry)?;
             new_entries.push(entry.clone());
-            recorder.record_committed_step("update-metadata", entry.path())?;
-            recorder.record_committed_action(action)?;
             #[cfg(test)]
             if let Some(hook) = &post_commit_hook {
                 hook(action_index)?;
@@ -7232,20 +7264,14 @@ impl DetailApplier {
                                 self.attempt_state.as_deref(),
                             )?;
                             fs::remove_dir(&dirname)?;
-                            record_committed_step(
-                                self.attempt_state.as_deref(),
-                                "remove-dir",
-                                e.path(),
-                            )?;
+                            self.recorder
+                                .record_committed_step("remove-dir", e.path())?;
                         }
                         Change::Added(e) => {
                             let dirname = safe_join(&self.base, e.path())?;
                             self.new_entries.push(update_meta(&dirname, e)?);
-                            record_committed_step(
-                                self.attempt_state.as_deref(),
-                                "update-metadata",
-                                e.path(),
-                            )?;
+                            self.recorder
+                                .record_committed_step("update-metadata", e.path())?;
                         }
                         Change::Modified(e1, e2) => {
                             let dirname = safe_join(&self.base, e2.path())?;
@@ -7258,20 +7284,180 @@ impl DetailApplier {
                                 verify_current_matches_entry(&dirname, e1, "metadata target")?;
                             }
                             self.new_entries.push(update_meta(&dirname, e2)?);
-                            record_committed_step(
-                                self.attempt_state.as_deref(),
-                                "update-metadata",
-                                e2.path(),
-                            )?;
+                            self.recorder
+                                .record_committed_step("update-metadata", e2.path())?;
                         }
                     }
-                    record_committed_action(self.attempt_state.as_deref(), action)?;
+                    self.recorder.record_committed_action(action)?;
                 }
                 _ => {}
             }
         }
         Ok(())
     }
+}
+
+trait PreparedOutputValidator: Sync {
+    fn validate(&self, action_index: usize, output: &PreparedOutput) -> Result<()>;
+}
+
+struct FilePreparedOutputValidator;
+
+impl PreparedOutputValidator for FilePreparedOutputValidator {
+    fn validate(&self, _action_index: usize, output: &PreparedOutput) -> Result<()> {
+        output.output.verify_at_identity(
+            &output.output.staging.directory,
+            &output.output.output_name,
+            &output.output.temp_path,
+        )?;
+        output
+            .output
+            .verify_prepared_contents(&output.final_entry)?;
+        output.output.verify_at_identity(
+            &output.output.staging.directory,
+            &output.output.output_name,
+            &output.output.temp_path,
+        )
+    }
+}
+
+fn validation_worker_limit() -> usize {
+    let available = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    validation_worker_limit_from(
+        std::env::var(ENV_VALIDATION_WORKERS).ok().as_deref(),
+        available,
+        validation_fd_limit(),
+    )
+}
+
+fn validation_worker_limit_from(
+    configured: Option<&str>,
+    available: usize,
+    fd_limit: usize,
+) -> usize {
+    let available = available.max(1);
+    let requested = match configured {
+        Some(value) => match value.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                log::warn!(
+                    "ignoring invalid {ENV_VALIDATION_WORKERS}={value:?}; using {available}"
+                );
+                available
+            }
+        },
+        None => available,
+    };
+    requested
+        .min(available)
+        .min(MAX_VALIDATION_WORKERS)
+        .min(fd_limit.max(1))
+        .max(1)
+}
+
+fn validation_fd_limit() -> usize {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return MAX_VALIDATION_WORKERS;
+    }
+    let soft = unsafe { limit.assume_init() }.rlim_cur;
+    if soft == libc::RLIM_INFINITY {
+        return MAX_VALIDATION_WORKERS;
+    }
+    let soft = soft.min(usize::MAX as libc::rlim_t) as usize;
+    soft.saturating_sub(VALIDATION_FD_HEADROOM).max(1)
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn validate_prepared_outputs(
+    outputs: &[Option<PreparedOutput>],
+    workers: usize,
+    validator: &dyn PreparedOutputValidator,
+) -> Result<()> {
+    validate_prepared_outputs_with_spawn_failure(outputs, workers, validator, None)
+}
+
+fn validate_prepared_outputs_with_spawn_failure(
+    outputs: &[Option<PreparedOutput>],
+    workers: usize,
+    validator: &dyn PreparedOutputValidator,
+    injected_spawn_failure: Option<io::ErrorKind>,
+) -> Result<()> {
+    let prepared = outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output)| output.as_ref().map(|output| (index, output)))
+        .collect::<Vec<_>>();
+    if prepared.is_empty() {
+        return Ok(());
+    }
+
+    let next = AtomicUsize::new(0);
+    let worker_count = workers.max(1).min(prepared.len());
+    let mut results = thread::scope(|scope| -> Result<Vec<_>> {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            if let Some(kind) = injected_spawn_failure {
+                return Err(io::Error::from(kind))
+                    .wrap_err("unable to create prepared output validation worker");
+            }
+            let handle = thread::Builder::new()
+                .name("duet-staged-validation".to_string())
+                .spawn_scoped(scope, || {
+                    let mut worker_results = Vec::new();
+                    loop {
+                        let position = next.fetch_add(1, AtomicOrdering::Relaxed);
+                        let Some(&(action_index, output)) = prepared.get(position) else {
+                            break;
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            validator.validate(action_index, output)
+                        }))
+                        .unwrap_or_else(|payload| {
+                            Err(eyre!(
+                                "prepared output validation worker panicked for action {}: {}",
+                                action_index,
+                                panic_message(payload)
+                            ))
+                        });
+                        worker_results.push((action_index, result));
+                    }
+                    worker_results
+                })
+                .wrap_err("unable to create prepared output validation worker")?;
+            handles.push(handle);
+        }
+        Ok(handles
+            .into_iter()
+            .flat_map(|handle| {
+                handle.join().unwrap_or_else(|payload| {
+                    vec![(
+                        usize::MAX,
+                        Err(eyre!(
+                            "prepared output validation worker panicked: {}",
+                            panic_message(payload)
+                        )),
+                    )]
+                })
+            })
+            .collect::<Vec<_>>())
+    })?;
+    results.sort_by_key(|(action_index, _)| *action_index);
+    for (_, result) in results {
+        result?;
+    }
+    Ok(())
 }
 
 impl PreparedApply {
@@ -7297,16 +7483,11 @@ impl PreparedApply {
             self.inner.scan_policy.as_ref(),
             self.inner.apply_options,
         )?;
-        for output in self.inner.prepared_outputs.iter().flatten() {
-            output.output.verify_at_identity(
-                &output.output.staging.directory,
-                &output.output.output_name,
-                &output.output.temp_path,
-            )?;
-            output
-                .output
-                .verify_prepared_contents(&output.final_entry)?;
-        }
+        validate_prepared_outputs(
+            &self.inner.prepared_outputs,
+            validation_worker_limit(),
+            &FilePreparedOutputValidator,
+        )?;
         for action in &self.inner.actions {
             let change = match action {
                 Action::Local(change) | Action::ResolvedLocal((_, _), change) => change,
@@ -7339,8 +7520,17 @@ impl PreparedApply {
         Ok(())
     }
 
-    pub fn commit(mut self) -> Result<Vec<Entry>> {
+    pub fn commit(self) -> Result<Vec<Entry>> {
+        self.commit_profiled().map(|(entries, _)| entries)
+    }
+
+    pub(crate) fn commit_profiled(mut self) -> Result<(Vec<Entry>, StagedCommitProfile)> {
+        let mut profile = StagedCommitProfile::default();
+        let started = Instant::now();
         self.validate_commit()?;
+        profile.revalidation_us = duration_us(started.elapsed());
+
+        let started = Instant::now();
         if let (Some(state_path), Some(attempt_id)) = (
             self.inner.attempt_state.as_deref(),
             self.inner.attempt_id.as_deref(),
@@ -7352,7 +7542,9 @@ impl PreparedApply {
                 ApplyAttemptPhase::Committing,
             )?;
         }
+        profile.committing_marker_transition_us = duration_us(started.elapsed());
 
+        let started = Instant::now();
         self.inner.old_index = 0;
         self.inner.action_index = 0;
         self.inner.new_entries.clear();
@@ -7365,12 +7557,20 @@ impl PreparedApply {
             }
             self.inner.action_index = action_index + 1;
         }
-        self.inner.apply_directory_second_pass()?;
+        profile.forward_apply_publication_us = duration_us(started.elapsed());
 
+        let started = Instant::now();
+        self.inner.apply_directory_second_pass()?;
+        profile.reverse_directory_pass_us = duration_us(started.elapsed());
+
+        let started = Instant::now();
         for entry in self.inner.all_old.iter().skip(self.inner.old_index) {
             self.inner.new_entries.push(entry.clone());
         }
         self.inner.new_entries.sort();
+        profile.manifest_finalization_us = duration_us(started.elapsed());
+
+        let started = Instant::now();
         let metadata_synced = metadata_synced_directories(&self.inner.base, &self.inner.actions);
         let already_synced = match self.inner.staging.take() {
             Some(staging) => staging.finish(&metadata_synced)?,
@@ -7382,6 +7582,9 @@ impl PreparedApply {
             self.inner.attempt_state.as_deref(),
             &already_synced,
         )?;
+        profile.durability_staging_cleanup_us = duration_us(started.elapsed());
+
+        let started = Instant::now();
         if let (Some(state_path), Some(attempt_id)) = (
             self.inner.attempt_state.as_deref(),
             self.inner.attempt_id.as_deref(),
@@ -7393,7 +7596,8 @@ impl PreparedApply {
                 ApplyAttemptPhase::Committed,
             )?;
         }
-        Ok(std::mem::take(&mut self.inner.new_entries))
+        profile.committed_marker_transition_us = duration_us(started.elapsed());
+        Ok((std::mem::take(&mut self.inner.new_entries), profile))
     }
 
     #[allow(dead_code)]
@@ -9228,6 +9432,159 @@ mod tests {
         }
     }
 
+    struct TestPreparedOutputValidator {
+        failures: HashSet<usize>,
+        panic_at: Option<usize>,
+        delay: Duration,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl PreparedOutputValidator for TestPreparedOutputValidator {
+        fn validate(&self, action_index: usize, _output: &PreparedOutput) -> Result<()> {
+            if self.panic_at == Some(action_index) {
+                panic!("injected validation panic");
+            }
+            let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.max_active.fetch_max(active, AtomicOrdering::SeqCst);
+            thread::sleep(self.delay);
+            self.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            if self.failures.contains(&action_index) {
+                Err(eyre!("validation failed at action {}", action_index))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn test_validator(failures: &[usize], panic_at: Option<usize>) -> TestPreparedOutputValidator {
+        TestPreparedOutputValidator {
+            failures: failures.iter().copied().collect(),
+            panic_at,
+            delay: Duration::from_millis(25),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        }
+    }
+
+    fn validation_test_outputs(
+        base: &Path,
+        staging: &StagingArea,
+        count: usize,
+    ) -> Vec<Option<PreparedOutput>> {
+        (0..count)
+            .map(|index| {
+                let path = format!("{index}.txt");
+                let contents = path.as_bytes();
+                let entry = test_file_entry(&path, contents);
+                Some(prepared_test_output(base, staging, &entry, contents))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn validation_worker_configuration_is_bounded_and_normalized() {
+        assert_eq!(validation_worker_limit_from(None, 8, 8), 8);
+        assert_eq!(validation_worker_limit_from(Some("0"), 8, 8), 8);
+        assert_eq!(validation_worker_limit_from(Some("invalid"), 8, 8), 8);
+        assert_eq!(validation_worker_limit_from(Some("1000"), 4, 8), 4);
+        assert_eq!(validation_worker_limit_from(Some("1000"), 100, 3), 3);
+        assert_eq!(validation_worker_limit_from(Some("1000"), 100, 100), 16);
+        assert_eq!(validation_worker_limit_from(Some("2"), 0, 0), 1);
+    }
+
+    #[test]
+    fn staged_commit_profile_round_trips_and_aggregates() {
+        let mut profile = StagedCommitProfile {
+            revalidation_us: 1,
+            committing_marker_transition_us: 2,
+            forward_apply_publication_us: 3,
+            reverse_directory_pass_us: 4,
+            manifest_finalization_us: 5,
+            durability_staging_cleanup_us: 6,
+            committed_marker_transition_us: 7,
+        };
+        let encoded = serde_json::to_string(&profile).unwrap();
+        let decoded: StagedCommitProfile = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, profile);
+        assert_eq!(profile.total_us(), 28);
+
+        profile.saturating_add_assign(StagedCommitProfile {
+            revalidation_us: u64::MAX,
+            ..StagedCommitProfile::default()
+        });
+        assert_eq!(profile.revalidation_us, u64::MAX);
+    }
+
+    #[test]
+    fn prepared_output_validation_workers_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let outputs = validation_test_outputs(dir.path(), &staging, 4);
+        let validator = test_validator(&[], None);
+
+        validate_prepared_outputs(&outputs, 4, &validator).unwrap();
+
+        assert!(validator.max_active.load(AtomicOrdering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn prepared_output_validation_reports_lowest_action_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let outputs = validation_test_outputs(dir.path(), &staging, 4);
+        let validator = test_validator(&[1, 3], None);
+
+        let error = validate_prepared_outputs(&outputs, 4, &validator).unwrap_err();
+
+        assert!(error.to_string().contains("action 1"), "{}", error);
+    }
+
+    #[test]
+    fn prepared_output_validation_converts_worker_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let outputs = validation_test_outputs(dir.path(), &staging, 2);
+        let validator = test_validator(&[], Some(0));
+
+        let error = validate_prepared_outputs(&outputs, 2, &validator).unwrap_err();
+
+        assert!(
+            error.to_string().contains("panicked for action 0"),
+            "{}",
+            error
+        );
+        assert!(
+            error.to_string().contains("injected validation panic"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn prepared_output_validation_converts_worker_spawn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let outputs = validation_test_outputs(dir.path(), &staging, 1);
+        let validator = test_validator(&[], None);
+
+        let error = validate_prepared_outputs_with_spawn_failure(
+            &outputs,
+            1,
+            &validator,
+            Some(io::ErrorKind::WouldBlock),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unable to create prepared output validation worker"),
+            "{}",
+            error
+        );
+    }
+
     struct OverlapSyncWorker {
         expected_overlap: usize,
         state: Mutex<(usize, usize)>,
@@ -10428,6 +10785,32 @@ mod tests {
         assert_eq!(mode(&parent), 0o000);
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         result.unwrap();
+    }
+
+    #[test]
+    fn complete_apply_phase_remote_only_syncs_marker_without_base_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_base = dir.path().join("missing-base");
+        let state = dir.path().join("profile.snp");
+        let marker = apply_attempt_path(&state).unwrap();
+        fs::write(&marker, b"marker").unwrap();
+        let actions = vec![Action::Remote(Change::Added(test_file_entry(
+            "missing/child.txt",
+            b"contents",
+        )))];
+
+        complete_apply_phase(&missing_base, &actions, Some(&state), &HashSet::new()).unwrap();
+
+        fs::remove_file(&marker).unwrap();
+        let error = complete_apply_phase(&missing_base, &actions, Some(&state), &HashSet::new())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unable to sync accumulated apply recovery records"),
+            "{}",
+            error
+        );
     }
 
     #[test]
@@ -12795,7 +13178,8 @@ mod tests {
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("phase: prepared"), "{}", marker);
 
-        let entries = prepared.commit().unwrap();
+        let (entries, profile) = prepared.commit_profiled().unwrap();
+        assert!(profile.revalidation_us <= profile.total_us());
         assert!(base.join("a-dir").is_dir());
         assert_eq!(fs::read(base.join("b-file.txt")).unwrap(), b"new");
         assert_eq!(

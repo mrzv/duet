@@ -609,6 +609,16 @@ fn performance_profile_reports_human_and_json_output() {
     assert!(stdout.contains("local_scan"), "{}", stdout);
     assert!(stdout.contains("remote_scan_rpc"), "{}", stdout);
     assert!(stdout.contains("staged_validation"), "{}", stdout);
+    assert!(
+        stdout.contains("staged_local_commit_revalidation"),
+        "{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("staged_remote_commit_forward_apply"),
+        "{}",
+        stdout
+    );
     assert!(stdout.contains("signatures:"), "{}", stdout);
     assert!(stdout.contains("staging: waves="), "{}", stdout);
     assert!(stdout.contains("stream remote->local"), "{}", stdout);
@@ -624,6 +634,16 @@ fn performance_profile_reports_human_and_json_output() {
         .unwrap()
         .iter()
         .any(|phase| phase["name"] == "staged_validation"));
+    assert!(profile["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|phase| phase["name"] == "staged_local_commit_durability"));
+    assert!(profile["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|phase| phase["name"] == "staged_remote_commit_forward_apply"));
     assert!(profile["sync_tuning"].is_object());
     let counters = &profile["counters"];
     assert_eq!(counters["streamed_details"], true);

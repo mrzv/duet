@@ -46,6 +46,7 @@ pub(crate) const CAPABILITY_CHECKPOINTED_STAGING: &str = "checkpointed-staging-v
 pub(crate) const CAPABILITY_STAGING_RESERVE_ENFORCEMENT: &str = "staging-reserve-enforcement-v1";
 pub(crate) const CAPABILITY_STAGING_INODE_CAPACITY: &str = "staging-inode-capacity-v1";
 pub(crate) const CAPABILITY_SCAN_EXCLUDES: &str = "scan-excludes-v1";
+pub(crate) const CAPABILITY_STAGED_COMMIT_PROFILE: &str = "staged-commit-profile-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -71,6 +72,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_STAGING_RESERVE_ENFORCEMENT,
     CAPABILITY_STAGING_INODE_CAPACITY,
     CAPABILITY_SCAN_EXCLUDES,
+    CAPABILITY_STAGED_COMMIT_PROFILE,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -225,6 +227,10 @@ pub trait DuetServer {
         remote_id: String,
         strong: bool,
     ) -> Result<ChangesV2, RPCError>;
+    fn commit_staged_apply_profiled(
+        &mut self,
+        attempt_id: String,
+    ) -> Result<sync::StagedCommitProfile, RPCError>;
 }
 
 enum ApplyStream {
@@ -476,6 +482,55 @@ impl DuetServerImpl {
                 .map_err(|e| rpc_report_error("finish apply recovery", Some(&remote_state), e))?;
         }
         Ok(())
+    }
+
+    fn commit_staged_apply_inner(
+        &mut self,
+        attempt_id: String,
+    ) -> Result<sync::StagedCommitProfile, RPCError> {
+        let state = self.staged_apply.take().ok_or_else(|| {
+            rpc_error(
+                "commit staged apply",
+                None,
+                "no staged apply attempt is active",
+            )
+        })?;
+        let (state_path, prepared) = match state {
+            StagedApplyState::Prepared {
+                attempt_id: active_id,
+                state_path,
+                prepared,
+            } if active_id == attempt_id => (state_path, prepared),
+            other => {
+                self.staged_apply = Some(other);
+                return Err(rpc_error(
+                    "commit staged apply",
+                    None,
+                    "staged apply attempt ID mismatch or attempt is not prepared",
+                ));
+            }
+        };
+        self.staged_apply = Some(StagedApplyState::Committing {
+            attempt_id: attempt_id.clone(),
+            state_path: state_path.clone(),
+        });
+        match prepared.commit_profiled() {
+            Ok((all_old, profile)) => {
+                self.all_old = all_old;
+                self.staged_apply = Some(StagedApplyState::Committed {
+                    attempt_id,
+                    state_path,
+                    state_save_started: false,
+                    state_saved: false,
+                });
+                Ok(profile)
+            }
+            Err(error) => Err(rpc_report_error(
+                "commit staged apply",
+                Some(&state_path),
+                error,
+            )),
+        }
     }
 }
 
@@ -1302,49 +1357,7 @@ impl DuetServer for DuetServerImpl {
     }
 
     fn commit_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError> {
-        let state = self.staged_apply.take().ok_or_else(|| {
-            rpc_error(
-                "commit staged apply",
-                None,
-                "no staged apply attempt is active",
-            )
-        })?;
-        let (state_path, prepared) = match state {
-            StagedApplyState::Prepared {
-                attempt_id: active_id,
-                state_path,
-                prepared,
-            } if active_id == attempt_id => (state_path, prepared),
-            other => {
-                self.staged_apply = Some(other);
-                return Err(rpc_error(
-                    "commit staged apply",
-                    None,
-                    "staged apply attempt ID mismatch or attempt is not prepared",
-                ));
-            }
-        };
-        self.staged_apply = Some(StagedApplyState::Committing {
-            attempt_id: attempt_id.clone(),
-            state_path: state_path.clone(),
-        });
-        match prepared.commit() {
-            Ok(all_old) => {
-                self.all_old = all_old;
-                self.staged_apply = Some(StagedApplyState::Committed {
-                    attempt_id,
-                    state_path,
-                    state_save_started: false,
-                    state_saved: false,
-                });
-                Ok(())
-            }
-            Err(error) => Err(rpc_report_error(
-                "commit staged apply",
-                Some(&state_path),
-                error,
-            )),
-        }
+        self.commit_staged_apply_inner(attempt_id).map(|_| ())
     }
 
     fn validate_staged_apply(&self, attempt_id: String) -> Result<(), RPCError> {
@@ -1365,6 +1378,13 @@ impl DuetServer for DuetServerImpl {
         prepared
             .validate_commit()
             .map_err(|e| rpc_report_error("validate staged apply", Some(state_path), e))
+    }
+
+    fn commit_staged_apply_profiled(
+        &mut self,
+        attempt_id: String,
+    ) -> Result<sync::StagedCommitProfile, RPCError> {
+        self.commit_staged_apply_inner(attempt_id)
     }
 
     fn save_staged_state_pending(
@@ -1671,6 +1691,9 @@ mod tests {
                 true,
             )
             .is_err());
+        assert!(client
+            .commit_staged_apply_profiled("attempt".to_string())
+            .is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -1706,6 +1729,7 @@ mod tests {
                 ("staging_filesystem_info", 45),
                 ("set_staging_policy", 46),
                 ("changes_scope", 47),
+                ("commit_staged_apply_profiled", 48),
             ]
         );
     }
@@ -1750,6 +1774,7 @@ mod tests {
                 CAPABILITY_STAGING_RESERVE_ENFORCEMENT.to_string(),
                 CAPABILITY_STAGING_INODE_CAPACITY.to_string(),
                 CAPABILITY_SCAN_EXCLUDES.to_string(),
+                CAPABILITY_STAGED_COMMIT_PROFILE.to_string(),
             ]
         );
     }
