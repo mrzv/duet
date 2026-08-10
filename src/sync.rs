@@ -2438,16 +2438,11 @@ impl PreparingMarker {
     }
 
     fn record_stage_entry(&mut self, output: &TempOutput) -> Result<()> {
-        let metadata = output
-            .file
-            .as_ref()
-            .ok_or_else(|| eyre!("new staged output is closed"))?
-            .metadata()?;
         self.append(&format!(
             "stage-entry: {} {} {}\n",
             output.output_name.to_string_lossy(),
-            metadata.dev(),
-            metadata.ino()
+            output.identity.dev,
+            output.identity.ino
         ))
     }
 }
@@ -4309,9 +4304,7 @@ impl StagingState {
         self.verify_stage_path_identity()
     }
 
-    fn record_published_parent(&self, path: &Path, directory: &fs::File) -> Result<()> {
-        verify_path_identity(path, directory, "published destination parent")?;
-        let identity = directory_identity(directory, path, "published destination parent")?;
+    fn record_published_parent(&self, path: &Path, identity: DirectoryIdentity) -> Result<()> {
         let mut parents = self
             .published_parents
             .lock()
@@ -4811,7 +4804,7 @@ struct TempOutput {
     output_name: std::ffi::CString,
     staging: Arc<StagingState>,
     file: Option<fs::File>,
-    identity: Option<FileIdentity>,
+    identity: FileIdentity,
     cleanup_on_drop: bool,
 }
 
@@ -4842,25 +4835,7 @@ impl TempOutput {
             CloneOutput::Cloned(path, name, file) => (path, name, file),
             CloneOutput::Unsupported => return Ok(None),
         };
-        let cleanup_name = created.1.clone();
-        match Self::from_created(final_path, Arc::clone(&staging), created) {
-            Ok(output) => Ok(Some(output)),
-            Err(error) => {
-                match unlinkat(staging.directory.as_raw_fd(), &cleanup_name, 0) {
-                    Ok(()) => {}
-                    Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {}
-                    Err(cleanup_error) => {
-                        return Err(error).wrap_err_with(|| {
-                            format!(
-                                "failed to initialize cloned temporary output; additionally failed to remove it: {}",
-                                cleanup_error
-                            )
-                        });
-                    }
-                }
-                Err(error)
-            }
-        }
+        Self::from_created(final_path, staging, created).map(Some)
     }
 
     fn from_created(
@@ -4868,42 +4843,82 @@ impl TempOutput {
         staging: Arc<StagingState>,
         (temp_path, output_name, file): (PathBuf, std::ffi::CString, fs::File),
     ) -> Result<Self> {
-        let parent = output_parent(&final_path);
-        let parent_path = parent.to_path_buf();
-        let parent_identity = if parent.try_exists().wrap_err_with(|| {
-            format!(
-                "failed to inspect output parent directory {}",
-                parent.display()
-            )
-        })? {
-            Some(directory_path_identity(parent, "output parent directory")?)
-        } else {
-            None
-        };
-        let final_name = path_component_cstring(
-            final_path
-                .file_name()
-                .ok_or_else(|| eyre!("output path {} has no file name", final_path.display()))?,
-            "output file name",
-        )?;
-        let output = TempOutput {
-            final_path,
-            parent_path,
-            parent_identity,
-            temp_path,
-            final_name,
-            output_name,
-            staging,
-            file: Some(file),
-            identity: None,
-            cleanup_on_drop: true,
-        };
-        output.verify_at_identity(
-            &output.staging.directory,
-            &output.output_name,
-            &output.temp_path,
-        )?;
-        Ok(output)
+        let cleanup_staging = Arc::clone(&staging);
+        let cleanup_name = output_name.clone();
+        let mut cleanup_identity = None;
+        let result = (|| {
+            let metadata = file.metadata().wrap_err_with(|| {
+                format!("failed to inspect temporary file {}", temp_path.display())
+            })?;
+            if !metadata.is_file() {
+                return Err(eyre!(
+                    "temporary output {} is not a regular file",
+                    temp_path.display()
+                ));
+            }
+            let identity = FileIdentity {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            };
+            cleanup_identity = Some(identity);
+            let parent = output_parent(&final_path);
+            let parent_path = parent.to_path_buf();
+            let parent_identity = match fs::symlink_metadata(parent) {
+                Ok(metadata) if metadata.is_dir() => Some(DirectoryIdentity {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                }),
+                Ok(_) => {
+                    return Err(eyre!(
+                        "output parent {} is not a directory",
+                        parent.display()
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "failed to inspect output parent directory {}",
+                            parent.display()
+                        )
+                    });
+                }
+            };
+            let final_name = path_component_cstring(
+                final_path.file_name().ok_or_else(|| {
+                    eyre!("output path {} has no file name", final_path.display())
+                })?,
+                "output file name",
+            )?;
+            let output = TempOutput {
+                final_path,
+                parent_path,
+                parent_identity,
+                temp_path,
+                final_name,
+                output_name,
+                staging,
+                file: Some(file),
+                identity,
+                cleanup_on_drop: true,
+            };
+            output.verify_at_identity(
+                &output.staging.directory,
+                &output.output_name,
+                &output.temp_path,
+            )?;
+            Ok(output)
+        })();
+        if result.is_err() {
+            if let Some(identity) = cleanup_identity {
+                let _ = unlink_file_at_identity(
+                    cleanup_staging.directory.as_raw_fd(),
+                    &cleanup_name,
+                    identity,
+                );
+            }
+        }
+        result
     }
 
     fn prepare_metadata(&mut self, entry: &Entry) -> Result<Entry> {
@@ -4959,11 +4974,17 @@ impl TempOutput {
 
     fn verify_contents(&mut self, entry: &Entry, description: &str) -> Result<()> {
         self.flush()?;
+        let identity = self.identity;
+        let temp_path = &self.temp_path;
         let file = self
             .file
             .as_mut()
             .ok_or_else(|| eyre!("temporary output is closed"))?;
-        verify_open_file_matches_entry(file, &self.temp_path, entry, description)
+        let metadata = file
+            .metadata()
+            .wrap_err_with(|| format!("failed to read metadata for {}", temp_path.display()))?;
+        verify_temp_output_metadata(&metadata, identity, temp_path)?;
+        verify_open_file_contents_match_entry(file, &metadata, temp_path, entry, description)
     }
 
     fn verify_at_identity(
@@ -4972,25 +4993,11 @@ impl TempOutput {
         name: &std::ffi::CStr,
         path: &Path,
     ) -> Result<()> {
-        let identity = match self.file.as_ref() {
-            Some(file) => {
-                let metadata = file
-                    .metadata()
-                    .wrap_err("failed to read open temporary file metadata")?;
-                FileIdentity {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                }
-            }
-            None => self
-                .identity
-                .ok_or_else(|| eyre!("temporary output has no recorded identity"))?,
-        };
         let path_stat = fstatat_nofollow(directory.as_raw_fd(), name)
             .wrap_err_with(|| format!("failed to read temporary path {}", path.display()))?;
         if path_stat.st_mode & libc::S_IFMT != libc::S_IFREG
-            || path_stat.st_dev as u64 != identity.dev
-            || path_stat.st_ino as u64 != identity.ino
+            || path_stat.st_dev as u64 != self.identity.dev
+            || path_stat.st_ino as u64 != self.identity.ino
         {
             return Err(eyre!(
                 "temporary path {} no longer refers to the open output file",
@@ -5007,8 +5014,22 @@ impl TempOutput {
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         )?;
+        let metadata = file.metadata().wrap_err_with(|| {
+            format!(
+                "failed to inspect reopened temporary file {}",
+                self.temp_path.display()
+            )
+        })?;
+        verify_temp_output_metadata(&metadata, self.identity, &self.temp_path)?;
         self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
-        verify_open_file_matches_entry(&mut file, &self.temp_path, entry, "staged output")
+        verify_open_file_contents_match_entry(
+            &mut file,
+            &metadata,
+            &self.temp_path,
+            entry,
+            "staged output",
+        )?;
+        self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)
     }
 
     fn prepare(mut self, entry: &Entry, publication: OutputPublication) -> Result<PreparedOutput> {
@@ -5030,8 +5051,7 @@ impl TempOutput {
         expected: &Entry,
         on_commit: impl FnOnce(&Entry) -> Result<()>,
     ) -> Result<Entry> {
-        self.reopen()?;
-        self.verify_contents(&final_entry, "staged output")?;
+        self.reopen_and_verify_contents(&final_entry, "staged output")?;
         let final_entry = self.prepare_metadata(&final_entry)?;
         self.prepare_publication_parent()?;
         verify_current_matches_entry(&self.final_path, expected, "rename target")?;
@@ -5054,14 +5074,14 @@ impl TempOutput {
                 )
             })?;
             on_commit(&final_entry)?;
-            verify_path_identity(
+            let parent_identity = verify_path_identity_and_get(
                 &self.parent_path,
                 parent_directory,
                 "output parent directory",
             )?;
             self.verify_at_identity(parent_directory, &self.final_name, &self.final_path)?;
             self.staging
-                .record_published_parent(&self.parent_path, parent_directory)
+                .record_published_parent(&self.parent_path, parent_identity)
         })?;
         Ok(final_entry)
     }
@@ -5072,8 +5092,7 @@ impl TempOutput {
         description: &str,
         on_commit: impl FnOnce(&Entry) -> Result<()>,
     ) -> Result<Entry> {
-        self.reopen()?;
-        self.verify_contents(&final_entry, "staged output")?;
+        self.reopen_and_verify_contents(&final_entry, "staged output")?;
         let final_entry = self.prepare_metadata(&final_entry)?;
         self.prepare_publication_parent()?;
         self.with_publication_parent(|parent_directory| {
@@ -5107,14 +5126,14 @@ impl TempOutput {
                 }
             }
             on_commit(&final_entry)?;
-            verify_path_identity(
+            let parent_identity = verify_path_identity_and_get(
                 &self.parent_path,
                 parent_directory,
                 "output parent directory",
             )?;
             self.verify_at_identity(parent_directory, &self.final_name, &self.final_path)?;
             self.staging
-                .record_published_parent(&self.parent_path, parent_directory)?;
+                .record_published_parent(&self.parent_path, parent_identity)?;
             unlinkat(self.staging.directory.as_raw_fd(), &self.output_name, 0).wrap_err_with(|| {
                 format!(
                     "failed to remove temporary file {}",
@@ -5167,14 +5186,14 @@ impl TempOutput {
                     self.final_path.display()
                 )
             })?;
-            verify_path_identity(
+            let parent_identity = verify_path_identity_and_get(
                 &self.parent_path,
                 parent_directory,
                 "output parent directory",
             )?;
             self.verify_at_identity(parent_directory, &self.final_name, &self.final_path)?;
             self.staging
-                .record_published_parent(&self.parent_path, parent_directory)
+                .record_published_parent(&self.parent_path, parent_identity)
         })?;
         Ok(final_entry)
     }
@@ -5203,33 +5222,19 @@ impl TempOutput {
     }
 
     fn close_after_sync(&mut self) -> Result<()> {
-        let file = self
-            .file
-            .as_ref()
-            .ok_or_else(|| eyre!("temporary output is closed"))?;
-        let metadata = file.metadata().wrap_err_with(|| {
-            format!(
-                "failed to inspect temporary file {}",
-                self.temp_path.display()
-            )
-        })?;
-        self.identity = Some(FileIdentity {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        });
+        if self.file.is_none() {
+            return Err(eyre!("temporary output is closed"));
+        }
         self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
         self.file = None;
         Ok(())
     }
 
-    fn reopen(&mut self) -> Result<()> {
+    fn reopen_and_verify_contents(&mut self, entry: &Entry, description: &str) -> Result<()> {
         if self.file.is_some() {
-            return Ok(());
+            return self.verify_contents(entry, description);
         }
-        let expected = self
-            .identity
-            .ok_or_else(|| eyre!("temporary output has no recorded identity"))?;
-        let file = openat_file(
+        let mut file = openat_file(
             self.staging.directory.as_raw_fd(),
             &self.output_name,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -5247,14 +5252,18 @@ impl TempOutput {
                 self.temp_path.display()
             )
         })?;
-        if !metadata.is_file() || metadata.dev() != expected.dev || metadata.ino() != expected.ino {
-            return Err(eyre!(
-                "temporary path {} no longer refers to the prepared output file",
-                self.temp_path.display()
-            ));
-        }
+        verify_temp_output_metadata(&metadata, self.identity, &self.temp_path)?;
+        self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
+        verify_open_file_contents_match_entry(
+            &mut file,
+            &metadata,
+            &self.temp_path,
+            entry,
+            description,
+        )?;
+        self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
         self.file = Some(file);
-        self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)
+        Ok(())
     }
 
     #[cfg(test)]
@@ -5860,6 +5869,26 @@ fn fstatat_nofollow(directory: RawFd, name: &std::ffi::CStr) -> io::Result<libc:
     Ok(unsafe { stat.assume_init() })
 }
 
+fn unlink_file_at_identity(
+    directory: RawFd,
+    name: &std::ffi::CStr,
+    identity: FileIdentity,
+) -> io::Result<bool> {
+    let current = match fstatat_nofollow(directory, name) {
+        Ok(current) => current,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if current.st_mode & libc::S_IFMT != libc::S_IFREG
+        || current.st_dev as u64 != identity.dev
+        || current.st_ino as u64 != identity.ino
+    {
+        return Ok(false);
+    }
+    unlinkat(directory, name, 0)?;
+    Ok(true)
+}
+
 fn normalize_stage_directory_mode(
     parent: &fs::File,
     name: &std::ffi::CStr,
@@ -5988,6 +6017,14 @@ fn verify_directory_at_identity(
 }
 
 fn verify_path_identity(path: &Path, retained: &fs::File, description: &str) -> Result<()> {
+    verify_path_identity_and_get(path, retained, description).map(|_| ())
+}
+
+fn verify_path_identity_and_get(
+    path: &Path,
+    retained: &fs::File,
+    description: &str,
+) -> Result<DirectoryIdentity> {
     let expected = retained.metadata().wrap_err_with(|| {
         format!(
             "failed to inspect retained {} {}",
@@ -6004,7 +6041,10 @@ fn verify_path_identity(path: &Path, retained: &fs::File, description: &str) -> 
             path.display()
         ));
     }
-    Ok(())
+    Ok(DirectoryIdentity {
+        dev: expected.dev(),
+        ino: expected.ino(),
+    })
 }
 
 fn verify_same_directory_handles(
@@ -7712,19 +7752,7 @@ struct FilePreparedOutputValidator;
 
 impl PreparedOutputValidator for FilePreparedOutputValidator {
     fn validate(&self, _action_index: usize, output: &PreparedOutput) -> Result<()> {
-        output.output.verify_at_identity(
-            &output.output.staging.directory,
-            &output.output.output_name,
-            &output.output.temp_path,
-        )?;
-        output
-            .output
-            .verify_prepared_contents(&output.final_entry)?;
-        output.output.verify_at_identity(
-            &output.output.staging.directory,
-            &output.output.output_name,
-            &output.output.temp_path,
-        )
+        output.output.verify_prepared_contents(&output.final_entry)
     }
 }
 
@@ -8767,6 +8795,16 @@ fn verify_open_file_matches_entry(
     let meta = file
         .metadata()
         .wrap_err_with(|| format!("failed to read metadata for {}", filename.display()))?;
+    verify_open_file_contents_match_entry(file, &meta, filename, entry, description)
+}
+
+fn verify_open_file_contents_match_entry(
+    file: &mut fs::File,
+    meta: &fs::Metadata,
+    filename: &Path,
+    entry: &Entry,
+    description: &str,
+) -> Result<()> {
     if !meta.is_file() {
         return Err(eyre!(
             "{} {} is not a regular file",
@@ -8812,6 +8850,20 @@ fn verify_open_file_matches_entry(
         }
     }
 
+    Ok(())
+}
+
+fn verify_temp_output_metadata(
+    metadata: &fs::Metadata,
+    identity: FileIdentity,
+    path: &Path,
+) -> Result<()> {
+    if !metadata.is_file() || metadata.dev() != identity.dev || metadata.ino() != identity.ino {
+        return Err(eyre!(
+            "temporary path {} no longer refers to the prepared output file",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -10528,6 +10580,49 @@ mod tests {
     }
 
     #[test]
+    fn post_publication_parent_substitution_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let parent = base.join("parent");
+        let moved_parent = base.join("moved-parent");
+        fs::create_dir_all(&parent).unwrap();
+        let entry = test_file_entry("parent/a.txt", b"a");
+        let actions = vec![Action::Local(Change::Added(entry.clone()))];
+        let staging = StagingArea::new(&base).unwrap();
+        let mut batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 1,
+                max_bytes: 1024,
+                workers: 1,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+        let hook_parent = parent.clone();
+        let hook_moved_parent = moved_parent.clone();
+        batch.post_commit_hook = Some(Arc::new(move |_| {
+            fs::rename(&hook_parent, &hook_moved_parent)?;
+            fs::create_dir(&hook_parent)?;
+            Ok(())
+        }));
+        batch.push(0, prepared_test_output(&base, &staging, &entry, b"a"));
+
+        let error = batch
+            .flush(&actions, &mut ApplyRecorder::new(None), &mut Vec::new())
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no longer refers to the retained directory"),
+            "{}",
+            error
+        );
+        assert!(moved_parent.join("a.txt").exists());
+        assert!(!parent.join("a.txt").exists());
+        staging.finish(&HashSet::new()).unwrap();
+    }
+
+    #[test]
     fn replacement_parent_is_rejected_before_publication_widening() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
@@ -11255,6 +11350,80 @@ mod tests {
         assert!(stage_dir.exists());
         staging.finish(&HashSet::new()).unwrap();
         assert!(!stage_dir.exists());
+    }
+
+    #[test]
+    fn temp_output_cached_identity_survives_sealing_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let mut output = TempOutput::new(dir.path().join("out.txt"), staging.shared()).unwrap();
+        let identity = output.identity;
+        output
+            .file
+            .as_mut()
+            .unwrap()
+            .write_all(b"contents")
+            .unwrap();
+        let entry = test_file_entry("out.txt", b"contents");
+        output.file.as_ref().unwrap().sync_all().unwrap();
+
+        output.close_after_sync().unwrap();
+        assert_eq!(output.identity, identity);
+        output.verify_prepared_contents(&entry).unwrap();
+        output
+            .reopen_and_verify_contents(&entry, "staged output")
+            .unwrap();
+        let reopened = output.file.as_ref().unwrap().metadata().unwrap();
+        assert_eq!(
+            (reopened.dev(), reopened.ino()),
+            (identity.dev, identity.ino)
+        );
+    }
+
+    #[test]
+    fn temp_output_drop_refuses_substituted_stage_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let output = TempOutput::new(dir.path().join("out.txt"), staging.shared()).unwrap();
+        let output_path = output.temp_path().to_path_buf();
+        let displaced = output_path.with_extension("displaced");
+        fs::rename(&output_path, &displaced).unwrap();
+        fs::write(&output_path, b"substitute").unwrap();
+
+        drop(output);
+
+        assert_eq!(fs::read(&output_path).unwrap(), b"substitute");
+        assert!(displaced.exists());
+        fs::remove_file(output_path).unwrap();
+        fs::remove_file(displaced).unwrap();
+        staging.finish(&HashSet::new()).unwrap();
+    }
+
+    #[test]
+    fn temp_output_initialization_refuses_to_unlink_substituted_stage_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = StagingArea::new(dir.path()).unwrap();
+        let shared = staging.shared();
+        let (output_path, output_name, file) = shared.create_output().unwrap();
+        let displaced = output_path.with_extension("displaced");
+        fs::rename(&output_path, &displaced).unwrap();
+        fs::write(&output_path, b"substitute").unwrap();
+
+        let error = match TempOutput::from_created(
+            dir.path().join("out.txt"),
+            shared,
+            (output_path.clone(), output_name, file),
+        ) {
+            Ok(_) => panic!("substituted temporary output unexpectedly initialized"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("no longer refers"), "{}", error);
+        assert_eq!(fs::read(&output_path).unwrap(), b"substitute");
+        assert!(displaced.exists());
+        fs::remove_file(output_path).unwrap();
+        fs::remove_file(displaced).unwrap();
+        staging.finish(&HashSet::new()).unwrap();
     }
 
     #[test]
@@ -13858,7 +14027,7 @@ mod tests {
         for output in applier.prepared_outputs.iter().flatten() {
             assert_eq!(
                 parsed.entries[output.output.output_name.to_str().unwrap()],
-                output.output.identity.unwrap()
+                output.output.identity
             );
         }
 
