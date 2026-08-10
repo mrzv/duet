@@ -2272,51 +2272,160 @@ fn parse_marker_path_identity(value: &str) -> Result<(&str, DirectoryIdentity)> 
     }
 }
 
-fn append_v2_marker_line_durable(state_path: &Path, attempt_id: &str, line: &str) -> Result<()> {
-    let marker_path = apply_attempt_path(state_path)?;
-    let contents = fs::read_to_string(&marker_path)?;
-    let marker = parse_v2_apply_attempt(&contents)?;
-    if marker.attempt_id != attempt_id || marker.phase != ApplyAttemptPhase::Preparing {
-        return Err(eyre!(
-            "staged apply marker does not match active preparing attempt"
-        ));
+struct PreparingMarker {
+    path: PathBuf,
+    attempt_id: String,
+    file: fs::File,
+    identity: FileIdentity,
+    expected_length: u64,
+}
+
+impl PreparingMarker {
+    fn open(state_path: &Path, attempt_id: &str) -> Result<Self> {
+        let path = apply_attempt_path(state_path)?;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .wrap_err_with(|| format!("unable to open preparing marker {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .wrap_err_with(|| format!("unable to inspect preparing marker {}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(eyre!(
+                "preparing marker {} is not a regular file",
+                path.display()
+            ));
+        }
+        let identity = FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+        let expected_length = metadata.len();
+        file.seek(SeekFrom::Start(0))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .wrap_err_with(|| format!("unable to read preparing marker {}", path.display()))?;
+        if contents.len() as u64 != expected_length {
+            return Err(eyre!(
+                "preparing marker {} changed length while opening",
+                path.display()
+            ));
+        }
+        let marker = parse_v2_apply_attempt(&contents)?;
+        if marker.attempt_id != attempt_id || marker.phase != ApplyAttemptPhase::Preparing {
+            return Err(eyre!(
+                "staged apply marker does not match active preparing attempt"
+            ));
+        }
+        let preparing = Self {
+            path,
+            attempt_id: attempt_id.to_string(),
+            file,
+            identity,
+            expected_length,
+        };
+        preparing.verify_identity()?;
+        Ok(preparing)
     }
-    let mut file = fs::OpenOptions::new().append(true).open(&marker_path)?;
-    file.write_all(line.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
-}
 
-fn append_v2_marker_line(state_path: &Path, line: &str) -> Result<()> {
-    let marker_path = apply_attempt_path(state_path)?;
-    let mut file = fs::OpenOptions::new().append(true).open(&marker_path)?;
-    file.write_all(line.as_bytes())?;
-    Ok(())
-}
-
-fn sync_v2_marker_entries(state_path: &Path, attempt_id: &str) -> Result<()> {
-    let marker_path = apply_attempt_path(state_path)?;
-    let contents = fs::read_to_string(&marker_path)?;
-    let marker = parse_v2_apply_attempt(&contents)?;
-    if marker.attempt_id != attempt_id || marker.phase != ApplyAttemptPhase::Preparing {
-        return Err(eyre!(
-            "staged apply marker does not match active preparing attempt"
-        ));
+    fn verify_identity(&self) -> Result<()> {
+        let retained = self.file.metadata().wrap_err_with(|| {
+            format!("unable to inspect preparing marker {}", self.path.display())
+        })?;
+        if !retained.is_file()
+            || retained.dev() != self.identity.dev
+            || retained.ino() != self.identity.ino
+            || retained.len() != self.expected_length
+        {
+            return Err(eyre!(
+                "preparing marker handle {} changed identity or length for attempt {}",
+                self.path.display(),
+                self.attempt_id
+            ));
+        }
+        let current = fs::symlink_metadata(&self.path).wrap_err_with(|| {
+            format!(
+                "unable to inspect preparing marker path {}",
+                self.path.display()
+            )
+        })?;
+        if !current.is_file()
+            || current.dev() != self.identity.dev
+            || current.ino() != self.identity.ino
+        {
+            return Err(eyre!(
+                "preparing marker path {} no longer refers to the retained regular file",
+                self.path.display()
+            ));
+        }
+        Ok(())
     }
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&marker_path)?
-        .sync_all()?;
-    Ok(())
-}
 
-fn record_v2_stage(state_path: &Path, attempt_id: &str, staging: &StagingArea) -> Result<()> {
-    let shared = &staging.shared;
-    let metadata = shared.directory.metadata()?;
-    append_v2_marker_line_durable(
-        state_path,
-        attempt_id,
-        &format!(
+    fn read_validated_contents(&mut self) -> Result<String> {
+        self.verify_identity()?;
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut contents = String::new();
+        self.file
+            .read_to_string(&mut contents)
+            .wrap_err_with(|| format!("unable to read preparing marker {}", self.path.display()))?;
+        if contents.len() as u64 != self.expected_length {
+            return Err(eyre!(
+                "preparing marker {} changed length while reading",
+                self.path.display()
+            ));
+        }
+        let marker = parse_v2_apply_attempt(&contents)?;
+        if marker.attempt_id != self.attempt_id || marker.phase != ApplyAttemptPhase::Preparing {
+            return Err(eyre!(
+                "staged apply marker does not match active preparing attempt"
+            ));
+        }
+        self.verify_identity()?;
+        Ok(contents)
+    }
+
+    fn append(&mut self, line: &str) -> Result<()> {
+        self.verify_identity()?;
+        self.file.write_all(line.as_bytes()).wrap_err_with(|| {
+            format!("unable to append preparing marker {}", self.path.display())
+        })?;
+        self.expected_length = self
+            .expected_length
+            .checked_add(line.len() as u64)
+            .ok_or_else(|| eyre!("preparing marker length overflow"))?;
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.read_validated_contents()?;
+        self.file
+            .sync_all()
+            .wrap_err_with(|| format!("unable to sync preparing marker {}", self.path.display()))?;
+        self.read_validated_contents().map(|_| ())
+    }
+
+    fn transition_to_prepared(self) -> Result<()> {
+        self.transition_to_prepared_with_hook(|| Ok(()))
+    }
+
+    fn transition_to_prepared_with_hook(
+        mut self,
+        before_replace: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let contents = self.read_validated_contents()?;
+        let updated =
+            replace_marker_line(&contents, "phase: ", ApplyAttemptPhase::Prepared.as_str())?;
+        self.verify_identity()?;
+        before_replace()?;
+        write_apply_marker_atomic(&self.path, &updated)
+    }
+
+    fn record_stage(&mut self, staging: &StagingArea) -> Result<()> {
+        let shared = &staging.shared;
+        let metadata = shared.directory.metadata()?;
+        self.append(&format!(
             "stage-parent: {} {} {}\nstage: {} {} {}\n",
             shared.stage_parent_path.display(),
             shared.stage_parent_identity.dev,
@@ -2324,25 +2433,23 @@ fn record_v2_stage(state_path: &Path, attempt_id: &str, staging: &StagingArea) -
             shared.name.to_string_lossy(),
             metadata.dev(),
             metadata.ino()
-        ),
-    )
-}
+        ))?;
+        self.sync()
+    }
 
-fn record_v2_stage_entry(state_path: &Path, output: &TempOutput) -> Result<()> {
-    let metadata = output
-        .file
-        .as_ref()
-        .ok_or_else(|| eyre!("new staged output is closed"))?
-        .metadata()?;
-    append_v2_marker_line(
-        state_path,
-        &format!(
+    fn record_stage_entry(&mut self, output: &TempOutput) -> Result<()> {
+        let metadata = output
+            .file
+            .as_ref()
+            .ok_or_else(|| eyre!("new staged output is closed"))?
+            .metadata()?;
+        self.append(&format!(
             "stage-entry: {} {} {}\n",
             output.output_name.to_string_lossy(),
             metadata.dev(),
             metadata.ino()
-        ),
-    )
+        ))
+    }
 }
 
 fn cleanup_v2_precommit_stage(contents: &str) -> Result<()> {
@@ -5459,7 +5566,7 @@ impl FilePublicationBatch {
     fn seal_into(
         &mut self,
         prepared_outputs: &mut [Option<PreparedOutput>],
-        recovery_attempt: Option<(&Path, &str)>,
+        preparing_marker: Option<&mut PreparingMarker>,
     ) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -5527,11 +5634,12 @@ impl FilePublicationBatch {
                 }
             }
         }
-        if let Some((state_path, attempt_id)) = recovery_attempt {
-            sync_v2_marker_entries(state_path, attempt_id)?;
+        let marker_owned = preparing_marker.is_some();
+        if let Some(marker) = preparing_marker {
+            marker.sync()?;
         }
         for mut item in pending {
-            if recovery_attempt.is_some() {
+            if marker_owned {
                 item.prepared.output.cleanup_on_drop = false;
             }
             item.prepared.output.close_after_sync()?;
@@ -6710,6 +6818,7 @@ pub struct DetailApplier {
     state: Option<ApplyState>,
     output_batch: FilePublicationBatch,
     prepared_outputs: Vec<Option<PreparedOutput>>,
+    preparing_marker: Option<PreparingMarker>,
     // Drop pending outputs before removing their shared staging directory.
     staging: Option<StagingArea>,
     staging_space_monitor: Option<StagingSpaceMonitor>,
@@ -6876,6 +6985,7 @@ impl DetailApplier {
             staging_space_monitor: None,
             output_batch: FilePublicationBatch::new(),
             prepared_outputs,
+            preparing_marker: None,
             failed: None,
         }
     }
@@ -7062,12 +7172,17 @@ impl DetailApplier {
         if let (Some(state_path), Some(attempt_id)) =
             (self.attempt_state.as_deref(), self.attempt_id.as_deref())
         {
-            transition_staged_apply_attempt(
-                state_path,
-                attempt_id,
-                &[ApplyAttemptPhase::Preparing],
-                ApplyAttemptPhase::Prepared,
-            )?;
+            if let Some(marker) = self.preparing_marker.take() {
+                marker.transition_to_prepared()?;
+            } else {
+                transition_staged_apply_attempt(
+                    state_path,
+                    attempt_id,
+                    &[ApplyAttemptPhase::Preparing],
+                    ApplyAttemptPhase::Prepared,
+                )?;
+            }
+            self.recorder = ApplyRecorder::new(self.attempt_state.clone());
         }
         Ok(PreparedApply { inner: self, plan })
     }
@@ -7309,8 +7424,10 @@ impl DetailApplier {
             if let (Some(state_path), Some(attempt_id)) =
                 (self.attempt_state.as_deref(), self.attempt_id.as_deref())
             {
-                record_v2_stage(state_path, attempt_id, &staging)?;
+                let mut marker = PreparingMarker::open(state_path, attempt_id)?;
+                marker.record_stage(&staging)?;
                 staging.retain_for_recovery();
+                self.preparing_marker = Some(marker);
             } else {
                 self.recorder.record_staged_file(staging.path())?;
             }
@@ -7319,11 +7436,9 @@ impl DetailApplier {
         Ok(())
     }
 
-    fn record_new_output(&self, output: &TempOutput) -> Result<()> {
-        if let (Some(state_path), Some(_)) =
-            (self.attempt_state.as_deref(), self.attempt_id.as_deref())
-        {
-            record_v2_stage_entry(state_path, output)?;
+    fn record_new_output(&mut self, output: &TempOutput) -> Result<()> {
+        if let Some(marker) = &mut self.preparing_marker {
+            marker.record_stage_entry(output)?;
         }
         Ok(())
     }
@@ -7381,12 +7496,8 @@ impl DetailApplier {
     }
 
     fn seal_outputs(&mut self) -> Result<()> {
-        self.output_batch.seal_into(
-            &mut self.prepared_outputs,
-            self.attempt_state
-                .as_deref()
-                .zip(self.attempt_id.as_deref()),
-        )?;
+        self.output_batch
+            .seal_into(&mut self.prepared_outputs, self.preparing_marker.as_mut())?;
         if let Some(monitor) = &self.staging_space_monitor {
             monitor.recheck(&self.base)?;
         }
@@ -7832,6 +7943,7 @@ impl PreparedApply {
                 &[ApplyAttemptPhase::Prepared],
                 ApplyAttemptPhase::Committing,
             )?;
+            self.inner.recorder = ApplyRecorder::new(self.inner.attempt_state.clone());
         }
         profile.committing_marker_transition_us = duration_us(started.elapsed());
 
@@ -7879,6 +7991,7 @@ impl PreparedApply {
             self.inner.attempt_state.as_deref(),
             self.inner.attempt_id.as_deref(),
         ) {
+            self.inner.recorder = ApplyRecorder::new(None);
             transition_staged_apply_attempt(
                 state_path,
                 attempt_id,
@@ -13650,6 +13763,443 @@ mod tests {
             "{}",
             rendered
         );
+    }
+
+    #[test]
+    fn preparing_marker_accepts_only_matching_preparing_v2_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+
+        let v2_state = dir.path().join("v2.snp");
+        start_staged_apply_attempt("local", &v2_state, &base, &[], "attempt-1").unwrap();
+        PreparingMarker::open(&v2_state, "attempt-1").unwrap();
+        assert!(PreparingMarker::open(&v2_state, "wrong-attempt").is_err());
+        transition_staged_apply_attempt(
+            &v2_state,
+            "attempt-1",
+            &[ApplyAttemptPhase::Preparing],
+            ApplyAttemptPhase::Prepared,
+        )
+        .unwrap();
+        assert!(PreparingMarker::open(&v2_state, "attempt-1").is_err());
+
+        let v1_state = dir.path().join("v1.snp");
+        start_apply_attempt("local", &v1_state, &base, &[], None).unwrap();
+        assert!(PreparingMarker::open(&v1_state, "attempt-1").is_err());
+    }
+
+    #[test]
+    fn preparing_marker_retains_one_identity_across_entries_and_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entries = [
+            test_file_entry("a.txt", b"a"),
+            test_file_entry("b.txt", b"bb"),
+            test_file_entry("c.txt", b"ccc"),
+        ];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base.clone(),
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 1,
+                max_bytes: 1024,
+                workers: 1,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+
+        let mut retained = None;
+        for (index, contents) in
+            IntoIterator::into_iter([b"a".as_slice(), b"bb", b"ccc"]).enumerate()
+        {
+            stream_file(&mut applier, index, contents).unwrap();
+            let marker = applier.preparing_marker.as_ref().unwrap();
+            let current = (marker.file.as_raw_fd(), marker.identity);
+            assert_eq!(*retained.get_or_insert(current), current);
+        }
+
+        let marker_contents = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        let parsed = parse_v2_apply_attempt(&marker_contents).unwrap();
+        assert_eq!(parsed.attempt_id, "attempt-1");
+        assert_eq!(parsed.phase, ApplyAttemptPhase::Preparing);
+        let staging = applier.staging.as_ref().unwrap();
+        assert_eq!(
+            parsed.stage_parent,
+            Some((base.clone(), staging.shared.stage_parent_identity))
+        );
+        let stage_metadata = staging.shared.directory.metadata().unwrap();
+        assert_eq!(
+            parsed.stage,
+            Some((
+                staging.shared.name.to_string_lossy().into_owned(),
+                DirectoryIdentity {
+                    dev: stage_metadata.dev(),
+                    ino: stage_metadata.ino(),
+                }
+            ))
+        );
+        assert_eq!(parsed.entries.len(), entries.len());
+        for output in applier.prepared_outputs.iter().flatten() {
+            assert_eq!(
+                parsed.entries[output.output.output_name.to_str().unwrap()],
+                output.output.identity.unwrap()
+            );
+        }
+
+        let prepared = applier.finish_preparation().unwrap();
+        assert!(prepared.inner.preparing_marker.is_none());
+        prepared.abort().unwrap();
+    }
+
+    #[test]
+    fn preparing_marker_path_substitution_is_rejected_after_output_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entries = [
+            test_file_entry("a.txt", b"a"),
+            test_file_entry("b.txt", b"b"),
+        ];
+        let actions = entries
+            .iter()
+            .cloned()
+            .map(|entry| Action::Local(Change::Added(entry)))
+            .collect::<Vec<_>>();
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let synced = Arc::new(AtomicUsize::new(0));
+        struct CountingSyncWorker(Arc<AtomicUsize>);
+        impl OutputSyncWorker for CountingSyncWorker {
+            fn sync(&self, _batch_index: usize, output: &TempOutput) -> io::Result<()> {
+                output.file.as_ref().unwrap().sync_all()?;
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+        }
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 2,
+            },
+            Arc::new(CountingSyncWorker(Arc::clone(&synced))),
+        );
+        stream_file(&mut applier, 0, b"a").unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 1,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 1,
+                payload: DetailPayload::FileBytes(b"b".to_vec()),
+            })
+            .unwrap();
+        let marker_path = apply_attempt_path(&state).unwrap();
+        let displaced = marker_path.with_extension("displaced");
+        fs::rename(&marker_path, &displaced).unwrap();
+        fs::write(&marker_path, b"replacement must remain unchanged\n").unwrap();
+
+        let error = applier
+            .apply_frame(DetailFrame {
+                action_index: 1,
+                payload: DetailPayload::FileEnd,
+            })
+            .unwrap_err();
+
+        assert_eq!(synced.load(AtomicOrdering::SeqCst), 2);
+        assert!(
+            format!("{error:#}").contains("no longer refers"),
+            "{:#}",
+            error
+        );
+        assert_eq!(
+            fs::read(&marker_path).unwrap(),
+            b"replacement must remain unchanged\n"
+        );
+        assert!(applier.prepared_outputs.iter().all(Option::is_none));
+        assert!(fs::read_dir(applier.staging.as_ref().unwrap().path())
+            .unwrap()
+            .next()
+            .is_none());
+        fs::remove_file(marker_path).unwrap();
+        fs::rename(displaced, apply_attempt_path(&state).unwrap()).unwrap();
+        drop(applier);
+        abort_staged_apply_attempt(&state, "attempt-1").unwrap();
+    }
+
+    #[test]
+    fn preparing_marker_rejects_same_length_content_corruption_before_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entry = test_file_entry("a.txt", b"a");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 2,
+                max_bytes: 1024,
+                workers: 1,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+        stream_file(&mut applier, 0, b"a").unwrap();
+
+        let marker_path = apply_attempt_path(&state).unwrap();
+        let original = fs::read_to_string(&marker_path).unwrap();
+        let corrupted = original.replace("phase: preparing", "phase: committed");
+        assert_eq!(original.len(), corrupted.len());
+        let before = fs::symlink_metadata(&marker_path).unwrap();
+        let mut marker_file = fs::OpenOptions::new()
+            .write(true)
+            .open(&marker_path)
+            .unwrap();
+        marker_file.write_all(corrupted.as_bytes()).unwrap();
+        marker_file.sync_all().unwrap();
+        let after = fs::symlink_metadata(&marker_path).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+
+        let error = applier.seal_outputs().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not match active preparing attempt"),
+            "{:#}",
+            error
+        );
+        assert!(applier.prepared_outputs.iter().all(Option::is_none));
+        assert!(fs::read_dir(applier.staging.as_ref().unwrap().path())
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn preparing_marker_transition_uses_retained_inventory_after_path_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let entry = test_file_entry("a.txt", b"a");
+        let actions = vec![Action::Local(Change::Added(entry))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let marker_path = apply_attempt_path(&state).unwrap();
+        let empty_inventory = fs::read_to_string(&marker_path).unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        stream_file(&mut applier, 0, b"a").unwrap();
+        applier.seal_outputs().unwrap();
+        let output_name = applier.prepared_outputs[0]
+            .as_ref()
+            .unwrap()
+            .output
+            .output_name
+            .to_string_lossy()
+            .into_owned();
+        let marker = applier.preparing_marker.take().unwrap();
+        let displaced = marker_path.with_extension("displaced");
+
+        marker
+            .transition_to_prepared_with_hook(|| {
+                fs::rename(&marker_path, &displaced)?;
+                fs::write(&marker_path, empty_inventory.as_bytes())?;
+                Ok(())
+            })
+            .unwrap();
+
+        let transitioned = fs::read_to_string(&marker_path).unwrap();
+        let parsed = parse_v2_apply_attempt(&transitioned).unwrap();
+        assert_eq!(parsed.phase, ApplyAttemptPhase::Prepared);
+        assert_eq!(parsed.attempt_id, "attempt-1");
+        assert!(parsed.stage.is_some());
+        assert!(parsed.entries.contains_key(&output_name));
+        abort_staged_apply_attempt(&state, "attempt-1").unwrap();
+        drop(applier);
+    }
+
+    #[test]
+    fn output_sync_failure_precedes_preparing_marker_identity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let actions = vec![Action::Local(Change::Added(test_file_entry("a.txt", b"a")))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 1,
+                max_bytes: 1024,
+                workers: 1,
+            },
+            Arc::new(PathFailureSyncWorker),
+        );
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBegin,
+            })
+            .unwrap();
+        applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileBytes(b"a".to_vec()),
+            })
+            .unwrap();
+        let marker_path = apply_attempt_path(&state).unwrap();
+        let displaced = marker_path.with_extension("displaced");
+        fs::rename(&marker_path, &displaced).unwrap();
+        fs::write(&marker_path, b"replacement must remain unchanged\n").unwrap();
+
+        let error = applier
+            .apply_frame(DetailFrame {
+                action_index: 0,
+                payload: DetailPayload::FileEnd,
+            })
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("sync failed for"),
+            "{:#}",
+            error
+        );
+        assert!(!format!("{error:#}").contains("no longer refers"));
+        assert_eq!(
+            fs::read(&marker_path).unwrap(),
+            b"replacement must remain unchanged\n"
+        );
+        assert!(applier.prepared_outputs.iter().all(Option::is_none));
+        fs::remove_file(marker_path).unwrap();
+        fs::rename(displaced, apply_attempt_path(&state).unwrap()).unwrap();
+        drop(applier);
+        abort_staged_apply_attempt(&state, "attempt-1").unwrap();
+    }
+
+    #[test]
+    fn staged_multi_batch_abort_cleans_exact_marker_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let actions = IntoIterator::into_iter([b"a".as_slice(), b"b", b"c"])
+            .enumerate()
+            .map(|(index, contents)| {
+                Action::Local(Change::Added(test_file_entry(
+                    &format!("{index}.txt"),
+                    contents,
+                )))
+            })
+            .collect::<Vec<_>>();
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base.clone(),
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        applier.output_batch = FilePublicationBatch::with_worker(
+            OutputBatchConfig {
+                max_files: 1,
+                max_bytes: 1024,
+                workers: 1,
+            },
+            Arc::new(NoopSyncWorker),
+        );
+        for (index, contents) in IntoIterator::into_iter([b"a".as_slice(), b"b", b"c"]).enumerate()
+        {
+            stream_file(&mut applier, index, contents).unwrap();
+        }
+        let prepared = applier.finish_preparation().unwrap();
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert_eq!(parse_v2_apply_attempt(&marker).unwrap().entries.len(), 3);
+
+        prepared.abort().unwrap();
+
+        assert!(!apply_attempt_path(&state).unwrap().exists());
+        assert!(stage_directories(&base).is_empty());
+    }
+
+    #[test]
+    fn staged_no_output_attempt_never_opens_preparing_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        start_staged_apply_attempt("local", &state, &base, &[], "attempt-1").unwrap();
+        let applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            Vec::new(),
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        assert!(applier.preparing_marker.is_none());
+
+        let prepared = applier.finish_preparation().unwrap();
+
+        assert!(prepared.inner.preparing_marker.is_none());
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert_eq!(
+            parse_v2_apply_attempt(&marker).unwrap().phase,
+            ApplyAttemptPhase::Prepared
+        );
+        prepared.abort().unwrap();
     }
 
     #[test]
