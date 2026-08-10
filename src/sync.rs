@@ -991,7 +991,7 @@ pub fn safe_join(base: &Path, path: &Path) -> Result<PathBuf> {
 
 pub fn validate_entries(description: &str, entries: &[Entry]) -> Result<()> {
     for entry in entries {
-        validate_relative_path(entry.path()).wrap_err_with(|| {
+        validate_canonical_entry_path(entry.path()).wrap_err_with(|| {
             format!(
                 "invalid {} entry path {}",
                 description,
@@ -1020,6 +1020,78 @@ pub fn validate_actions(actions: &[Action]) -> Result<()> {
                 validate_change_paths(left)?;
                 validate_change_paths(right)?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_staged_structure(actions: &[Action], all_old: &[Entry]) -> Result<()> {
+    let mut previous_path: Option<&Path> = None;
+    for action in actions {
+        let effective_change = match action {
+            Action::Local(change)
+            | Action::Remote(change)
+            | Action::ResolvedLocal((_, _), change)
+            | Action::ResolvedRemote((_, _), change) => Some(change),
+            Action::Conflict(_, _) | Action::Identical(_, _) => None,
+        };
+        if let Some(Change::Modified(old, new)) = effective_change {
+            if old.is_dir() && !new.is_dir() {
+                return Err(eyre!(
+                    "staged apply does not support replacing directory {} with a non-directory",
+                    old.path().display()
+                ));
+            }
+        }
+        let changes: Vec<&Change> = match action {
+            Action::Local(change) | Action::Remote(change) => vec![change],
+            Action::Conflict(left, right) | Action::Identical(left, right) => vec![left, right],
+            Action::ResolvedLocal((left, right), resolved)
+            | Action::ResolvedRemote((left, right), resolved) => vec![left, right, resolved],
+        };
+        let mut paths = Vec::with_capacity(changes.len());
+        for change in changes {
+            let path = match change {
+                Change::Added(entry) | Change::Removed(entry) => entry.path(),
+                Change::Modified(old, new) => {
+                    if old.path() != new.path() {
+                        return Err(eyre!(
+                            "modified change path mismatch: {} and {}",
+                            old.path().display(),
+                            new.path().display()
+                        ));
+                    }
+                    new.path()
+                }
+            };
+            paths.push(path.as_path());
+        }
+        let path = paths[0];
+        if let Some(previous) = previous_path.filter(|previous| *previous >= path) {
+            return Err(eyre!(
+                "staged actions must be in strictly increasing path order: {} then {}",
+                previous.display(),
+                path.display()
+            ));
+        }
+        previous_path = Some(path);
+        for compound_path in paths.into_iter().skip(1) {
+            if compound_path != path {
+                return Err(eyre!(
+                    "compound action path mismatch: action {} contains change {}",
+                    path.display(),
+                    compound_path.display()
+                ));
+            }
+        }
+    }
+    for entries in all_old.windows(2) {
+        if entries[0].path() >= entries[1].path() {
+            return Err(eyre!(
+                "old manifest entries must be in strictly increasing path order: {} then {}",
+                entries[0].path().display(),
+                entries[1].path().display()
+            ));
         }
     }
     Ok(())
@@ -1112,8 +1184,24 @@ fn validate_change_paths(change: &Change) -> Result<()> {
 }
 
 fn validate_entry_path(entry: &Entry) -> Result<()> {
-    validate_relative_path(entry.path())
+    validate_canonical_entry_path(entry.path())
         .wrap_err_with(|| format!("invalid action entry path {}", entry.path().display()))
+}
+
+fn validate_canonical_entry_path(path: &Path) -> Result<()> {
+    validate_relative_path(path)?;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty()
+        || bytes
+            .split(|byte| *byte == b'/')
+            .any(|component| component.is_empty() || component == b".")
+    {
+        return Err(eyre!(
+            "path {} must use nonempty canonical components without . aliases",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 pub fn get_signatures_with_config(
@@ -1259,18 +1347,26 @@ pub fn preflight_apply_with_policy(
     apply_options: ApplyOptions,
 ) -> Result<()> {
     validate_actions(actions)?;
-    preflight_source_reads(base, actions)?;
-    let removal_policy = RemovalBlockerPolicy::new(scan_policy, apply_options)?;
-    let report = removal_blocker_report(base, actions, &removal_policy)?;
+    validate_staged_structure(actions, &[])?;
+    let plan = CommitPlan::new(base, actions, scan_policy, apply_options)?;
+    preflight_commit_plan(base, &plan, apply_options)
+}
+
+fn preflight_commit_plan(
+    base: &Path,
+    plan: &CommitPlan,
+    apply_options: ApplyOptions,
+) -> Result<()> {
+    preflight_source_reads_from_plan(base, &plan.source_reads)?;
+    let report =
+        removal_blocker_report(base, &plan.removed_destination_paths, &plan.removal_policy)?;
     if let Some(blocker) = report.blockers.iter().find(|blocker| !blocker.prunable) {
         return Err(blocker.to_error(apply_options.prune_ignored));
     }
-    preflight_removed_directories(base, actions, &removal_policy)?;
+    preflight_removed_directories(base, &plan.removed_destination_paths, &plan.removal_policy)?;
 
-    let readonly_metadata_changes = readonly_directory_metadata_changes(actions);
-    let planned_directories = planned_destination_directories(actions);
-    for target in apply_metadata_targets(actions) {
-        let target_path = safe_join(base, &target)?;
+    for target in &plan.metadata_targets {
+        let target_path = safe_join(base, target)?;
         fs::symlink_metadata(&target_path).wrap_err_with(|| {
             format!(
                 "unable to preflight destination metadata for {}",
@@ -1279,13 +1375,13 @@ pub fn preflight_apply_with_policy(
         })?;
     }
 
-    for mutation in apply_parent_mutations(actions) {
-        let target = mutation.path;
+    for mutation in &plan.parent_mutations {
+        let target = &mutation.path;
         let Some(parent) = target.parent() else {
             continue;
         };
         let parent_path = if parent.as_os_str().is_empty() {
-            base.clone()
+            base.to_path_buf()
         } else {
             safe_join(base, parent)?
         };
@@ -1295,7 +1391,7 @@ pub fn preflight_apply_with_policy(
                 parent_path.display()
             )
         })? {
-            if planned_directories.contains(parent) {
+            if plan.planned_destination_directories.contains(parent) {
                 continue;
             }
             if mutation.allow_missing_parent {
@@ -1323,7 +1419,9 @@ pub fn preflight_apply_with_policy(
             continue;
         }
 
-        if !mutation.allow_writable_guard || readonly_metadata_changes.contains(parent) {
+        if !mutation.allow_writable_guard
+            || plan.readonly_directory_metadata_changes.contains(parent)
+        {
             return Err(eyre!(
                 "destination parent {} is not writable",
                 parent_path.display()
@@ -1340,8 +1438,9 @@ pub fn preflight_apply_report(
     apply_options: ApplyOptions,
 ) -> Result<ApplyPreflightReport> {
     validate_actions(actions)?;
-    let removal_policy = RemovalBlockerPolicy::new(scan_policy, apply_options)?;
-    removal_blocker_report(base, actions, &removal_policy)
+    validate_staged_structure(actions, &[])?;
+    let plan = CommitPlan::new(base, actions, scan_policy, apply_options)?;
+    removal_blocker_report(base, &plan.removed_destination_paths, &plan.removal_policy)
 }
 
 pub fn preflight_state_save(state_path: &Path) -> Result<()> {
@@ -2644,8 +2743,29 @@ fn complete_apply_phase(
             }
         }
     }
+    complete_apply_phase_planned(
+        base,
+        attempt_state,
+        already_synced,
+        &metadata_synced_directories,
+        &candidates,
+        has_local_actions,
+    )
+}
+
+fn complete_apply_phase_planned(
+    base: &Path,
+    attempt_state: Option<&Path>,
+    already_synced: &HashSet<PathBuf>,
+    metadata_synced_directories: &HashSet<PathBuf>,
+    candidates: &HashSet<PathBuf>,
+    has_local_actions: bool,
+) -> Result<()> {
     let mut directories = Vec::new();
     for path in candidates {
+        if already_synced.contains(path) || metadata_synced_directories.contains(path) {
+            continue;
+        }
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() => directories.push(path),
             Ok(_) => {}
@@ -2856,7 +2976,7 @@ fn owner_write_execute(mode: u32) -> bool {
     mode & 0o300 == 0o300
 }
 
-fn readonly_directory_metadata_changes(actions: &Vec<Action>) -> HashSet<PathBuf> {
+fn readonly_directory_metadata_changes(actions: &[Action]) -> HashSet<PathBuf> {
     actions
         .iter()
         .filter_map(|action| match action {
@@ -2874,7 +2994,7 @@ fn readonly_directory_metadata_changes(actions: &Vec<Action>) -> HashSet<PathBuf
         .collect()
 }
 
-fn planned_destination_directories(actions: &Vec<Action>) -> HashSet<PathBuf> {
+fn planned_destination_directories(actions: &[Action]) -> HashSet<PathBuf> {
     actions
         .iter()
         .filter_map(|action| match action {
@@ -2901,7 +3021,91 @@ struct ParentMutation {
     allow_missing_parent: bool,
 }
 
-fn apply_parent_mutations(actions: &Vec<Action>) -> Vec<ParentMutation> {
+struct SourceRead {
+    path: PathBuf,
+    description: &'static str,
+}
+
+struct CommitPlan {
+    removal_policy: RemovalBlockerPolicy,
+    removed_destination_paths: HashSet<PathBuf>,
+    metadata_synced_directories: HashSet<PathBuf>,
+    readonly_directory_metadata_changes: HashSet<PathBuf>,
+    planned_destination_directories: HashSet<PathBuf>,
+    metadata_targets: Vec<PathBuf>,
+    parent_mutations: Vec<ParentMutation>,
+    source_reads: Vec<SourceRead>,
+    durability_candidates: HashSet<PathBuf>,
+    has_local_actions: bool,
+}
+
+impl CommitPlan {
+    fn new(
+        base: &Path,
+        actions: &[Action],
+        scan_policy: Option<&ScanPolicy>,
+        apply_options: ApplyOptions,
+    ) -> Result<Self> {
+        let metadata_synced_directories = metadata_synced_directories(base, actions);
+        let mut durability_candidates = HashSet::new();
+        let mut has_local_actions = false;
+        for change in actions.iter().filter_map(applied_change) {
+            has_local_actions = true;
+            let mut path = base.join(change.path());
+            if path != base && !path.pop() {
+                continue;
+            }
+            while path != base {
+                if !metadata_synced_directories.contains(&path) {
+                    durability_candidates.insert(path.clone());
+                }
+                if !path.pop() {
+                    break;
+                }
+            }
+        }
+
+        let mut source_reads = Vec::new();
+        for action in actions {
+            if let Some(kind) = source_detail_kind(action) {
+                let path = match kind {
+                    SourceDetailKind::File(path) | SourceDetailKind::Diff(path) => path,
+                };
+                source_reads.push(SourceRead {
+                    path: path.clone(),
+                    description: "source detail",
+                });
+            }
+            match action {
+                Action::Local(Change::Modified(old, new))
+                | Action::ResolvedLocal((_, _), Change::Modified(old, new))
+                    if old.is_file() && new.is_file() && !old.same_contents(new) =>
+                {
+                    source_reads.push(SourceRead {
+                        path: old.path().clone(),
+                        description: "destination signature",
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            removal_policy: RemovalBlockerPolicy::new(scan_policy, apply_options)?,
+            removed_destination_paths: removed_destination_paths(actions),
+            metadata_synced_directories,
+            readonly_directory_metadata_changes: readonly_directory_metadata_changes(actions),
+            planned_destination_directories: planned_destination_directories(actions),
+            metadata_targets: apply_metadata_targets(actions),
+            parent_mutations: apply_parent_mutations(actions),
+            source_reads,
+            durability_candidates,
+            has_local_actions,
+        })
+    }
+}
+
+fn apply_parent_mutations(actions: &[Action]) -> Vec<ParentMutation> {
     let mut mutations = Vec::new();
     for action in actions {
         match action {
@@ -3148,10 +3352,9 @@ fn removal_blocker_error(
 
 fn preflight_removed_directories(
     base: &Path,
-    actions: &Vec<Action>,
+    removed_paths: &HashSet<PathBuf>,
     policy: &RemovalBlockerPolicy,
 ) -> Result<()> {
-    let removed_paths = removed_destination_paths(actions);
     for path in removed_paths.iter() {
         let dirname = safe_join(base, path)?;
         if is_directory_without_following(&dirname)? {
@@ -3174,7 +3377,7 @@ fn is_directory_without_following(path: &Path) -> Result<bool> {
     }
 }
 
-fn removed_destination_paths(actions: &Vec<Action>) -> HashSet<PathBuf> {
+fn removed_destination_paths(actions: &[Action]) -> HashSet<PathBuf> {
     actions
         .iter()
         .filter_map(|action| match action {
@@ -3193,10 +3396,9 @@ fn removed_destination_paths(actions: &Vec<Action>) -> HashSet<PathBuf> {
 
 fn removal_blocker_report(
     base: &Path,
-    actions: &Vec<Action>,
+    removed_paths: &HashSet<PathBuf>,
     policy: &RemovalBlockerPolicy,
 ) -> Result<ApplyPreflightReport> {
-    let removed_paths = removed_destination_paths(actions);
     let mut report = ApplyPreflightReport::default();
     for path in removed_paths.iter() {
         let dirname = safe_join(base, path)?;
@@ -3577,7 +3779,7 @@ fn remove_quarantined_ignored_path(path: &Path, base_dev: u64) -> Result<()> {
     Ok(())
 }
 
-fn apply_metadata_targets(actions: &Vec<Action>) -> Vec<PathBuf> {
+fn apply_metadata_targets(actions: &[Action]) -> Vec<PathBuf> {
     let mut targets = Vec::new();
     for action in actions {
         match action {
@@ -3593,25 +3795,9 @@ fn apply_metadata_targets(actions: &Vec<Action>) -> Vec<PathBuf> {
     targets
 }
 
-fn preflight_source_reads(base: &PathBuf, actions: &Vec<Action>) -> Result<()> {
-    for action in actions {
-        if let Some(kind) = source_detail_kind(action) {
-            match kind {
-                SourceDetailKind::File(path) | SourceDetailKind::Diff(path) => {
-                    preflight_read_file(base, path, "source detail")?;
-                }
-            }
-        }
-
-        match action {
-            Action::Local(Change::Modified(old, new))
-            | Action::ResolvedLocal((_, _), Change::Modified(old, new))
-                if old.is_file() && new.is_file() && !old.same_contents(new) =>
-            {
-                preflight_read_file(base, old.path(), "destination signature")?;
-            }
-            _ => {}
-        }
+fn preflight_source_reads_from_plan(base: &Path, source_reads: &[SourceRead]) -> Result<()> {
+    for source in source_reads {
+        preflight_read_file(base, &source.path, source.description)?;
     }
     Ok(())
 }
@@ -6519,9 +6705,8 @@ pub struct DetailApplier {
     recorder: ApplyRecorder,
     scan_policy: Option<ScanPolicy>,
     apply_options: ApplyOptions,
-    old_index: usize,
     action_index: usize,
-    new_entries: Vec<Entry>,
+    local_results: Vec<Option<Entry>>,
     state: Option<ApplyState>,
     output_batch: FilePublicationBatch,
     prepared_outputs: Vec<Option<PreparedOutput>>,
@@ -6533,6 +6718,7 @@ pub struct DetailApplier {
 
 pub struct PreparedApply {
     inner: DetailApplier,
+    plan: CommitPlan,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -6672,6 +6858,8 @@ impl DetailApplier {
     ) -> Self {
         let mut prepared_outputs = Vec::with_capacity(actions.len());
         prepared_outputs.resize_with(actions.len(), || None);
+        let mut local_results = Vec::with_capacity(actions.len());
+        local_results.resize_with(actions.len(), || None);
         DetailApplier {
             base,
             actions,
@@ -6681,9 +6869,8 @@ impl DetailApplier {
             attempt_id: None,
             scan_policy,
             apply_options,
-            old_index: 0,
             action_index: 0,
-            new_entries: Vec::new(),
+            local_results,
             state: None,
             staging: None,
             staging_space_monitor: None,
@@ -6864,6 +7051,14 @@ impl DetailApplier {
             monitor.recheck(&self.base)?;
         }
         validate_actions(&self.actions)?;
+        validate_entries("old manifest", &self.all_old)?;
+        validate_staged_structure(&self.actions, &self.all_old)?;
+        let plan = CommitPlan::new(
+            &self.base,
+            &self.actions,
+            self.scan_policy.as_ref(),
+            self.apply_options,
+        )?;
         if let (Some(state_path), Some(attempt_id)) =
             (self.attempt_state.as_deref(), self.attempt_id.as_deref())
         {
@@ -6874,7 +7069,7 @@ impl DetailApplier {
                 ApplyAttemptPhase::Prepared,
             )?;
         }
-        Ok(PreparedApply { inner: self })
+        Ok(PreparedApply { inner: self, plan })
     }
 
     fn advance_to_action(&mut self, target_index: usize) -> Result<()> {
@@ -6890,34 +7085,7 @@ impl DetailApplier {
         Ok(())
     }
 
-    fn prepare_action(&mut self, action_index: usize) {
-        let path = self.actions[action_index].path();
-        loop {
-            let oe = self.all_old.get(self.old_index);
-            if let Some(e) = oe {
-                match e.path().cmp(path) {
-                    Ordering::Less => {
-                        self.new_entries.push(e.clone());
-                        self.old_index += 1;
-                    }
-                    Ordering::Equal => {
-                        let e = e.clone();
-                        self.old_index += 1;
-                        if self.actions[action_index].is_unresolved_conflict() {
-                            self.new_entries.push(e);
-                        }
-                        continue;
-                    }
-                    Ordering::Greater => break,
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
     fn apply_action_without_detail(&mut self, action_index: usize) -> Result<()> {
-        self.prepare_action(action_index);
         match &self.actions[action_index] {
             Action::Local(change) | Action::ResolvedLocal((_, _), change) => match change {
                 Change::Removed(e) => {
@@ -6936,7 +7104,13 @@ impl DetailApplier {
                         std::os::unix::fs::symlink(p, &filename)?;
                         self.recorder
                             .record_committed_step("create-symlink", e.path())?;
-                        self.new_entries.push(update_meta(&filename, e)?);
+                        let result = update_meta(&filename, e)?;
+                        assign_local_result(
+                            &self.actions,
+                            &mut self.local_results,
+                            action_index,
+                            result,
+                        )?;
                         self.recorder
                             .record_committed_step("update-metadata", e.path())?;
                     } else if e.is_dir() {
@@ -6959,7 +7133,13 @@ impl DetailApplier {
                             } else {
                                 verify_current_matches_entry(&filename, e1, "metadata target")?;
                             }
-                            self.new_entries.push(update_meta(&filename, e2)?);
+                            let result = update_meta(&filename, e2)?;
+                            assign_local_result(
+                                &self.actions,
+                                &mut self.local_results,
+                                action_index,
+                                result,
+                            )?;
                             self.recorder
                                 .record_committed_step("update-metadata", e2.path())?;
                         } else {
@@ -6971,7 +7151,13 @@ impl DetailApplier {
                                 std::os::unix::fs::symlink(p, &filename)?;
                                 self.recorder
                                     .record_committed_step("create-symlink", e2.path())?;
-                                self.new_entries.push(update_meta(&filename, e2)?);
+                                let result = update_meta(&filename, e2)?;
+                                assign_local_result(
+                                    &self.actions,
+                                    &mut self.local_results,
+                                    action_index,
+                                    result,
+                                )?;
                                 self.recorder
                                     .record_committed_step("update-metadata", e2.path())?;
                             } else if e2.is_dir() {
@@ -6997,7 +7183,13 @@ impl DetailApplier {
                             std::os::unix::fs::symlink(p, &filename)?;
                             self.recorder
                                 .record_committed_step("create-symlink", e2.path())?;
-                            self.new_entries.push(update_meta(&filename, e2)?);
+                            let result = update_meta(&filename, e2)?;
+                            assign_local_result(
+                                &self.actions,
+                                &mut self.local_results,
+                                action_index,
+                                result,
+                            )?;
                             self.recorder
                                 .record_committed_step("update-metadata", e2.path())?;
                         } else if e2.is_dir() {
@@ -7016,14 +7208,7 @@ impl DetailApplier {
                     }
                 }
             },
-            Action::Remote(change) | Action::ResolvedRemote((_, _), change) => match change {
-                Change::Removed(_) => {}
-                Change::Added(e) | Change::Modified(_, e) => self.new_entries.push(e.clone()),
-            },
-            Action::Identical(change, _) => match change {
-                Change::Removed(_) => {}
-                Change::Added(e) | Change::Modified(_, e) => self.new_entries.push(e.clone()),
-            },
+            Action::Remote(_) | Action::ResolvedRemote((_, _), _) | Action::Identical(_, _) => {}
             Action::Conflict(_, _) => {}
         }
         if let Some(change) = applied_change(&self.actions[action_index]) {
@@ -7217,14 +7402,15 @@ impl DetailApplier {
             .take()
             .ok_or_else(|| eyre!("missing prepared output for action {}", action_index))?;
         ensure_parent_directory(&output.final_path)?;
-        let action = &self.actions[action_index];
+        let actions = &self.actions;
+        let action = &actions[action_index];
         let recorder = &mut self.recorder;
-        let new_entries = &mut self.new_entries;
+        let local_results = &mut self.local_results;
         #[cfg(test)]
         let post_commit_hook = self.output_batch.post_commit_hook.clone();
         let on_commit = |entry: &Entry| -> Result<()> {
             recorder.record_regular_publication(action, entry)?;
-            new_entries.push(entry.clone());
+            assign_local_result(actions, local_results, action_index, entry.clone())?;
             #[cfg(test)]
             if let Some(hook) = &post_commit_hook {
                 hook(action_index)?;
@@ -7242,11 +7428,8 @@ impl DetailApplier {
         Ok(())
     }
 
-    fn apply_directory_second_pass(&mut self) -> Result<()> {
-        let removal_policy =
-            RemovalBlockerPolicy::new(self.scan_policy.as_ref(), self.apply_options)?;
-        let removed_paths = removed_destination_paths(&self.actions);
-        for action in self.actions.iter().rev() {
+    fn apply_directory_second_pass(&mut self, plan: &CommitPlan) -> Result<()> {
+        for (action_index, action) in self.actions.iter().enumerate().rev() {
             match action {
                 Action::Local(change) | Action::ResolvedLocal((_, _), change) => {
                     if !change.is_dir() {
@@ -7259,8 +7442,8 @@ impl DetailApplier {
                             prune_ignored_removal_blockers(
                                 &self.base,
                                 &dirname,
-                                &removed_paths,
-                                &removal_policy,
+                                &plan.removed_destination_paths,
+                                &plan.removal_policy,
                                 self.attempt_state.as_deref(),
                             )?;
                             fs::remove_dir(&dirname)?;
@@ -7269,7 +7452,13 @@ impl DetailApplier {
                         }
                         Change::Added(e) => {
                             let dirname = safe_join(&self.base, e.path())?;
-                            self.new_entries.push(update_meta(&dirname, e)?);
+                            let result = update_meta(&dirname, e)?;
+                            assign_local_result(
+                                &self.actions,
+                                &mut self.local_results,
+                                action_index,
+                                result,
+                            )?;
                             self.recorder
                                 .record_committed_step("update-metadata", e.path())?;
                         }
@@ -7283,7 +7472,13 @@ impl DetailApplier {
                             if e1.is_dir() && e2.is_dir() {
                                 verify_current_matches_entry(&dirname, e1, "metadata target")?;
                             }
-                            self.new_entries.push(update_meta(&dirname, e2)?);
+                            let result = update_meta(&dirname, e2)?;
+                            assign_local_result(
+                                &self.actions,
+                                &mut self.local_results,
+                                action_index,
+                                result,
+                            )?;
                             self.recorder
                                 .record_committed_step("update-metadata", e2.path())?;
                         }
@@ -7295,6 +7490,107 @@ impl DetailApplier {
         }
         Ok(())
     }
+}
+
+fn assign_local_result(
+    actions: &[Action],
+    results: &mut [Option<Entry>],
+    action_index: usize,
+    entry: Entry,
+) -> Result<()> {
+    let action = actions
+        .get(action_index)
+        .ok_or_else(|| eyre!("local result references missing action {}", action_index))?;
+    if entry.path() != action.path() {
+        return Err(eyre!(
+            "local result path mismatch for action {}: expected {}, got {}",
+            action_index,
+            action.path().display(),
+            entry.path().display()
+        ));
+    }
+    let slot = results
+        .get_mut(action_index)
+        .ok_or_else(|| eyre!("local result slot is missing for action {}", action_index))?;
+    if slot.is_some() {
+        return Err(eyre!(
+            "duplicate local result assignment for action {} at {}",
+            action_index,
+            entry.path().display()
+        ));
+    }
+    *slot = Some(entry);
+    Ok(())
+}
+
+fn merge_staged_manifest(
+    all_old: Vec<Entry>,
+    actions: Vec<Action>,
+    mut local_results: Vec<Option<Entry>>,
+) -> Result<Vec<Entry>> {
+    if local_results.len() != actions.len() {
+        return Err(eyre!(
+            "local result slot count mismatch: expected {}, got {}",
+            actions.len(),
+            local_results.len()
+        ));
+    }
+    let mut merged = Vec::with_capacity(all_old.len().saturating_add(actions.len()));
+    let mut old = all_old.into_iter().peekable();
+    for (action_index, action) in actions.into_iter().enumerate() {
+        while old.peek().is_some_and(|entry| entry.path() < action.path()) {
+            if let Some(entry) = old.next() {
+                merged.push(entry);
+            }
+        }
+        let matched_old = if old
+            .peek()
+            .is_some_and(|entry| entry.path() == action.path())
+        {
+            old.next()
+        } else {
+            None
+        };
+        let local_result = local_results[action_index].take();
+        let expects_local_result = matches!(
+            &action,
+            Action::Local(Change::Added(_) | Change::Modified(_, _))
+                | Action::ResolvedLocal((_, _), Change::Added(_) | Change::Modified(_, _))
+        );
+        if !expects_local_result {
+            if let Some(entry) = local_result.as_ref() {
+                return Err(eyre!(
+                    "unexpected local mutation result for action {} at {}",
+                    action_index,
+                    entry.path().display()
+                ));
+            }
+        }
+
+        match action {
+            Action::Local(Change::Removed(_))
+            | Action::ResolvedLocal((_, _), Change::Removed(_)) => {}
+            Action::Local(Change::Added(_) | Change::Modified(_, _))
+            | Action::ResolvedLocal((_, _), Change::Added(_) | Change::Modified(_, _)) => {
+                merged.push(local_result.ok_or_else(|| {
+                    eyre!("missing local mutation result for action {}", action_index)
+                })?);
+            }
+            Action::Remote(change)
+            | Action::ResolvedRemote((_, _), change)
+            | Action::Identical(change, _) => match change {
+                Change::Removed(_) => {}
+                Change::Added(entry) | Change::Modified(_, entry) => merged.push(entry),
+            },
+            Action::Conflict(_, _) => {
+                if let Some(entry) = matched_old {
+                    merged.push(entry);
+                }
+            }
+        }
+    }
+    merged.extend(old);
+    Ok(merged)
 }
 
 trait PreparedOutputValidator: Sync {
@@ -7477,12 +7773,7 @@ impl PreparedApply {
     }
 
     pub fn validate_commit(&self) -> Result<()> {
-        preflight_apply_with_policy(
-            &self.inner.base,
-            &self.inner.actions,
-            self.inner.scan_policy.as_ref(),
-            self.inner.apply_options,
-        )?;
+        preflight_commit_plan(&self.inner.base, &self.plan, self.inner.apply_options)?;
         validate_prepared_outputs(
             &self.inner.prepared_outputs,
             validation_worker_limit(),
@@ -7545,12 +7836,9 @@ impl PreparedApply {
         profile.committing_marker_transition_us = duration_us(started.elapsed());
 
         let started = Instant::now();
-        self.inner.old_index = 0;
         self.inner.action_index = 0;
-        self.inner.new_entries.clear();
         for action_index in 0..self.inner.actions.len() {
             if self.inner.prepared_outputs[action_index].is_some() {
-                self.inner.prepare_action(action_index);
                 self.inner.publish_prepared_output(action_index)?;
             } else {
                 self.inner.apply_action_without_detail(action_index)?;
@@ -7560,27 +7848,29 @@ impl PreparedApply {
         profile.forward_apply_publication_us = duration_us(started.elapsed());
 
         let started = Instant::now();
-        self.inner.apply_directory_second_pass()?;
+        self.inner.apply_directory_second_pass(&self.plan)?;
         profile.reverse_directory_pass_us = duration_us(started.elapsed());
 
         let started = Instant::now();
-        for entry in self.inner.all_old.iter().skip(self.inner.old_index) {
-            self.inner.new_entries.push(entry.clone());
-        }
-        self.inner.new_entries.sort();
+        let entries = merge_staged_manifest(
+            std::mem::take(&mut self.inner.all_old),
+            std::mem::take(&mut self.inner.actions),
+            std::mem::take(&mut self.inner.local_results),
+        )?;
         profile.manifest_finalization_us = duration_us(started.elapsed());
 
         let started = Instant::now();
-        let metadata_synced = metadata_synced_directories(&self.inner.base, &self.inner.actions);
         let already_synced = match self.inner.staging.take() {
-            Some(staging) => staging.finish(&metadata_synced)?,
+            Some(staging) => staging.finish(&self.plan.metadata_synced_directories)?,
             None => HashSet::new(),
         };
-        complete_apply_phase(
+        complete_apply_phase_planned(
             &self.inner.base,
-            &self.inner.actions,
             self.inner.attempt_state.as_deref(),
             &already_synced,
+            &self.plan.metadata_synced_directories,
+            &self.plan.durability_candidates,
+            self.plan.has_local_actions,
         )?;
         profile.durability_staging_cleanup_us = duration_us(started.elapsed());
 
@@ -7597,7 +7887,7 @@ impl PreparedApply {
             )?;
         }
         profile.committed_marker_transition_us = duration_us(started.elapsed());
-        Ok((std::mem::take(&mut self.inner.new_entries), profile))
+        Ok((entries, profile))
     }
 
     #[allow(dead_code)]
@@ -9405,6 +9695,228 @@ mod tests {
         })
     }
 
+    #[test]
+    fn staged_manifest_merge_preserves_mixed_linear_semantics() {
+        let old = IntoIterator::into_iter(["a", "b", "d", "f", "h", "z"])
+            .map(|path| test_file_entry(path, path.as_bytes()))
+            .collect::<Vec<_>>();
+        let local_c = test_file_entry("c", b"local-c");
+        let remote_d = test_file_entry("d", b"remote-d");
+        let identical_e = test_file_entry("e", b"identical-e");
+        let local_h = test_file_entry("h", b"local-h");
+        let actions = vec![
+            Action::Local(Change::Removed(old[1].clone())),
+            Action::Local(Change::Added(local_c.clone())),
+            Action::Remote(Change::Modified(old[2].clone(), remote_d.clone())),
+            Action::Identical(
+                Change::Added(identical_e.clone()),
+                Change::Added(identical_e.clone()),
+            ),
+            Action::Conflict(
+                Change::Modified(old[3].clone(), test_file_entry("f", b"left")),
+                Change::Modified(old[3].clone(), test_file_entry("f", b"right")),
+            ),
+            Action::Remote(Change::Removed(test_file_entry("g", b"gone"))),
+            Action::Local(Change::Modified(old[4].clone(), local_h.clone())),
+        ];
+        validate_staged_structure(&actions, &old).unwrap();
+        let mut results = vec![None; actions.len()];
+        results[1] = Some(local_c);
+        results[6] = Some(local_h);
+
+        let merged = merge_staged_manifest(old, actions, results).unwrap();
+        let paths = merged
+            .iter()
+            .map(|entry| entry.path().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, ["a", "c", "d", "e", "f", "h", "z"]);
+        assert_eq!(merged[2].checksum(), remote_d.checksum());
+    }
+
+    #[test]
+    fn staged_manifest_merge_orders_reverse_produced_directory_results_without_sorting() {
+        let actions = IntoIterator::into_iter(["a", "b", "c"])
+            .map(|path| Action::Local(Change::Added(Entry::test_dir(PathBuf::from(path)))))
+            .collect::<Vec<_>>();
+        let mut results = vec![None; actions.len()];
+        for action_index in (0..actions.len()).rev() {
+            assign_local_result(
+                &actions,
+                &mut results,
+                action_index,
+                Entry::test_dir(actions[action_index].path().clone()),
+            )
+            .unwrap();
+        }
+
+        let merged = merge_staged_manifest(Vec::new(), actions, results).unwrap();
+        assert_eq!(
+            merged.iter().map(Entry::path).collect::<Vec<_>>(),
+            [Path::new("a"), Path::new("b"), Path::new("c")]
+        );
+    }
+
+    #[test]
+    fn staged_manifest_merge_scales_linearly_over_untouched_entries() {
+        let old = (0..50_000)
+            .map(|index| test_file_entry(&format!("entry-{index:05}"), b"x"))
+            .collect::<Vec<_>>();
+
+        let merged = merge_staged_manifest(old, Vec::new(), Vec::new()).unwrap();
+
+        assert_eq!(merged.len(), 50_000);
+        assert_eq!(merged[0].path(), Path::new("entry-00000"));
+        assert_eq!(merged[49_999].path(), Path::new("entry-49999"));
+    }
+
+    #[test]
+    fn staged_structure_rejects_order_duplicates_and_compound_path_mismatches() {
+        let malformed_actions = [
+            vec![
+                Action::Remote(Change::Removed(test_file_entry("b", b"b"))),
+                Action::Remote(Change::Removed(test_file_entry("a", b"a"))),
+            ],
+            vec![
+                Action::Remote(Change::Removed(test_file_entry("a", b"a"))),
+                Action::Local(Change::Removed(test_file_entry("a", b"a"))),
+            ],
+            vec![Action::Conflict(
+                Change::Removed(test_file_entry("a", b"a")),
+                Change::Removed(test_file_entry("b", b"b")),
+            )],
+            vec![Action::Remote(Change::Modified(
+                test_file_entry("a", b"old"),
+                test_file_entry("b", b"new"),
+            ))],
+            vec![Action::Local(Change::Removed(test_file_entry("./a", b"a")))],
+            vec![Action::Local(Change::Removed(test_file_entry(
+                "dir/./a", b"a",
+            )))],
+            vec![Action::Local(Change::Removed(test_file_entry(
+                "dir//a", b"a",
+            )))],
+            vec![Action::Local(Change::Modified(
+                Entry::test_dir(PathBuf::from("a")),
+                Entry::test_symlink(PathBuf::from("a"), PathBuf::from("target")),
+            ))],
+        ];
+        for actions in malformed_actions {
+            let error =
+                DetailApplier::new_with_attempt(PathBuf::from("unused"), actions, vec![], None)
+                    .finish_preparation()
+                    .err()
+                    .expect("malformed staged structure must fail");
+            assert!(
+                error.to_string().contains("path")
+                    || error.to_string().contains("strictly increasing")
+                    || error.to_string().contains("does not support"),
+                "{}",
+                error
+            );
+        }
+
+        let duplicate_old = vec![test_file_entry("a", b"a"), test_file_entry("a", b"a")];
+        let error = DetailApplier::new_with_attempt(
+            PathBuf::from("unused"),
+            Vec::new(),
+            duplicate_old,
+            None,
+        )
+        .finish_preparation()
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("old manifest entries"),
+            "{}",
+            error
+        );
+
+        let aliased_old = vec![test_file_entry("./a", b"a")];
+        let error =
+            DetailApplier::new_with_attempt(PathBuf::from("unused"), Vec::new(), aliased_old, None)
+                .finish_preparation()
+                .err()
+                .unwrap();
+        assert!(
+            format!("{error:#}").contains("canonical components"),
+            "{:#}",
+            error
+        );
+    }
+
+    #[test]
+    fn local_result_slots_reject_mismatch_and_duplicate_assignment() {
+        let actions = vec![Action::Local(Change::Added(test_file_entry("a", b"a")))];
+        let mut results = vec![None];
+        let mismatch =
+            assign_local_result(&actions, &mut results, 0, test_file_entry("b", b"b")).unwrap_err();
+        assert!(mismatch.to_string().contains("path mismatch"));
+        assign_local_result(&actions, &mut results, 0, test_file_entry("a", b"a")).unwrap();
+        let duplicate =
+            assign_local_result(&actions, &mut results, 0, test_file_entry("a", b"a")).unwrap_err();
+        assert!(duplicate.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn staged_commit_revalidates_target_after_explicit_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let actions = vec![Action::Local(Change::Added(test_file_entry(
+            "file", b"new",
+        )))];
+        let mut applier = DetailApplier::new_with_attempt(base.clone(), actions, Vec::new(), None);
+        stream_file(&mut applier, 0, b"new").unwrap();
+        let prepared = applier.finish_preparation().unwrap();
+        prepared.validate_commit().unwrap();
+        fs::write(base.join("file"), b"race").unwrap();
+
+        let error = prepared.commit().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("appeared after staged preparation"));
+        assert_eq!(fs::read(base.join("file")).unwrap(), b"race");
+    }
+
+    #[test]
+    fn commit_plan_retains_removal_policy_and_runtime_durability_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let actions = vec![
+            Action::Local(Change::Removed(Entry::test_dir(PathBuf::from("gone")))),
+            Action::Local(Change::Added(test_file_entry("parent/file", b"new"))),
+        ];
+        let policy = ScanPolicy::with_prune(Vec::new(), vec!["*.tmp".to_string()], Vec::new());
+        let plan = CommitPlan::new(
+            base,
+            &actions,
+            Some(&policy),
+            ApplyOptions {
+                prune_ignored: true,
+            },
+        )
+        .unwrap();
+
+        assert!(plan.removed_destination_paths.contains(Path::new("gone")));
+        let kind = plan.removal_policy.classify(Path::new("gone/blocker.tmp"));
+        assert!(plan.removal_policy.should_prune(&kind));
+        assert!(plan.durability_candidates.contains(&base.join("parent")));
+
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::set_permissions(base.join("parent"), fs::Permissions::from_mode(0o300)).unwrap();
+        let result = complete_apply_phase_planned(
+            base,
+            None,
+            &HashSet::new(),
+            &plan.metadata_synced_directories,
+            &plan.durability_candidates,
+            plan.has_local_actions,
+        );
+        fs::set_permissions(base.join("parent"), fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+    }
+
     fn prepared_test_output(
         base: &Path,
         staging: &StagingArea,
@@ -10406,7 +10918,7 @@ mod tests {
             .filter(|line| line.starts_with("committed-operation: "))
             .collect::<Vec<_>>();
         assert!(committed.is_empty());
-        assert!(applier.new_entries.is_empty());
+        assert!(applier.local_results.iter().all(Option::is_none));
         let entries = applier.finish().unwrap();
         assert_eq!(entries[0].path(), Path::new("a.txt"));
         assert_eq!(entries[1].path(), Path::new("b.txt"));
@@ -10464,7 +10976,7 @@ mod tests {
         assert!(error.to_string().contains("a.txt"), "{}", error);
         assert_eq!(fs::read(base.join("a.txt")).unwrap(), b"unchanged-a");
         assert_eq!(fs::read(base.join("b.txt")).unwrap(), b"unchanged-b");
-        assert!(applier.new_entries.is_empty());
+        assert!(applier.local_results.iter().all(Option::is_none));
         assert_eq!(fs::read(&state_path).unwrap(), b"old snapshot");
         let marker_path = apply_attempt_path(&state_path).unwrap();
         assert!(marker_path.exists());

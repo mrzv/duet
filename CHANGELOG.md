@@ -4,6 +4,7 @@
 
 ### Changed
 - Parallelized staged-output commit validation with bounded deterministic workers, reduced recovery-marker writes, skipped irrelevant directory durability discovery, and added local/remote staged commit subphase profiling.
+- Reconstructed staged checkpoint manifests with a linear move-based merge and reused immutable commit-plan data across validation, mutation, and durability planning.
 
 ## 0.9.2 - 2026-08-09
 
