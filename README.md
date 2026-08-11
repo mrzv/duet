@@ -224,7 +224,18 @@ the local marker, including the side, phase, affected paths, staged temporary
 files, and committed operations. Run `duet recover --remote <profile>` to inspect
 the remote-side marker for a named profile. After you have inspected both sides
 and reconciled any partial changes, add `--clear` to remove the marker and allow
-syncs to resume. For a V2 `preparing` or `prepared` marker, `--clear` first
-identity-checks and removes only Duet-owned private staging; commit-or-later
-markers still require manual inspection. Use `--yes` with `--clear` only for
-non-interactive cleanup after that inspection.
+syncs to resume. For a valid V2 or V3 `preparing` or `prepared` marker, `--clear`
+first identity-checks and removes only Duet-owned private staging;
+commit-or-later markers still require manual inspection. V3 markers keep the
+human-readable inventory and five fixed-size checksum-chained phase slots.
+Malformed, truncated, or checksum-invalid staged markers are not cleared and
+recovery advice never suggests removing them directly. Because V3 magic is
+deliberately V2-prefixed, an older binary blocks on it but cannot inspect or clear
+it; use a V3-aware binary after downgrading. Marker inventory is line-oriented,
+so unsupported or non-UTF-8 path names can fail closed and require manual
+recovery. Exact-marker removal uses quarantine and verification within the marker
+parent, which is assumed to be a trusted user-owned directory. Automatic abort
+and clear quarantine before phase classification or staging cleanup, preventing
+an active same-inode phase transition from being mistaken for an abandoned
+precommit attempt. Use `--yes` with `--clear` only for non-interactive cleanup
+after inspection.

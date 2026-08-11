@@ -2059,7 +2059,15 @@ mod tests {
         );
         let state = server.remote_state_for_id("peer").unwrap();
         let marker = sync::describe_apply_attempt(&state).unwrap().unwrap();
-        assert!(marker.contains("phase: prepared"), "{}", marker);
+        assert!(
+            marker.lines().any(|line| {
+                line.starts_with("phase-slot-v3: ")
+                    && line.contains(" applied ")
+                    && line.ends_with(" prepared")
+            }),
+            "{}",
+            marker
+        );
 
         server.abort_staged_apply("attempt-1".to_string()).unwrap();
         assert!(server

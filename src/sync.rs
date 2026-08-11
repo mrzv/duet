@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -23,6 +23,19 @@ pub use crate::rustsync::{Delta, Signature};
 
 #[allow(dead_code)]
 const STAGING_RESERVE_BASIS_POINTS: u64 = 10_000;
+const STAGED_MARKER_V2_MAGIC: &str = "duet-apply-attempt-v2\n";
+const STAGED_MARKER_V3_MAGIC: &str = "duet-apply-attempt-v2-journal-v3\n";
+const PHASE_SLOT_V3_PREFIX: &str = "phase-slot-v3: ";
+const PHASE_SLOT_V3_DOMAIN: &[u8] = b"duet staged marker fixed phase slot v3\0";
+const MAX_STAGED_MARKER_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STAGED_MARKER_LINE_BYTES: usize = 16 * 1024;
+const V3_PHASES: [ApplyAttemptPhase; 5] = [
+    ApplyAttemptPhase::Prepared,
+    ApplyAttemptPhase::Committing,
+    ApplyAttemptPhase::Committed,
+    ApplyAttemptPhase::StateSave,
+    ApplyAttemptPhase::Finished,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StagingReserve {
@@ -1504,7 +1517,7 @@ pub fn describe_apply_attempt(state_path: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let marker = fs::read_to_string(&marker_path).wrap_err_with(|| {
+    let marker = read_staged_marker_path(&marker_path).wrap_err_with(|| {
         format!(
             "unable to read apply recovery marker {}",
             marker_path.display()
@@ -1555,41 +1568,25 @@ pub fn start_apply_attempt(
             )
         }),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let existing = fs::read_to_string(&marker_path).wrap_err_with(|| {
+            let existing = read_staged_marker_path(&marker_path).wrap_err_with(|| {
                 format!(
                     "unable to read apply recovery marker {}",
                     marker_path.display()
                 )
             })?;
-            if existing == contents {
-                let file = fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&marker_path)
-                    .wrap_err_with(|| {
-                        format!(
-                            "unable to open existing apply recovery marker {}",
-                            marker_path.display()
-                        )
-                    })?;
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
-                file.sync_all().wrap_err_with(|| {
-                    format!(
-                        "unable to sync existing apply recovery marker {}",
-                        marker_path.display()
-                    )
-                })?;
-                sync_directory(parent).wrap_err_with(|| {
-                    format!(
-                        "unable to sync apply recovery marker directory {}",
-                        parent.display()
-                    )
-                })
-            } else {
+            if existing != contents {
                 Err(eyre!(
                     "{}",
                     apply_attempt_description(state_path, &marker_path, &existing)
                 ))
+            } else {
+                finalize_existing_apply_marker(
+                    &marker_path,
+                    parent,
+                    &contents,
+                    |file| file.sync_all().map_err(Into::into),
+                    || sync_directory(parent),
+                )
             }
         }
         Err(e) => Err(e).wrap_err_with(|| {
@@ -1680,7 +1677,14 @@ pub(crate) fn start_staged_apply_attempt(
         actions,
         Some(attempt_id),
     );
-    contents.replace_range(.."duet-apply-attempt-v1".len(), "duet-apply-attempt-v2");
+    contents.replace_range(
+        .."duet-apply-attempt-v1".len(),
+        "duet-apply-attempt-v2-journal-v3",
+    );
+    for (sequence, phase) in V3_PHASES.iter().copied().enumerate() {
+        contents.push_str(&phase_slot_v3_pending_line(sequence as u64, phase));
+    }
+    parse_staged_apply_attempt(&contents)?;
     write_new_apply_marker(state_path, &marker_path, parent, &contents)
 }
 
@@ -1703,14 +1707,20 @@ fn write_new_apply_marker(
         }) {
         Ok(()) => sync_directory(parent),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let existing = fs::read_to_string(marker_path)?;
-            if existing == contents {
-                Ok(())
-            } else {
+            let existing = read_staged_marker_path(marker_path)?;
+            if existing != contents {
                 Err(eyre!(
                     "{}",
                     apply_attempt_description(state_path, marker_path, &existing)
                 ))
+            } else {
+                finalize_existing_apply_marker(
+                    marker_path,
+                    parent,
+                    contents,
+                    |file| file.sync_all().map_err(Into::into),
+                    || sync_directory(parent),
+                )
             }
         }
         Err(error) => Err(error).wrap_err_with(|| {
@@ -1722,15 +1732,88 @@ fn write_new_apply_marker(
     }
 }
 
+fn finalize_existing_apply_marker(
+    marker_path: &Path,
+    parent: &Path,
+    expected_contents: &str,
+    sync_marker: impl FnOnce(&fs::File) -> Result<()>,
+    sync_parent: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(marker_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_STAGED_MARKER_BYTES {
+        return Err(eyre!(
+            "existing apply recovery marker is invalid or oversized"
+        ));
+    }
+    let identity = FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
+    let contents = read_staged_marker_descriptor(&mut file, metadata.len())?;
+    if contents != expected_contents {
+        return Err(eyre!(
+            "existing apply recovery marker changed while validating retry"
+        ));
+    }
+    verify_staged_marker_path_identity(marker_path, &file, identity, metadata.len())?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    sync_marker(&file)?;
+    verify_existing_apply_marker(
+        marker_path,
+        &mut file,
+        identity,
+        metadata.len(),
+        expected_contents,
+    )?;
+    sync_parent().wrap_err_with(|| {
+        format!(
+            "unable to sync existing apply marker parent {}",
+            parent.display()
+        )
+    })?;
+    verify_existing_apply_marker(
+        marker_path,
+        &mut file,
+        identity,
+        metadata.len(),
+        expected_contents,
+    )
+}
+
+fn verify_existing_apply_marker(
+    marker_path: &Path,
+    file: &mut fs::File,
+    identity: FileIdentity,
+    expected_length: u64,
+    expected_contents: &str,
+) -> Result<()> {
+    let contents = read_staged_marker_descriptor(file, expected_length)?;
+    if contents != expected_contents {
+        return Err(eyre!(
+            "existing apply recovery marker changed during retry finalization"
+        ));
+    }
+    let metadata = file.metadata()?;
+    if metadata.mode() & 0o7777 != 0o600 {
+        return Err(eyre!("existing apply recovery marker mode is not 0600"));
+    }
+    verify_staged_marker_path_identity(marker_path, file, identity, expected_length)
+}
+
 fn transition_staged_apply_attempt(
     state_path: &Path,
     attempt_id: &str,
     expected: &[ApplyAttemptPhase],
     next: ApplyAttemptPhase,
-) -> Result<()> {
+) -> Result<Option<FileIdentity>> {
     let marker_path = apply_attempt_path(state_path)?;
-    let contents = fs::read_to_string(&marker_path)?;
-    let marker = parse_v2_apply_attempt(&contents)?;
+    let contents = read_staged_marker_path(&marker_path)?;
+    let marker = parse_staged_apply_attempt(&contents)?;
     if marker.attempt_id != attempt_id {
         return Err(eyre!(
             "staged apply attempt ID mismatch: expected {}, marker contains {}",
@@ -1746,8 +1829,16 @@ fn transition_staged_apply_attempt(
             next.as_str()
         ));
     }
-    let updated = replace_marker_line(&contents, "phase: ", next.as_str())?;
-    write_apply_marker_atomic(&marker_path, &updated)
+    match marker.version {
+        StagedMarkerVersion::V2 => {
+            let updated = replace_marker_line(&contents, "phase: ", next.as_str())?;
+            write_apply_marker_atomic(&marker_path, &updated)?;
+            Ok(None)
+        }
+        StagedMarkerVersion::V3 => {
+            update_v3_phase_slot(&marker_path, attempt_id, expected, next, None).map(Some)
+        }
+    }
 }
 
 pub(crate) fn mark_staged_apply_attempt_state_save(
@@ -1785,31 +1876,85 @@ pub(crate) fn finish_staged_apply_attempt_profiled(
 ) -> Result<StagedMarkerLifecycleProfile> {
     let mut profile = StagedMarkerLifecycleProfile::default();
     let started = Instant::now();
-    transition_staged_apply_attempt(
+    let identity = transition_staged_apply_attempt(
         state_path,
         attempt_id,
         &[ApplyAttemptPhase::StateSave],
         ApplyAttemptPhase::Finished,
     )?;
     profile.state_save_to_finished_us = duration_us(started.elapsed());
-    finish_apply_attempt_profiled(state_path, &mut profile)?;
+    match identity {
+        Some(identity) => {
+            finish_apply_attempt_identity_profiled(state_path, identity, &mut profile)?
+        }
+        None => finish_apply_attempt_profiled(state_path, &mut profile)?,
+    }
     Ok(profile)
 }
 
 #[allow(dead_code)]
 pub(crate) fn abort_staged_apply_attempt(state_path: &Path, attempt_id: &str) -> Result<()> {
-    let marker_path = apply_attempt_path(state_path)?;
-    let contents = fs::read_to_string(&marker_path)?;
-    let marker = parse_v2_apply_attempt(&contents)?;
-    if marker.attempt_id != attempt_id {
-        return Err(eyre!(
-            "staged apply attempt ID mismatch: expected {}, marker contains {}",
-            attempt_id,
-            marker.attempt_id
-        ));
+    abort_staged_apply_attempt_with_hook(state_path, attempt_id, || Ok(()))
+}
+
+fn abort_staged_apply_attempt_with_hook(
+    state_path: &Path,
+    attempt_id: &str,
+    after_quarantine: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut quarantined =
+        quarantine_apply_marker_with_hook(state_path, None, |_, _| after_quarantine())?;
+    let contents = match quarantined.read_contents() {
+        Ok(contents) => contents,
+        Err(error) => return restore_after_recovery_error(quarantined, error),
+    };
+    let marker = match parse_staged_apply_attempt(&contents) {
+        Ok(marker) => marker,
+        Err(error) => return restore_after_recovery_error(quarantined, error),
+    };
+    if marker.version == StagedMarkerVersion::V3 && quarantined.mode & 0o7777 != 0o600 {
+        return restore_after_recovery_error(
+            quarantined,
+            eyre!("V3 apply recovery marker mode is not 0600"),
+        );
     }
-    cleanup_v2_precommit_stage(&contents)?;
-    finish_apply_attempt(state_path)
+    if marker.attempt_id != attempt_id {
+        return restore_after_recovery_error(
+            quarantined,
+            eyre!(
+                "staged apply attempt ID mismatch: expected {}, marker contains {}",
+                attempt_id,
+                marker.attempt_id
+            ),
+        );
+    }
+    if !matches!(
+        marker.phase,
+        ApplyAttemptPhase::Preparing | ApplyAttemptPhase::Prepared
+    ) {
+        return restore_after_recovery_error(
+            quarantined,
+            eyre!(
+                "refusing to abort staged apply attempt {} in {} phase",
+                attempt_id,
+                marker.phase.as_str()
+            ),
+        );
+    }
+    if let Err(error) = cleanup_staged_precommit_stage(&contents) {
+        return restore_after_recovery_error(quarantined, error);
+    }
+    match quarantined.read_contents() {
+        Ok(current) if current == contents => {}
+        Ok(_) => {
+            return restore_after_recovery_error(
+                quarantined,
+                eyre!("staged apply marker changed while abort cleanup was in progress"),
+            );
+        }
+        Err(error) => return restore_after_recovery_error(quarantined, error),
+    }
+    unlink_quarantined_marker(quarantined, None)
 }
 
 fn replace_marker_line(contents: &str, prefix: &str, value: &str) -> Result<String> {
@@ -1865,6 +2010,231 @@ fn write_apply_marker_atomic(marker_path: &Path, contents: &str) -> Result<()> {
     sync_directory(parent)
 }
 
+fn read_staged_marker_path(marker_path: &Path) -> Result<String> {
+    read_staged_marker_snapshot(marker_path).map(|(contents, _)| contents)
+}
+
+fn read_staged_marker_snapshot(marker_path: &Path) -> Result<(String, FileIdentity)> {
+    read_staged_marker_snapshot_with_hook(marker_path, || Ok(()))
+}
+
+fn read_staged_marker_snapshot_with_hook(
+    marker_path: &Path,
+    after_metadata: impl FnOnce() -> Result<()>,
+) -> Result<(String, FileIdentity)> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(marker_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(eyre!("apply recovery marker is not a regular file"));
+    }
+    if metadata.len() > MAX_STAGED_MARKER_BYTES {
+        return Err(eyre!("apply recovery marker exceeds the size limit"));
+    }
+    after_metadata()?;
+    let mut contents = String::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_STAGED_MARKER_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 != metadata.len() {
+        return Err(eyre!("apply recovery marker changed length while reading"));
+    }
+    let current = fs::symlink_metadata(marker_path)?;
+    if !current.is_file()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+        || current.len() != metadata.len()
+        || current.mode() != metadata.mode()
+    {
+        return Err(eyre!("apply recovery marker changed while reading"));
+    }
+    Ok((
+        contents,
+        FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        },
+    ))
+}
+
+fn update_v3_phase_slot(
+    marker_path: &Path,
+    attempt_id: &str,
+    expected: &[ApplyAttemptPhase],
+    next: ApplyAttemptPhase,
+    retained: Option<&mut fs::File>,
+) -> Result<FileIdentity> {
+    update_v3_phase_slot_with_hook(marker_path, attempt_id, expected, next, retained, || Ok(()))
+}
+
+fn update_v3_phase_slot_with_hook(
+    marker_path: &Path,
+    attempt_id: &str,
+    expected: &[ApplyAttemptPhase],
+    next: ApplyAttemptPhase,
+    retained: Option<&mut fs::File>,
+    after_sync: impl FnOnce() -> Result<()>,
+) -> Result<FileIdentity> {
+    let mut opened;
+    let file = match retained {
+        Some(file) => file,
+        None => {
+            opened = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(marker_path)?;
+            &mut opened
+        }
+    };
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() > MAX_STAGED_MARKER_BYTES {
+        return Err(eyre!("invalid or oversized V3 apply recovery marker"));
+    }
+    if before.mode() & 0o7777 != 0o600 {
+        return Err(eyre!("V3 apply recovery marker mode is not 0600"));
+    }
+    let identity = FileIdentity {
+        dev: before.dev(),
+        ino: before.ino(),
+    };
+    let expected_mode = before.mode();
+    let expected_length = before.len();
+    let contents = read_staged_marker_descriptor(file, expected_length)?;
+    let marker = parse_staged_apply_attempt(&contents)?;
+    if marker.version != StagedMarkerVersion::V3
+        || marker.attempt_id != attempt_id
+        || !expected.contains(&marker.phase)
+        || next_staged_phase(marker.phase) != Some(next)
+    {
+        return Err(eyre!(
+            "staged apply marker does not match the requested V3 phase transition"
+        ));
+    }
+    verify_staged_marker_identity(marker_path, file, identity, expected_length, expected_mode)?;
+    let slot_index = marker.applied_slots as usize;
+    let offset = *marker
+        .slot_offsets
+        .get(slot_index)
+        .ok_or_else(|| eyre!("V3 apply marker has no pending phase slot"))?;
+    let line = phase_slot_v3_applied_line(
+        marker.applied_slots,
+        marker.applied_digest,
+        attempt_id,
+        next,
+    );
+    let pending = phase_slot_v3_pending_line(marker.applied_slots, next);
+    if line.len() != pending.len() {
+        return Err(eyre!("V3 phase slot length changed"));
+    }
+    write_all_at(file, line.as_bytes(), offset).wrap_err_with(|| {
+        format!(
+            "unable to update V3 phase slot in {}",
+            marker_path.display()
+        )
+    })?;
+    file.sync_all()
+        .wrap_err_with(|| format!("unable to sync V3 phase slot in {}", marker_path.display()))?;
+    after_sync()?;
+    let updated = read_staged_marker_descriptor(file, expected_length)?;
+    let updated_marker = parse_staged_apply_attempt(&updated)?;
+    if updated_marker.version != StagedMarkerVersion::V3
+        || updated_marker.attempt_id != attempt_id
+        || updated_marker.phase != next
+        || updated_marker.applied_slots != marker.applied_slots + 1
+    {
+        return Err(eyre!("V3 apply marker transition verification failed"));
+    }
+    verify_staged_marker_identity(marker_path, file, identity, expected_length, expected_mode)?;
+    Ok(identity)
+}
+
+fn write_all_at(file: &fs::File, mut bytes: &[u8], mut offset: u64) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let written = file.write_at(bytes, offset)?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write complete V3 phase slot",
+            ));
+        }
+        bytes = &bytes[written..];
+        offset = offset
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "slot offset overflow"))?;
+    }
+    Ok(())
+}
+
+fn read_staged_marker_descriptor(file: &mut fs::File, expected_length: u64) -> Result<String> {
+    if expected_length > MAX_STAGED_MARKER_BYTES {
+        return Err(eyre!("staged apply marker exceeds the size limit"));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut contents = String::with_capacity(expected_length as usize);
+    file.take(MAX_STAGED_MARKER_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 != expected_length {
+        return Err(eyre!("staged apply marker changed length while reading"));
+    }
+    Ok(contents)
+}
+
+fn verify_staged_marker_identity(
+    marker_path: &Path,
+    file: &fs::File,
+    identity: FileIdentity,
+    expected_length: u64,
+    expected_mode: u32,
+) -> Result<()> {
+    let retained = file.metadata()?;
+    let current = fs::symlink_metadata(marker_path)?;
+    if !retained.is_file()
+        || retained.dev() != identity.dev
+        || retained.ino() != identity.ino
+        || retained.len() != expected_length
+        || retained.mode() != expected_mode
+        || !current.is_file()
+        || current.dev() != identity.dev
+        || current.ino() != identity.ino
+        || current.len() != expected_length
+        || current.mode() != expected_mode
+    {
+        return Err(eyre!(
+            "apply recovery marker {} changed identity, length, or mode",
+            marker_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_staged_marker_path_identity(
+    marker_path: &Path,
+    file: &fs::File,
+    identity: FileIdentity,
+    expected_length: u64,
+) -> Result<()> {
+    let retained = file.metadata()?;
+    let current = fs::symlink_metadata(marker_path)?;
+    if !retained.is_file()
+        || retained.dev() != identity.dev
+        || retained.ino() != identity.ino
+        || retained.len() != expected_length
+        || !current.is_file()
+        || current.dev() != identity.dev
+        || current.ino() != identity.ino
+        || current.len() != expected_length
+    {
+        return Err(eyre!(
+            "apply recovery marker {} changed identity or length",
+            marker_path.display()
+        ));
+    }
+    Ok(())
+}
+
 pub fn mark_apply_attempt_state_save(
     side: &str,
     state_path: &Path,
@@ -1873,13 +2243,14 @@ pub fn mark_apply_attempt_state_save(
     attempt_id: Option<&str>,
 ) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
-    let existing = fs::read_to_string(&marker_path).wrap_err_with(|| {
+    let existing = read_staged_marker_path(&marker_path).wrap_err_with(|| {
         format!(
             "unable to read apply recovery marker {}",
             marker_path.display()
         )
     })?;
-    if existing.starts_with("duet-apply-attempt-v2\n") {
+    if existing.starts_with(STAGED_MARKER_V2_MAGIC) || existing.starts_with(STAGED_MARKER_V3_MAGIC)
+    {
         let attempt_id =
             attempt_id.ok_or_else(|| eyre!("V2 apply marker requires an attempt ID"))?;
         return mark_staged_apply_attempt_state_save(state_path, attempt_id);
@@ -2027,31 +2398,403 @@ fn finish_apply_attempt_profiled(
     }
 }
 
-pub fn clear_apply_attempt(state_path: &Path) -> Result<()> {
-    let marker_path = apply_attempt_path(state_path)?;
-    let marker = fs::read_to_string(&marker_path).wrap_err_with(|| {
-        format!(
-            "unable to read apply recovery marker {}",
-            marker_path.display()
+#[cfg_attr(not(test), allow(dead_code))]
+fn finish_apply_attempt_identity(state_path: &Path, identity: FileIdentity) -> Result<()> {
+    finish_apply_attempt_identity_profiled(
+        state_path,
+        identity,
+        &mut StagedMarkerLifecycleProfile::default(),
+    )
+}
+
+fn finish_apply_attempt_identity_profiled(
+    state_path: &Path,
+    identity: FileIdentity,
+    profile: &mut StagedMarkerLifecycleProfile,
+) -> Result<()> {
+    finish_apply_attempt_identity_profiled_with_hook(state_path, identity, profile, |_, _| Ok(()))
+}
+
+fn finish_apply_attempt_identity_profiled_with_hook(
+    state_path: &Path,
+    identity: FileIdentity,
+    profile: &mut StagedMarkerLifecycleProfile,
+    after_quarantine: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<()> {
+    let started = Instant::now();
+    let quarantined =
+        quarantine_apply_marker_with_hook(state_path, Some(identity), after_quarantine)?;
+    if let Err(error) = quarantined.unlink() {
+        return restore_after_recovery_error(quarantined, error);
+    }
+    profile.marker_unlink_us = duration_us(started.elapsed());
+    let started = Instant::now();
+    quarantined.sync_parent()?;
+    profile.marker_parent_sync_us = duration_us(started.elapsed());
+    Ok(())
+}
+
+struct QuarantinedApplyMarker {
+    marker_path: PathBuf,
+    parent_path: PathBuf,
+    parent: fs::File,
+    source: std::ffi::CString,
+    quarantine: std::ffi::CString,
+    file: fs::File,
+    identity: FileIdentity,
+    length: u64,
+    mode: u32,
+}
+
+impl QuarantinedApplyMarker {
+    fn verify(&self) -> Result<()> {
+        let metadata = self.file.metadata()?;
+        let quarantined = fstatat_nofollow(self.parent.as_raw_fd(), &self.quarantine)?;
+        if !metadata.is_file()
+            || metadata.dev() != self.identity.dev
+            || metadata.ino() != self.identity.ino
+            || metadata.len() != self.length
+            || metadata.mode() != self.mode
+            || quarantined.st_mode & libc::S_IFMT != libc::S_IFREG
+            || quarantined.st_dev as u64 != self.identity.dev
+            || quarantined.st_ino as u64 != self.identity.ino
+            || quarantined.st_size as u64 != self.length
+            || quarantined.st_mode as u32 != self.mode
+        {
+            return Err(eyre!(
+                "quarantined apply recovery marker {} changed identity, length, or mode",
+                self.marker_path.display()
+            ));
+        }
+        match fstatat_nofollow(self.parent.as_raw_fd(), &self.source) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(eyre!(
+                "apply recovery marker path {} was replaced while quarantined",
+                self.marker_path.display()
+            )),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn read_contents(&mut self) -> Result<String> {
+        self.verify()?;
+        let contents = read_staged_marker_descriptor(&mut self.file, self.length)?;
+        self.verify()?;
+        Ok(contents)
+    }
+
+    fn restore(self) -> Result<()> {
+        self.restore_with_parent_sync(|marker| marker.sync_parent())
+    }
+
+    fn restore_with_parent_sync(self, sync_parent: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
+        self.verify_quarantine_component()?;
+        match fstatat_nofollow(self.parent.as_raw_fd(), &self.source) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(eyre!(
+                    "cannot restore apply recovery marker {} because its path was replaced",
+                    self.marker_path.display()
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        renameat_same_directory(self.parent.as_raw_fd(), &self.quarantine, &self.source)?;
+        verify_marker_at_identity(
+            self.parent.as_raw_fd(),
+            &self.source,
+            self.identity,
+            self.length,
         )
-    })?;
-    if marker.starts_with("duet-apply-attempt-v2\n") {
-        let parsed = parse_v2_apply_attempt(&marker)?;
+        .wrap_err_with(|| {
+            format!(
+                "restored apply recovery marker {} could not be verified",
+                self.marker_path.display()
+            )
+        })?;
+        sync_parent(&self).wrap_err_with(|| {
+            format!(
+                "unable to sync restored apply recovery marker parent {}",
+                self.parent_path.display()
+            )
+        })
+    }
+
+    fn restore_component(self) -> Result<()> {
+        self.restore_component_with_parent_sync(|marker| marker.sync_parent())
+    }
+
+    fn restore_component_with_parent_sync(
+        self,
+        sync_parent: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<()> {
+        match fstatat_nofollow(self.parent.as_raw_fd(), &self.source) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(eyre!(
+                    "cannot restore quarantined component for {} because the marker path exists",
+                    self.marker_path.display()
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let quarantined = fstatat_nofollow(self.parent.as_raw_fd(), &self.quarantine)?;
+        renameat_same_directory(self.parent.as_raw_fd(), &self.quarantine, &self.source)
+            .wrap_err_with(|| {
+                format!(
+                    "unable to restore quarantined component for {}",
+                    self.marker_path.display()
+                )
+            })?;
+        let restored = fstatat_nofollow(self.parent.as_raw_fd(), &self.source)?;
+        if restored.st_mode & libc::S_IFMT != (quarantined.st_mode & libc::S_IFMT)
+            || restored.st_dev != quarantined.st_dev
+            || restored.st_ino != quarantined.st_ino
+            || restored.st_size != quarantined.st_size
+        {
+            return Err(eyre!(
+                "restored quarantine component for {} changed identity or length",
+                self.marker_path.display()
+            ));
+        }
+        sync_parent(&self).wrap_err_with(|| {
+            format!(
+                "unable to sync restored quarantine parent {}",
+                self.parent_path.display()
+            )
+        })
+    }
+
+    fn verify_quarantine_component(&self) -> Result<()> {
+        let stat = fstatat_nofollow(self.parent.as_raw_fd(), &self.quarantine)?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat.st_dev as u64 != self.identity.dev
+            || stat.st_ino as u64 != self.identity.ino
+            || stat.st_size as u64 != self.length
+        {
+            return Err(eyre!(
+                "quarantined apply recovery marker {} no longer has the expected identity",
+                self.marker_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn unlink(&self) -> Result<()> {
+        self.verify()?;
+        unlinkat(self.parent.as_raw_fd(), &self.quarantine, 0).wrap_err_with(|| {
+            format!(
+                "unable to unlink quarantined apply recovery marker {}",
+                self.marker_path.display()
+            )
+        })
+    }
+
+    fn sync_parent(&self) -> Result<()> {
+        sync_retained_directory(
+            &self.parent_path,
+            &self.parent,
+            None,
+            "apply marker parent directory",
+        )
+    }
+}
+
+fn quarantine_apply_marker_with_hook(
+    state_path: &Path,
+    expected_identity: Option<FileIdentity>,
+    after_quarantine: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<QuarantinedApplyMarker> {
+    let marker_path = apply_attempt_path(state_path)?;
+    let parent_path = marker_path
+        .parent()
+        .ok_or_else(|| eyre!("apply recovery marker has no parent directory"))?
+        .to_path_buf();
+    let parent = open_directory_for_access(&parent_path)?;
+    verify_path_identity(&parent_path, &parent, "apply marker parent directory")?;
+    let source = path_component_cstring(
+        marker_path
+            .file_name()
+            .ok_or_else(|| eyre!("apply recovery marker has no file name"))?,
+        "apply recovery marker name",
+    )?;
+    let file = openat_file(
+        parent.as_raw_fd(),
+        &source,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_STAGED_MARKER_BYTES {
+        return Err(eyre!("apply recovery marker is invalid or oversized"));
+    }
+    let identity = FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
+    if expected_identity.is_some() && expected_identity != Some(identity) {
+        return Err(eyre!(
+            "refusing to quarantine a substituted apply recovery marker"
+        ));
+    }
+    verify_marker_at_identity(parent.as_raw_fd(), &source, identity, metadata.len())?;
+    let quarantine = unique_marker_quarantine_name(&parent)?;
+    let quarantine_path = parent_path.join(std::ffi::OsStr::from_bytes(quarantine.to_bytes()));
+    renameat_same_directory(parent.as_raw_fd(), &source, &quarantine)?;
+    let marker = QuarantinedApplyMarker {
+        marker_path,
+        parent_path,
+        parent,
+        source,
+        quarantine,
+        file,
+        identity,
+        length: metadata.len(),
+        mode: metadata.mode(),
+    };
+    if let Err(error) = after_quarantine(&marker.marker_path, &quarantine_path) {
+        let restore = marker.restore_component();
+        return combine_quarantine_error(error, restore);
+    }
+    if let Err(error) = marker.verify() {
+        let restore = marker.restore_component();
+        return combine_quarantine_error(error, restore);
+    }
+    Ok(marker)
+}
+
+fn verify_marker_at_identity(
+    parent: RawFd,
+    name: &std::ffi::CStr,
+    identity: FileIdentity,
+    length: u64,
+) -> Result<()> {
+    let stat = fstatat_nofollow(parent, name)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_dev as u64 != identity.dev
+        || stat.st_ino as u64 != identity.ino
+        || stat.st_size as u64 != length
+    {
+        return Err(eyre!("apply recovery marker component changed identity"));
+    }
+    Ok(())
+}
+
+fn combine_quarantine_error<T>(error: color_eyre::Report, restore: Result<()>) -> Result<T> {
+    match restore {
+        Ok(()) => Err(error),
+        Err(restore) => Err(eyre!(
+            "{}; additionally failed to restore quarantined marker: {:#}",
+            error,
+            restore
+        )),
+    }
+}
+
+fn restore_after_recovery_error(
+    marker: QuarantinedApplyMarker,
+    error: color_eyre::Report,
+) -> Result<()> {
+    combine_quarantine_error(error, marker.restore())
+}
+
+fn unlink_quarantined_marker(
+    marker: QuarantinedApplyMarker,
+    mut profile: Option<&mut StagedMarkerLifecycleProfile>,
+) -> Result<()> {
+    let started = Instant::now();
+    if let Err(error) = marker.unlink() {
+        return restore_after_recovery_error(marker, error);
+    }
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.marker_unlink_us = duration_us(started.elapsed());
+    }
+    let started = Instant::now();
+    marker.sync_parent()?;
+    if let Some(profile) = profile {
+        profile.marker_parent_sync_us = duration_us(started.elapsed());
+    }
+    Ok(())
+}
+
+fn unique_marker_quarantine_name(parent: &fs::File) -> Result<std::ffi::CString> {
+    for _ in 0..64 {
+        let name = std::ffi::CString::new(format!(".duet-q-{:016x}", temp_nonce())).unwrap();
+        match fstatat_nofollow(parent.as_raw_fd(), &name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(name),
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(eyre!(
+        "unable to choose a unique apply marker quarantine name"
+    ))
+}
+
+fn renameat_same_directory(
+    directory: RawFd,
+    source: &std::ffi::CStr,
+    destination: &std::ffi::CStr,
+) -> io::Result<()> {
+    cvt(unsafe { libc::renameat(directory, source.as_ptr(), directory, destination.as_ptr()) })
+}
+
+pub fn clear_apply_attempt(state_path: &Path) -> Result<()> {
+    clear_apply_attempt_with_hook(state_path, || Ok(()))
+}
+
+fn clear_apply_attempt_with_hook(
+    state_path: &Path,
+    after_quarantine: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut quarantined =
+        quarantine_apply_marker_with_hook(state_path, None, |_, _| after_quarantine())?;
+    let marker = match quarantined.read_contents() {
+        Ok(marker) => marker,
+        Err(error) => return restore_after_recovery_error(quarantined, error),
+    };
+    if marker.starts_with(STAGED_MARKER_V2_MAGIC) || marker.starts_with(STAGED_MARKER_V3_MAGIC) {
+        let parsed = match parse_staged_apply_attempt(&marker) {
+            Ok(parsed) => parsed,
+            Err(error) => return restore_after_recovery_error(quarantined, error),
+        };
+        if parsed.version == StagedMarkerVersion::V3 && quarantined.mode & 0o7777 != 0o600 {
+            return restore_after_recovery_error(
+                quarantined,
+                eyre!("V3 apply recovery marker mode is not 0600"),
+            );
+        }
         if matches!(
             parsed.phase,
             ApplyAttemptPhase::Preparing | ApplyAttemptPhase::Prepared
         ) {
-            cleanup_v2_precommit_stage(&marker)?;
+            if let Err(error) = cleanup_staged_precommit_stage(&marker) {
+                return restore_after_recovery_error(quarantined, error);
+            }
+            match quarantined.read_contents() {
+                Ok(current) if current == marker => {}
+                Ok(_) => {
+                    return restore_after_recovery_error(
+                        quarantined,
+                        eyre!("staged apply marker changed while clear cleanup was in progress"),
+                    );
+                }
+                Err(error) => return restore_after_recovery_error(quarantined, error),
+            }
         }
-        return finish_apply_attempt(state_path);
+        return unlink_quarantined_marker(quarantined, None);
     }
     if !marker.starts_with("duet-apply-attempt-v1\n") {
-        return Err(eyre!(
-            "refusing to remove malformed apply recovery marker {}",
-            marker_path.display()
-        ));
+        let marker_path = apply_attempt_path(state_path)?;
+        return restore_after_recovery_error(
+            quarantined,
+            eyre!(
+                "refusing to remove malformed apply recovery marker {}",
+                marker_path.display()
+            ),
+        );
     }
-    finish_apply_attempt(state_path)
+    unlink_quarantined_marker(quarantined, None)
 }
 
 fn apply_attempt_path(state_path: &Path) -> Result<PathBuf> {
@@ -2230,29 +2973,97 @@ struct ApplyAttemptMarker {
 
 #[derive(Debug)]
 struct V2ApplyAttemptMarker {
+    version: StagedMarkerVersion,
     attempt_id: String,
     phase: ApplyAttemptPhase,
     stage_parent: Option<(PathBuf, DirectoryIdentity)>,
     stage: Option<(String, DirectoryIdentity)>,
     entries: HashMap<String, FileIdentity>,
+    applied_slots: u64,
+    applied_digest: [u8; 32],
+    slot_offsets: [u64; 5],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedMarkerVersion {
+    V2,
+    V3,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_v2_apply_attempt(contents: &str) -> Result<V2ApplyAttemptMarker> {
-    if !contents.starts_with("duet-apply-attempt-v2\n") {
+    if !contents.starts_with(STAGED_MARKER_V2_MAGIC) {
         return Err(eyre!("apply recovery marker is not V2"));
     }
+    parse_staged_inventory(contents, StagedMarkerVersion::V2)
+}
+
+fn parse_staged_apply_attempt(contents: &str) -> Result<V2ApplyAttemptMarker> {
+    if contents.len() as u64 > MAX_STAGED_MARKER_BYTES {
+        return Err(eyre!("staged apply marker exceeds the size limit"));
+    }
+    if contents.starts_with(STAGED_MARKER_V3_MAGIC) {
+        parse_staged_inventory(contents, StagedMarkerVersion::V3)
+    } else if contents.starts_with(STAGED_MARKER_V2_MAGIC) {
+        parse_staged_inventory(contents, StagedMarkerVersion::V2)
+    } else {
+        Err(eyre!(
+            "apply recovery marker is not a supported staged marker"
+        ))
+    }
+}
+
+fn parse_staged_inventory(
+    contents: &str,
+    version: StagedMarkerVersion,
+) -> Result<V2ApplyAttemptMarker> {
     let mut attempt_id = None;
     let mut phase = None;
     let mut stage_parent = None;
     let mut stage = None;
     let mut entries = HashMap::new();
-    for line in contents.lines().skip(1) {
-        if let Some(value) = line.strip_prefix("attempt-id: ") {
+    let mut slots = Vec::new();
+    let mut slot_offsets = [0; 5];
+    if version == StagedMarkerVersion::V3 && !contents.ends_with('\n') {
+        return Err(eyre!("staged apply marker has an incomplete final line"));
+    }
+    let complete_length = contents.len();
+    let mut offset = contents
+        .find('\n')
+        .map(|index| index + 1)
+        .unwrap_or(contents.len());
+    for line_with_newline in contents[offset..complete_length].split_inclusive('\n') {
+        let line = line_with_newline.trim_end_matches('\n');
+        if line.len() > MAX_STAGED_MARKER_LINE_BYTES {
+            return Err(eyre!("staged apply marker line exceeds the size limit"));
+        }
+        if version == StagedMarkerVersion::V3
+            && !slots.is_empty()
+            && slots.len() < V3_PHASES.len()
+            && !line.starts_with(PHASE_SLOT_V3_PREFIX)
+        {
+            return Err(eyre!("V3 apply marker has a gap in its phase slots"));
+        }
+        if let Some(value) = line.strip_prefix(PHASE_SLOT_V3_PREFIX) {
+            if version != StagedMarkerVersion::V3 || slots.len() == V3_PHASES.len() {
+                return Err(eyre!("staged apply marker has unexpected phase slots"));
+            }
+            slot_offsets[slots.len()] = offset as u64;
+            slots.push(value);
+        } else if version == StagedMarkerVersion::V3 && line.starts_with("phase-") {
+            return Err(eyre!("unknown complete V3 phase journal line"));
+        } else if let Some(value) = line.strip_prefix("attempt-id: ") {
+            if version == StagedMarkerVersion::V3 && !slots.is_empty() {
+                return Err(eyre!("V3 attempt ID appears after its phase slots"));
+            }
             if attempt_id.is_some() {
                 return Err(eyre!("V2 apply marker has duplicate attempt IDs"));
             }
             attempt_id = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("phase: ") {
+            if version == StagedMarkerVersion::V3 && !slots.is_empty() {
+                return Err(eyre!("V3 initial phase appears after its phase slots"));
+            }
             if phase.is_some() {
                 return Err(eyre!("V2 apply marker has duplicate phases"));
             }
@@ -2261,18 +3072,27 @@ fn parse_v2_apply_attempt(contents: &str) -> Result<V2ApplyAttemptMarker> {
                 return Err(eyre!("V2 apply marker has an invalid phase"));
             }
         } else if let Some(value) = line.strip_prefix("stage-parent: ") {
+            if version == StagedMarkerVersion::V3 && slots.len() != V3_PHASES.len() {
+                return Err(eyre!("V3 staging inventory precedes its phase slots"));
+            }
             if stage_parent.is_some() {
                 return Err(eyre!("V2 apply marker has duplicate staging parents"));
             }
             let (path, identity) = parse_marker_path_identity(value)?;
             stage_parent = Some((PathBuf::from(path), identity));
         } else if let Some(value) = line.strip_prefix("stage: ") {
+            if version == StagedMarkerVersion::V3 && slots.len() != V3_PHASES.len() {
+                return Err(eyre!("V3 staging inventory precedes its phase slots"));
+            }
             if stage.is_some() {
                 return Err(eyre!("V2 apply marker has duplicate staging directories"));
             }
             let (name, identity) = parse_marker_path_identity(value)?;
             stage = Some((name.to_string(), identity));
         } else if let Some(value) = line.strip_prefix("stage-entry: ") {
+            if version == StagedMarkerVersion::V3 && slots.len() != V3_PHASES.len() {
+                return Err(eyre!("V3 staging inventory precedes its phase slots"));
+            }
             let (name, identity) = parse_marker_path_identity(value)?;
             if entries
                 .insert(
@@ -2286,15 +3106,175 @@ fn parse_v2_apply_attempt(contents: &str) -> Result<V2ApplyAttemptMarker> {
             {
                 return Err(eyre!("V2 apply marker has duplicate staged entries"));
             }
+        } else if version == StagedMarkerVersion::V3 {
+            let valid = if slots.is_empty() {
+                valid_v3_base_inventory_line(line)
+            } else {
+                slots.len() == V3_PHASES.len() && valid_v3_dynamic_line(line)
+            };
+            if !valid {
+                return Err(eyre!(
+                    "V3 apply marker contains an unknown, malformed, or misplaced line"
+                ));
+            }
+        }
+        offset += line_with_newline.len();
+    }
+    let attempt_id = attempt_id.ok_or_else(|| eyre!("V2 apply marker is missing attempt ID"))?;
+    if version == StagedMarkerVersion::V3 && attempt_id.is_empty() {
+        return Err(eyre!("V3 apply marker has an empty attempt ID"));
+    }
+    let initial_phase =
+        phase.ok_or_else(|| eyre!("V2 apply marker has an invalid or missing phase"))?;
+    if version == StagedMarkerVersion::V3 && initial_phase != ApplyAttemptPhase::Preparing {
+        return Err(eyre!("V3 apply marker initial phase is not preparing"));
+    }
+    if version == StagedMarkerVersion::V3 && slots.len() != V3_PHASES.len() {
+        return Err(eyre!(
+            "V3 apply marker does not contain exactly five phase slots"
+        ));
+    }
+    let mut latest_phase = initial_phase;
+    let mut applied_digest = [0; 32];
+    let mut applied_slots = 0;
+    let mut pending_seen = false;
+    for (index, (slot, phase)) in slots.iter().zip(V3_PHASES).enumerate() {
+        let pending = phase_slot_v3_pending_value(index as u64, phase);
+        let applied = phase_slot_v3_applied_value(index as u64, applied_digest, &attempt_id, phase);
+        if *slot == pending {
+            pending_seen = true;
+        } else if *slot == applied {
+            if pending_seen {
+                return Err(eyre!("V3 applied phase slots are not a contiguous prefix"));
+            }
+            applied_digest = phase_slot_v3_digest(index as u64, applied_digest, &attempt_id, phase);
+            applied_slots += 1;
+            latest_phase = phase;
+        } else {
+            return Err(eyre!("invalid or torn V3 phase slot"));
         }
     }
     Ok(V2ApplyAttemptMarker {
-        attempt_id: attempt_id.ok_or_else(|| eyre!("V2 apply marker is missing attempt ID"))?,
-        phase: phase.ok_or_else(|| eyre!("V2 apply marker has an invalid or missing phase"))?,
+        version,
+        attempt_id,
+        phase: latest_phase,
         stage_parent,
         stage,
         entries,
+        applied_slots,
+        applied_digest,
+        slot_offsets,
     })
+}
+
+fn valid_v3_base_inventory_line(line: &str) -> bool {
+    for prefix in [
+        "side: ",
+        "base: ",
+        "state: ",
+        "path: ",
+        "operation: ",
+        "unstaged-operation: ",
+    ] {
+        if let Some(value) = line.strip_prefix(prefix) {
+            return !value.is_empty();
+        }
+    }
+    for prefix in [
+        "path-count: ",
+        "operation-count: ",
+        "unstaged-operation-count: ",
+    ] {
+        if let Some(value) = line.strip_prefix(prefix) {
+            return !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+        }
+    }
+    matches!(
+        line,
+        "paths-truncated: true"
+            | "operations-truncated: true"
+            | "unstaged-operations-truncated: true"
+    )
+}
+
+fn valid_v3_dynamic_line(line: &str) -> bool {
+    ["staged-file: ", "committed-operation: ", "committed-step: "]
+        .iter()
+        .any(|prefix| {
+            line.strip_prefix(prefix)
+                .map(|value| !value.is_empty())
+                .unwrap_or(false)
+        })
+}
+
+fn next_staged_phase(phase: ApplyAttemptPhase) -> Option<ApplyAttemptPhase> {
+    match phase {
+        ApplyAttemptPhase::Preparing => Some(ApplyAttemptPhase::Prepared),
+        ApplyAttemptPhase::Prepared => Some(ApplyAttemptPhase::Committing),
+        ApplyAttemptPhase::Committing => Some(ApplyAttemptPhase::Committed),
+        ApplyAttemptPhase::Committed => Some(ApplyAttemptPhase::StateSave),
+        ApplyAttemptPhase::StateSave => Some(ApplyAttemptPhase::Finished),
+        ApplyAttemptPhase::Finished => None,
+    }
+}
+
+fn phase_slot_v3_digest(
+    sequence: u64,
+    previous: [u8; 32],
+    attempt_id: &str,
+    next: ApplyAttemptPhase,
+) -> [u8; 32] {
+    let mut hash = blake2_rfc::blake2b::Blake2b::new(32);
+    hash.update(PHASE_SLOT_V3_DOMAIN);
+    hash.update(&sequence.to_be_bytes());
+    hash.update(&previous);
+    hash.update(attempt_id.as_bytes());
+    hash.update(next.as_str().as_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(digest.as_bytes());
+    bytes
+}
+
+fn phase_slot_v3_pending_value(sequence: u64, phase: ApplyAttemptPhase) -> String {
+    format!(
+        "{sequence:016x} pending {} {}",
+        "0".repeat(64),
+        phase.as_str()
+    )
+}
+
+fn phase_slot_v3_pending_line(sequence: u64, phase: ApplyAttemptPhase) -> String {
+    format!(
+        "{PHASE_SLOT_V3_PREFIX}{}\n",
+        phase_slot_v3_pending_value(sequence, phase)
+    )
+}
+
+fn phase_slot_v3_applied_value(
+    sequence: u64,
+    previous: [u8; 32],
+    attempt_id: &str,
+    next: ApplyAttemptPhase,
+) -> String {
+    let digest = phase_slot_v3_digest(sequence, previous, attempt_id, next);
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{sequence:016x} applied {digest} {}", next.as_str())
+}
+
+fn phase_slot_v3_applied_line(
+    sequence: u64,
+    previous: [u8; 32],
+    attempt_id: &str,
+    next: ApplyAttemptPhase,
+) -> String {
+    format!(
+        "{PHASE_SLOT_V3_PREFIX}{}\n",
+        phase_slot_v3_applied_value(sequence, previous, attempt_id, next)
+    )
 }
 
 fn parse_marker_path_identity(value: &str) -> Result<(&str, DirectoryIdentity)> {
@@ -2316,6 +3296,7 @@ struct PreparingMarker {
     file: fs::File,
     identity: FileIdentity,
     expected_length: u64,
+    version: StagedMarkerVersion,
 }
 
 impl PreparingMarker {
@@ -2323,7 +3304,7 @@ impl PreparingMarker {
         let path = apply_attempt_path(state_path)?;
         let mut file = fs::OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .wrap_err_with(|| format!("unable to open preparing marker {}", path.display()))?;
@@ -2336,14 +3317,19 @@ impl PreparingMarker {
                 path.display()
             ));
         }
+        if metadata.len() > MAX_STAGED_MARKER_BYTES {
+            return Err(eyre!("preparing marker exceeds the size limit"));
+        }
         let identity = FileIdentity {
             dev: metadata.dev(),
             ino: metadata.ino(),
         };
         let expected_length = metadata.len();
         file.seek(SeekFrom::Start(0))?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
+        let mut contents = String::with_capacity(expected_length as usize);
+        std::io::Read::by_ref(&mut file)
+            .take(MAX_STAGED_MARKER_BYTES + 1)
+            .read_to_string(&mut contents)
             .wrap_err_with(|| format!("unable to read preparing marker {}", path.display()))?;
         if contents.len() as u64 != expected_length {
             return Err(eyre!(
@@ -2351,7 +3337,10 @@ impl PreparingMarker {
                 path.display()
             ));
         }
-        let marker = parse_v2_apply_attempt(&contents)?;
+        let marker = parse_staged_apply_attempt(&contents)?;
+        if marker.version == StagedMarkerVersion::V3 && metadata.mode() & 0o7777 != 0o600 {
+            return Err(eyre!("V3 preparing marker mode is not 0600"));
+        }
         if marker.attempt_id != attempt_id || marker.phase != ApplyAttemptPhase::Preparing {
             return Err(eyre!(
                 "staged apply marker does not match active preparing attempt"
@@ -2363,6 +3352,7 @@ impl PreparingMarker {
             file,
             identity,
             expected_length,
+            version: marker.version,
         };
         preparing.verify_identity()?;
         Ok(preparing)
@@ -2404,8 +3394,9 @@ impl PreparingMarker {
     fn read_validated_contents(&mut self) -> Result<String> {
         self.verify_identity()?;
         self.file.seek(SeekFrom::Start(0))?;
-        let mut contents = String::new();
-        self.file
+        let mut contents = String::with_capacity(self.expected_length as usize);
+        std::io::Read::by_ref(&mut self.file)
+            .take(MAX_STAGED_MARKER_BYTES + 1)
             .read_to_string(&mut contents)
             .wrap_err_with(|| format!("unable to read preparing marker {}", self.path.display()))?;
         if contents.len() as u64 != self.expected_length {
@@ -2414,7 +3405,7 @@ impl PreparingMarker {
                 self.path.display()
             ));
         }
-        let marker = parse_v2_apply_attempt(&contents)?;
+        let marker = parse_staged_apply_attempt(&contents)?;
         if marker.attempt_id != self.attempt_id || marker.phase != ApplyAttemptPhase::Preparing {
             return Err(eyre!(
                 "staged apply marker does not match active preparing attempt"
@@ -2425,7 +3416,15 @@ impl PreparingMarker {
     }
 
     fn append(&mut self, line: &str) -> Result<()> {
+        if line
+            .lines()
+            .any(|line| line.len() > MAX_STAGED_MARKER_LINE_BYTES)
+            || self.expected_length.saturating_add(line.len() as u64) > MAX_STAGED_MARKER_BYTES
+        {
+            return Err(eyre!("preparing marker append exceeds marker limits"));
+        }
         self.verify_identity()?;
+        self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(line.as_bytes()).wrap_err_with(|| {
             format!("unable to append preparing marker {}", self.path.display())
         })?;
@@ -2453,11 +3452,26 @@ impl PreparingMarker {
         before_replace: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let contents = self.read_validated_contents()?;
-        let updated =
-            replace_marker_line(&contents, "phase: ", ApplyAttemptPhase::Prepared.as_str())?;
         self.verify_identity()?;
         before_replace()?;
-        write_apply_marker_atomic(&self.path, &updated)
+        match self.version {
+            StagedMarkerVersion::V2 => {
+                let updated = replace_marker_line(
+                    &contents,
+                    "phase: ",
+                    ApplyAttemptPhase::Prepared.as_str(),
+                )?;
+                write_apply_marker_atomic(&self.path, &updated)
+            }
+            StagedMarkerVersion::V3 => update_v3_phase_slot(
+                &self.path,
+                &self.attempt_id,
+                &[ApplyAttemptPhase::Preparing],
+                ApplyAttemptPhase::Prepared,
+                Some(&mut self.file),
+            )
+            .map(|_| ()),
+        }
     }
 
     fn record_stage(&mut self, staging: &StagingArea) -> Result<()> {
@@ -2485,8 +3499,8 @@ impl PreparingMarker {
     }
 }
 
-fn cleanup_v2_precommit_stage(contents: &str) -> Result<()> {
-    let marker = parse_v2_apply_attempt(contents)?;
+fn cleanup_staged_precommit_stage(contents: &str) -> Result<()> {
+    let marker = parse_staged_apply_attempt(contents)?;
     if !matches!(
         marker.phase,
         ApplyAttemptPhase::Preparing | ApplyAttemptPhase::Prepared
@@ -2951,16 +3965,22 @@ fn apply_attempt_description(state_path: &Path, marker_path: &Path, marker: &str
 
 fn apply_attempt_recovery_advice(state_path: &Path, marker_path: &Path, marker: &str) -> String {
     let v2_marker = marker.starts_with("duet-apply-attempt-v2");
-    let staged_precommit = v2_marker
-        && parse_v2_apply_attempt(marker)
-            .map(|marker| {
-                matches!(
-                    marker.phase,
-                    ApplyAttemptPhase::Preparing | ApplyAttemptPhase::Prepared
-                )
-            })
-            .unwrap_or(false);
-    let marker = parse_apply_attempt_marker(marker);
+    let staged = v2_marker
+        .then(|| parse_staged_apply_attempt(marker).ok())
+        .flatten();
+    let staged_precommit = staged
+        .as_ref()
+        .map(|marker| {
+            matches!(
+                marker.phase,
+                ApplyAttemptPhase::Preparing | ApplyAttemptPhase::Prepared
+            )
+        })
+        .unwrap_or(false);
+    let mut marker = parse_apply_attempt_marker(marker);
+    if let Some(staged) = staged {
+        marker.phase = Some(staged.phase.as_str().to_string());
+    }
     let mut advice = if staged_precommit {
         "Recovery: this staged apply did not begin committing, so synchronized target paths were not changed. `duet recover --clear` can identity-check and remove the recorded Duet staging directory before clearing the marker."
             .to_string()
@@ -9330,6 +10350,47 @@ mod tests {
     use std::sync::Condvar;
     use std::time::{Duration, Instant};
 
+    fn staged_marker_contents(version: StagedMarkerVersion, attempt_id: &str) -> String {
+        let mut marker = apply_attempt_contents(
+            "local",
+            Path::new("/tmp/profile.snp"),
+            Path::new("/tmp/base"),
+            ApplyAttemptPhase::Preparing.as_str(),
+            &[],
+            Some(attempt_id),
+        );
+        let magic = match version {
+            StagedMarkerVersion::V2 => "duet-apply-attempt-v2",
+            StagedMarkerVersion::V3 => "duet-apply-attempt-v2-journal-v3",
+        };
+        marker.replace_range(.."duet-apply-attempt-v1".len(), magic);
+        if version == StagedMarkerVersion::V3 {
+            for (sequence, phase) in V3_PHASES.iter().copied().enumerate() {
+                marker.push_str(&phase_slot_v3_pending_line(sequence as u64, phase));
+            }
+        }
+        marker
+    }
+
+    fn write_test_staged_marker(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn append_test_transition(marker: &mut String, next: ApplyAttemptPhase) {
+        let parsed = parse_staged_apply_attempt(marker).unwrap();
+        let offset = parsed.slot_offsets[parsed.applied_slots as usize] as usize;
+        let pending = phase_slot_v3_pending_line(parsed.applied_slots, next);
+        let applied = phase_slot_v3_applied_line(
+            parsed.applied_slots,
+            parsed.applied_digest,
+            &parsed.attempt_id,
+            next,
+        );
+        assert_eq!(pending.len(), applied.len());
+        marker.replace_range(offset..offset + pending.len(), &applied);
+    }
+
     fn filesystem_info(total_bytes: u64, available_bytes: u64) -> StagingFilesystemInfo {
         StagingFilesystemInfo {
             total_bytes,
@@ -14355,6 +15416,657 @@ mod tests {
     }
 
     #[test]
+    fn v3_fixed_phase_slots_accept_only_the_hash_chained_lifecycle() {
+        let mut marker = staged_marker_contents(StagedMarkerVersion::V3, "attempt-1");
+        let fixed_length = marker.len();
+        for phase in V3_PHASES {
+            append_test_transition(&mut marker, phase);
+            assert_eq!(marker.len(), fixed_length);
+            assert_eq!(parse_staged_apply_attempt(&marker).unwrap().phase, phase);
+        }
+        assert_eq!(
+            parse_staged_apply_attempt(&marker).unwrap().applied_slots,
+            5
+        );
+
+        let mut wrong_id = marker.clone();
+        wrong_id = wrong_id.replace("attempt-id: attempt-1", "attempt-id: attempt-2");
+        assert!(parse_staged_apply_attempt(&wrong_id).is_err());
+
+        let mut bad_checksum = marker.clone();
+        let checksum = parse_staged_apply_attempt(&marker).unwrap().slot_offsets[0] as usize
+            + PHASE_SLOT_V3_PREFIX.len()
+            + 25;
+        let replacement = if bad_checksum.as_bytes()[checksum] == b'0' {
+            "1"
+        } else {
+            "0"
+        };
+        bad_checksum.replace_range(checksum..checksum + 1, replacement);
+        assert!(parse_staged_apply_attempt(&bad_checksum).is_err());
+
+        let parsed = parse_staged_apply_attempt(&marker).unwrap();
+        let first = parsed.slot_offsets[0] as usize;
+        let second = parsed.slot_offsets[1] as usize;
+        let third = parsed.slot_offsets[2] as usize;
+        let mut deleted = marker.clone();
+        deleted.replace_range(first..second, "");
+        assert!(parse_staged_apply_attempt(&deleted).is_err());
+        let mut reordered = marker.clone();
+        let first_line = marker[first..second].to_string();
+        let second_line = marker[second..third].to_string();
+        reordered.replace_range(first..third, &(second_line + &first_line));
+        assert!(parse_staged_apply_attempt(&reordered).is_err());
+
+        let mut skipped = staged_marker_contents(StagedMarkerVersion::V3, "attempt-1");
+        let parsed = parse_staged_apply_attempt(&skipped).unwrap();
+        let offset = parsed.slot_offsets[1] as usize;
+        let pending = phase_slot_v3_pending_line(1, ApplyAttemptPhase::Committing);
+        let applied =
+            phase_slot_v3_applied_line(1, [0; 32], "attempt-1", ApplyAttemptPhase::Committing);
+        skipped.replace_range(offset..offset + pending.len(), &applied);
+        assert!(parse_staged_apply_attempt(&skipped).is_err());
+    }
+
+    #[test]
+    fn v3_phase_slot_truncation_torn_writes_and_unknown_lines_fail_closed() {
+        let marker = staged_marker_contents(StagedMarkerVersion::V3, "attempt-1");
+        let parsed = parse_staged_apply_attempt(&marker).unwrap();
+        let final_slot = parsed.slot_offsets[4] as usize;
+        for length in [marker.len() - 1, final_slot + 1, final_slot] {
+            assert!(parse_staged_apply_attempt(&marker[..length]).is_err());
+        }
+        let mut torn = marker.clone();
+        let first_slot = parsed.slot_offsets[0] as usize;
+        torn.replace_range(
+            first_slot + PHASE_SLOT_V3_PREFIX.len() + 17
+                ..first_slot + PHASE_SLOT_V3_PREFIX.len() + 20,
+            "app",
+        );
+        assert!(parse_staged_apply_attempt(&torn).is_err());
+        let damaged_prefix = marker.replacen("phase-slot-v3:", "phase-sl0t-v3:", 1);
+        assert!(parse_staged_apply_attempt(&damaged_prefix).is_err());
+        assert!(
+            parse_staged_apply_attempt(&(marker.clone() + "phase-slot-v3-extra: x\n")).is_err()
+        );
+        assert!(parse_staged_apply_attempt(&(marker + "phase-transition-v3: legacy\n")).is_err());
+    }
+
+    #[test]
+    fn v2_staged_marker_lifecycle_remains_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker_path = apply_attempt_path(&state).unwrap();
+        let marker = staged_marker_contents(StagedMarkerVersion::V2, "attempt-1");
+        fs::write(&marker_path, marker).unwrap();
+        let original = fs::symlink_metadata(&marker_path).unwrap();
+
+        for (expected, next) in [
+            (ApplyAttemptPhase::Preparing, ApplyAttemptPhase::Prepared),
+            (ApplyAttemptPhase::Prepared, ApplyAttemptPhase::Committing),
+            (ApplyAttemptPhase::Committing, ApplyAttemptPhase::Committed),
+            (ApplyAttemptPhase::Committed, ApplyAttemptPhase::StateSave),
+        ] {
+            transition_staged_apply_attempt(&state, "attempt-1", &[expected], next).unwrap();
+        }
+        let replaced = fs::symlink_metadata(&marker_path).unwrap();
+        assert_ne!(
+            (original.dev(), original.ino()),
+            (replaced.dev(), replaced.ino())
+        );
+        assert_eq!(
+            parse_v2_apply_attempt(&fs::read_to_string(&marker_path).unwrap())
+                .unwrap()
+                .phase,
+            ApplyAttemptPhase::StateSave
+        );
+        finish_staged_apply_attempt(&state, "attempt-1").unwrap();
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn v2_parser_preserves_unterminated_stage_and_stage_entry_cleanup_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("base");
+        let stage_name = "stage";
+        let stage = parent.join(stage_name);
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&stage).unwrap();
+        let parent_meta = fs::metadata(&parent).unwrap();
+        let stage_meta = fs::metadata(&stage).unwrap();
+
+        let mut stage_tail = staged_marker_contents(StagedMarkerVersion::V2, "attempt-1");
+        stage_tail.push_str(&format!(
+            "stage-parent: {} {} {}\nstage: {} {} {}",
+            parent.display(),
+            parent_meta.dev(),
+            parent_meta.ino(),
+            stage_name,
+            stage_meta.dev(),
+            stage_meta.ino()
+        ));
+        assert_eq!(
+            parse_v2_apply_attempt(&stage_tail)
+                .unwrap()
+                .stage
+                .unwrap()
+                .0,
+            stage_name
+        );
+
+        let output = stage.join("output");
+        fs::write(&output, b"staged").unwrap();
+        let output_meta = fs::metadata(&output).unwrap();
+        let mut entry_tail = staged_marker_contents(StagedMarkerVersion::V2, "attempt-1");
+        entry_tail.push_str(&format!(
+            "stage-parent: {} {} {}\nstage: {} {} {}\nstage-entry: output {} {}",
+            parent.display(),
+            parent_meta.dev(),
+            parent_meta.ino(),
+            stage_name,
+            stage_meta.dev(),
+            stage_meta.ino(),
+            output_meta.dev(),
+            output_meta.ino()
+        ));
+        assert!(parse_v2_apply_attempt(&entry_tail)
+            .unwrap()
+            .entries
+            .contains_key("output"));
+        cleanup_staged_precommit_stage(&entry_tail).unwrap();
+        assert!(!stage.exists());
+    }
+
+    #[test]
+    fn v3_magic_fails_closed_in_the_exact_v2_parser_and_recovery_advice() {
+        let marker = staged_marker_contents(StagedMarkerVersion::V3, "attempt-1");
+        assert!(marker.starts_with("duet-apply-attempt-v2"));
+        assert!(parse_v2_apply_attempt(&marker).is_err());
+        let advice = apply_attempt_recovery_advice(
+            Path::new("/tmp/profile.snp"),
+            Path::new("/tmp/.profile.snp.duet-apply"),
+            &marker,
+        );
+        assert!(advice.contains("do not remove the marker directly"));
+        assert!(!advice.contains("manually with `rm"));
+    }
+
+    #[test]
+    fn identical_marker_retry_restores_mode_and_repeats_marker_and_parent_syncs() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        start_staged_apply_attempt("local", &state, &base, &[], "attempt-1").unwrap();
+        let marker_path = apply_attempt_path(&state).unwrap();
+        fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        start_staged_apply_attempt("local", &state, &base, &[], "attempt-1").unwrap();
+        assert_eq!(fs::metadata(&marker_path).unwrap().mode() & 0o7777, 0o600);
+
+        let contents = fs::read_to_string(&marker_path).unwrap();
+        let marker_syncs = Cell::new(0);
+        let parent_syncs = Cell::new(0);
+        let error = finalize_existing_apply_marker(
+            &marker_path,
+            marker_path.parent().unwrap(),
+            &contents,
+            |_| {
+                marker_syncs.set(marker_syncs.get() + 1);
+                Err(eyre!("injected marker sync failure"))
+            },
+            || {
+                parent_syncs.set(parent_syncs.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected marker sync failure"));
+        assert_eq!(marker_syncs.get(), 1);
+        assert_eq!(parent_syncs.get(), 0);
+
+        finalize_existing_apply_marker(
+            &marker_path,
+            marker_path.parent().unwrap(),
+            &contents,
+            |file| {
+                marker_syncs.set(marker_syncs.get() + 1);
+                file.sync_all().map_err(Into::into)
+            },
+            || {
+                parent_syncs.set(parent_syncs.get() + 1);
+                sync_directory(marker_path.parent().unwrap())
+            },
+        )
+        .unwrap();
+        assert_eq!(marker_syncs.get(), 2);
+        assert_eq!(parent_syncs.get(), 1);
+    }
+
+    #[test]
+    fn retry_finalization_rejects_same_inode_mutation_and_v1_path_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+
+        let v3_state = dir.path().join("v3.snp");
+        start_staged_apply_attempt("local", &v3_state, &base, &[], "attempt-1").unwrap();
+        let v3_path = apply_attempt_path(&v3_state).unwrap();
+        let v3_contents = fs::read_to_string(&v3_path).unwrap();
+        let mutation = v3_contents.find("side: local").unwrap() as u64 + "side: ".len() as u64;
+        let error = finalize_existing_apply_marker(
+            &v3_path,
+            v3_path.parent().unwrap(),
+            &v3_contents,
+            |file| {
+                write_all_at(file, b"remot", mutation)?;
+                file.sync_all().map_err(Into::into)
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed during retry finalization"));
+
+        let v1_state = dir.path().join("v1.snp");
+        start_apply_attempt("local", &v1_state, &base, &[], None).unwrap();
+        let v1_path = apply_attempt_path(&v1_state).unwrap();
+        fs::set_permissions(&v1_path, fs::Permissions::from_mode(0o666)).unwrap();
+        start_apply_attempt("local", &v1_state, &base, &[], None).unwrap();
+        assert_eq!(fs::metadata(&v1_path).unwrap().mode() & 0o7777, 0o600);
+        let v1_contents = fs::read_to_string(&v1_path).unwrap();
+        let displaced = v1_path.with_extension("displaced");
+        let replacement = b"replacement must remain unchanged\n";
+        let error = finalize_existing_apply_marker(
+            &v1_path,
+            v1_path.parent().unwrap(),
+            &v1_contents,
+            |file| {
+                fs::rename(&v1_path, &displaced)?;
+                fs::write(&v1_path, replacement)?;
+                file.sync_all().map_err(Into::into)
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("changed identity"));
+        assert_eq!(fs::read(&v1_path).unwrap(), replacement);
+        assert_eq!(fs::read_to_string(&displaced).unwrap(), v1_contents);
+    }
+
+    #[test]
+    fn active_v3_markers_require_mode_0600_without_tightening_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let v3_state = dir.path().join("v3.snp");
+        let v3_path = apply_attempt_path(&v3_state).unwrap();
+        fs::write(
+            &v3_path,
+            staged_marker_contents(StagedMarkerVersion::V3, "attempt-1"),
+        )
+        .unwrap();
+        fs::set_permissions(&v3_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(PreparingMarker::open(&v3_state, "attempt-1").is_err());
+        assert!(transition_staged_apply_attempt(
+            &v3_state,
+            "attempt-1",
+            &[ApplyAttemptPhase::Preparing],
+            ApplyAttemptPhase::Prepared,
+        )
+        .is_err());
+
+        let v2_state = dir.path().join("v2.snp");
+        let v2_path = apply_attempt_path(&v2_state).unwrap();
+        fs::write(
+            &v2_path,
+            staged_marker_contents(StagedMarkerVersion::V2, "attempt-2"),
+        )
+        .unwrap();
+        fs::set_permissions(&v2_path, fs::Permissions::from_mode(0o644)).unwrap();
+        PreparingMarker::open(&v2_state, "attempt-2").unwrap();
+        transition_staged_apply_attempt(
+            &v2_state,
+            "attempt-2",
+            &[ApplyAttemptPhase::Preparing],
+            ApplyAttemptPhase::Prepared,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v3_phase_slots_keep_fixed_file_identity_and_reject_path_substitution_after_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker_path = apply_attempt_path(&state).unwrap();
+        write_test_staged_marker(
+            &marker_path,
+            &staged_marker_contents(StagedMarkerVersion::V3, "attempt-1"),
+        );
+        let original = fs::symlink_metadata(&marker_path).unwrap();
+        transition_staged_apply_attempt(
+            &state,
+            "attempt-1",
+            &[ApplyAttemptPhase::Preparing],
+            ApplyAttemptPhase::Prepared,
+        )
+        .unwrap();
+        assert!(transition_staged_apply_attempt(
+            &state,
+            "attempt-1",
+            &[ApplyAttemptPhase::Preparing],
+            ApplyAttemptPhase::Prepared,
+        )
+        .is_err());
+        assert!(transition_staged_apply_attempt(
+            &state,
+            "attempt-1",
+            &[ApplyAttemptPhase::Prepared],
+            ApplyAttemptPhase::Committed,
+        )
+        .is_err());
+        assert!(transition_staged_apply_attempt(
+            &state,
+            "attempt-1",
+            &[ApplyAttemptPhase::Prepared],
+            ApplyAttemptPhase::Preparing,
+        )
+        .is_err());
+        let appended = fs::symlink_metadata(&marker_path).unwrap();
+        assert_eq!(
+            (original.dev(), original.ino()),
+            (appended.dev(), appended.ino())
+        );
+        assert_eq!(original.len(), appended.len());
+
+        let displaced = marker_path.with_extension("displaced");
+        let error = update_v3_phase_slot_with_hook(
+            &marker_path,
+            "attempt-1",
+            &[ApplyAttemptPhase::Prepared],
+            ApplyAttemptPhase::Committing,
+            None,
+            || {
+                fs::rename(&marker_path, &displaced)?;
+                fs::write(&marker_path, b"replacement must remain unchanged\n")?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("changed identity"));
+        assert_eq!(
+            fs::read(&marker_path).unwrap(),
+            b"replacement must remain unchanged\n"
+        );
+        assert_eq!(
+            parse_staged_apply_attempt(&fs::read_to_string(&displaced).unwrap())
+                .unwrap()
+                .phase,
+            ApplyAttemptPhase::Committing
+        );
+    }
+
+    #[test]
+    fn v3_all_phase_slot_updates_preserve_marker_length_and_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker_path = apply_attempt_path(&state).unwrap();
+        write_test_staged_marker(
+            &marker_path,
+            &staged_marker_contents(StagedMarkerVersion::V3, "attempt-1"),
+        );
+        let original = fs::metadata(&marker_path).unwrap();
+        let mut expected = ApplyAttemptPhase::Preparing;
+        for next in V3_PHASES {
+            transition_staged_apply_attempt(&state, "attempt-1", &[expected], next).unwrap();
+            let current = fs::metadata(&marker_path).unwrap();
+            assert_eq!(current.len(), original.len());
+            assert_eq!(
+                (current.dev(), current.ino()),
+                (original.dev(), original.ino())
+            );
+            assert_eq!(
+                parse_staged_apply_attempt(&fs::read_to_string(&marker_path).unwrap())
+                    .unwrap()
+                    .phase,
+                next
+            );
+            expected = next;
+        }
+    }
+
+    #[test]
+    fn malformed_v3_marker_refuses_clear_and_identity_checked_finish_refuses_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker_path = apply_attempt_path(&state).unwrap();
+        let mut marker = staged_marker_contents(StagedMarkerVersion::V3, "attempt-1");
+        append_test_transition(&mut marker, ApplyAttemptPhase::Prepared);
+        marker.push_str("phase-transition-v3: invalid\n");
+        fs::write(&marker_path, marker).unwrap();
+        assert!(clear_apply_attempt(&state).is_err());
+        assert!(marker_path.exists());
+
+        fs::write(
+            &marker_path,
+            staged_marker_contents(StagedMarkerVersion::V3, "attempt-2"),
+        )
+        .unwrap();
+        let (_, identity) = read_staged_marker_snapshot(&marker_path).unwrap();
+        fs::remove_file(&marker_path).unwrap();
+        fs::write(&marker_path, b"replacement must remain unchanged\n").unwrap();
+        assert!(finish_apply_attempt_identity(&state, identity).is_err());
+        assert_eq!(
+            fs::read(&marker_path).unwrap(),
+            b"replacement must remain unchanged\n"
+        );
+    }
+
+    #[test]
+    fn committing_v3_marker_fails_closed_when_pending_suffix_is_deleted_or_corrupted() {
+        let mut marker = staged_marker_contents(StagedMarkerVersion::V3, "attempt-1");
+        append_test_transition(&mut marker, ApplyAttemptPhase::Prepared);
+        append_test_transition(&mut marker, ApplyAttemptPhase::Committing);
+        assert_eq!(
+            parse_staged_apply_attempt(&marker).unwrap().phase,
+            ApplyAttemptPhase::Committing
+        );
+        let parsed = parse_staged_apply_attempt(&marker).unwrap();
+        let suffix = parsed.slot_offsets[4] as usize;
+        assert!(parse_staged_apply_attempt(&marker[..suffix]).is_err());
+        let mut corrupted = marker;
+        let offset = parsed.slot_offsets[3] as usize + PHASE_SLOT_V3_PREFIX.len() + 25;
+        corrupted.replace_range(offset..offset + 1, "1");
+        assert!(parse_staged_apply_attempt(&corrupted).is_err());
+    }
+
+    #[test]
+    fn exact_marker_quarantine_removal_restores_substitution_and_removes_only_exact_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker_path = apply_attempt_path(&state).unwrap();
+        fs::write(
+            &marker_path,
+            staged_marker_contents(StagedMarkerVersion::V3, "attempt-1"),
+        )
+        .unwrap();
+        let (_, identity) = read_staged_marker_snapshot(&marker_path).unwrap();
+        let displaced = dir.path().join("expected-marker");
+        let mut profile = StagedMarkerLifecycleProfile::default();
+        let error = finish_apply_attempt_identity_profiled_with_hook(
+            &state,
+            identity,
+            &mut profile,
+            |_, quarantine| {
+                fs::rename(quarantine, &displaced)?;
+                fs::write(quarantine, b"substituted marker\n")?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("changed identity"));
+        assert_eq!(fs::read(&marker_path).unwrap(), b"substituted marker\n");
+        assert_eq!(
+            (
+                fs::metadata(&displaced).unwrap().dev(),
+                fs::metadata(&displaced).unwrap().ino()
+            ),
+            (identity.dev, identity.ino)
+        );
+
+        fs::remove_file(&marker_path).unwrap();
+        fs::rename(&displaced, &marker_path).unwrap();
+        finish_apply_attempt_identity(&state, identity).unwrap();
+        assert!(!marker_path.exists());
+        assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".duet-q-")
+        }));
+    }
+
+    #[test]
+    fn quarantine_restore_reports_parent_sync_failure_after_canonical_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker_path = apply_attempt_path(&state).unwrap();
+        write_test_staged_marker(
+            &marker_path,
+            &staged_marker_contents(StagedMarkerVersion::V3, "attempt-1"),
+        );
+        let expected = fs::metadata(&marker_path).unwrap();
+        let quarantined = quarantine_apply_marker_with_hook(&state, None, |_, _| Ok(())).unwrap();
+        let error = quarantined
+            .restore_with_parent_sync(|_| Err(eyre!("injected parent sync failure")))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected parent sync failure"));
+        let restored = fs::metadata(&marker_path).unwrap();
+        assert_eq!(
+            (restored.dev(), restored.ino(), restored.len()),
+            (expected.dev(), expected.ino(), expected.len())
+        );
+    }
+
+    #[test]
+    fn quarantined_prepared_marker_blocks_retained_committing_transition_before_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker_path = apply_attempt_path(&state).unwrap();
+        let mut contents = staged_marker_contents(StagedMarkerVersion::V3, "attempt-1");
+        append_test_transition(&mut contents, ApplyAttemptPhase::Prepared);
+        write_test_staged_marker(&marker_path, &contents);
+        let mut retained = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&marker_path)
+            .unwrap();
+        let mut transition_error = None;
+
+        abort_staged_apply_attempt_with_hook(&state, "attempt-1", || {
+            transition_error = Some(
+                update_v3_phase_slot(
+                    &marker_path,
+                    "attempt-1",
+                    &[ApplyAttemptPhase::Prepared],
+                    ApplyAttemptPhase::Committing,
+                    Some(&mut retained),
+                )
+                .unwrap_err(),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(format!("{:#}", transition_error.unwrap()).contains("No such file"));
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn abort_restores_commit_authoritative_marker_and_clear_preserves_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker_path = apply_attempt_path(&state).unwrap();
+        let mut committing = staged_marker_contents(StagedMarkerVersion::V3, "attempt-1");
+        append_test_transition(&mut committing, ApplyAttemptPhase::Prepared);
+        append_test_transition(&mut committing, ApplyAttemptPhase::Committing);
+        write_test_staged_marker(&marker_path, &committing);
+
+        assert!(abort_staged_apply_attempt(&state, "attempt-1").is_err());
+        assert_eq!(
+            parse_staged_apply_attempt(&fs::read_to_string(&marker_path).unwrap())
+                .unwrap()
+                .phase,
+            ApplyAttemptPhase::Committing
+        );
+
+        let replacement = b"replacement must remain unchanged\n";
+        let error = clear_apply_attempt_with_hook(&state, || {
+            fs::write(&marker_path, replacement)?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("failed to restore quarantined marker"));
+        assert_eq!(fs::read(&marker_path).unwrap(), replacement);
+        assert!(fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".duet-q-")
+        }));
+    }
+
+    #[test]
+    fn bounded_marker_snapshot_rejects_concurrent_growth_past_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("marker");
+        fs::write(
+            &marker_path,
+            staged_marker_contents(StagedMarkerVersion::V3, "attempt-1"),
+        )
+        .unwrap();
+        let error = read_staged_marker_snapshot_with_hook(&marker_path, || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&marker_path)?
+                .set_len(MAX_STAGED_MARKER_BYTES + 2)?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed length"));
+    }
+
+    #[test]
+    fn retained_v2_preparing_transition_replaces_using_its_validated_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("profile.snp");
+        let marker_path = apply_attempt_path(&state).unwrap();
+        fs::write(
+            &marker_path,
+            staged_marker_contents(StagedMarkerVersion::V2, "attempt-1"),
+        )
+        .unwrap();
+        let mut retained = PreparingMarker::open(&state, "attempt-1").unwrap();
+        retained.append("stage-entry: output 1 2\n").unwrap();
+        let replacement = staged_marker_contents(StagedMarkerVersion::V2, "attempt-1");
+        let displaced = marker_path.with_extension("displaced");
+        retained
+            .transition_to_prepared_with_hook(|| {
+                fs::rename(&marker_path, &displaced)?;
+                fs::write(&marker_path, replacement)?;
+                Ok(())
+            })
+            .unwrap();
+        let parsed = parse_v2_apply_attempt(&fs::read_to_string(&marker_path).unwrap()).unwrap();
+        assert_eq!(parsed.phase, ApplyAttemptPhase::Prepared);
+        assert!(parsed.entries.contains_key("output"));
+    }
+
+    #[test]
     fn staged_marker_rejects_line_breaking_action_paths() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("profile.snp");
@@ -14398,23 +16110,42 @@ mod tests {
     }
 
     #[test]
-    fn preparing_marker_accepts_only_matching_preparing_v2_marker() {
+    fn preparing_marker_supports_v2_and_v3_and_requires_matching_preparing_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         fs::create_dir(&base).unwrap();
 
-        let v2_state = dir.path().join("v2.snp");
-        start_staged_apply_attempt("local", &v2_state, &base, &[], "attempt-1").unwrap();
-        PreparingMarker::open(&v2_state, "attempt-1").unwrap();
-        assert!(PreparingMarker::open(&v2_state, "wrong-attempt").is_err());
+        let v3_state = dir.path().join("v3.snp");
+        start_staged_apply_attempt("local", &v3_state, &base, &[], "attempt-1").unwrap();
+        PreparingMarker::open(&v3_state, "attempt-1").unwrap();
+        assert!(PreparingMarker::open(&v3_state, "wrong-attempt").is_err());
         transition_staged_apply_attempt(
-            &v2_state,
+            &v3_state,
             "attempt-1",
             &[ApplyAttemptPhase::Preparing],
             ApplyAttemptPhase::Prepared,
         )
         .unwrap();
-        assert!(PreparingMarker::open(&v2_state, "attempt-1").is_err());
+        assert!(PreparingMarker::open(&v3_state, "attempt-1").is_err());
+
+        let v2_state = dir.path().join("v2.snp");
+        fs::write(
+            apply_attempt_path(&v2_state).unwrap(),
+            staged_marker_contents(StagedMarkerVersion::V2, "attempt-2"),
+        )
+        .unwrap();
+        PreparingMarker::open(&v2_state, "attempt-2")
+            .unwrap()
+            .transition_to_prepared()
+            .unwrap();
+        assert_eq!(
+            parse_v2_apply_attempt(
+                &fs::read_to_string(apply_attempt_path(&v2_state).unwrap()).unwrap()
+            )
+            .unwrap()
+            .phase,
+            ApplyAttemptPhase::Prepared
+        );
 
         let v1_state = dir.path().join("v1.snp");
         start_apply_attempt("local", &v1_state, &base, &[], None).unwrap();
@@ -14467,7 +16198,7 @@ mod tests {
         }
 
         let marker_contents = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
-        let parsed = parse_v2_apply_attempt(&marker_contents).unwrap();
+        let parsed = parse_staged_apply_attempt(&marker_contents).unwrap();
         assert_eq!(parsed.attempt_id, "attempt-1");
         assert_eq!(parsed.phase, ApplyAttemptPhase::Preparing);
         let staging = applier.staging.as_ref().unwrap();
@@ -14631,7 +16362,7 @@ mod tests {
 
         let error = applier.seal_outputs().unwrap_err();
         assert!(
-            format!("{error:#}").contains("does not match active preparing attempt"),
+            format!("{error:#}").contains("initial phase is not preparing"),
             "{:#}",
             error
         );
@@ -14643,7 +16374,7 @@ mod tests {
     }
 
     #[test]
-    fn preparing_marker_transition_uses_retained_inventory_after_path_substitution() {
+    fn preparing_marker_v3_transition_rejects_path_substitution() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let state = dir.path().join("profile.snp");
@@ -14674,18 +16405,20 @@ mod tests {
         let marker = applier.preparing_marker.take().unwrap();
         let displaced = marker_path.with_extension("displaced");
 
-        marker
+        let error = marker
             .transition_to_prepared_with_hook(|| {
                 fs::rename(&marker_path, &displaced)?;
                 fs::write(&marker_path, empty_inventory.as_bytes())?;
                 Ok(())
             })
-            .unwrap();
+            .unwrap_err();
 
-        let transitioned = fs::read_to_string(&marker_path).unwrap();
-        let parsed = parse_v2_apply_attempt(&transitioned).unwrap();
-        assert_eq!(parsed.phase, ApplyAttemptPhase::Prepared);
-        assert_eq!(parsed.attempt_id, "attempt-1");
+        assert!(format!("{error:#}").contains("changed identity"));
+        assert_eq!(fs::read_to_string(&marker_path).unwrap(), empty_inventory);
+        fs::remove_file(&marker_path).unwrap();
+        fs::rename(&displaced, &marker_path).unwrap();
+        let retained = fs::read_to_string(&marker_path).unwrap();
+        let parsed = parse_staged_apply_attempt(&retained).unwrap();
         assert!(parsed.stage.is_some());
         assert!(parsed.entries.contains_key(&output_name));
         abort_staged_apply_attempt(&state, "attempt-1").unwrap();
@@ -14797,7 +16530,10 @@ mod tests {
         }
         let prepared = applier.finish_preparation().unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
-        assert_eq!(parse_v2_apply_attempt(&marker).unwrap().entries.len(), 3);
+        assert_eq!(
+            parse_staged_apply_attempt(&marker).unwrap().entries.len(),
+            3
+        );
 
         prepared.abort().unwrap();
 
@@ -14828,7 +16564,7 @@ mod tests {
         assert!(prepared.inner.preparing_marker.is_none());
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert_eq!(
-            parse_v2_apply_attempt(&marker).unwrap().phase,
+            parse_staged_apply_attempt(&marker).unwrap().phase,
             ApplyAttemptPhase::Prepared
         );
         prepared.abort().unwrap();
@@ -14870,7 +16606,10 @@ mod tests {
         assert!(!base.join("c-link").exists());
         assert_eq!(fs::read(base.join("z-remove.txt")).unwrap(), b"old");
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
-        assert!(marker.contains("phase: prepared"), "{}", marker);
+        assert_eq!(
+            parse_staged_apply_attempt(&marker).unwrap().phase,
+            ApplyAttemptPhase::Prepared
+        );
         assert!(prepare_profile.preparing_to_prepared_us > 0);
 
         let (entries, profile) = prepared.commit_profiled().unwrap();
@@ -14884,11 +16623,17 @@ mod tests {
         assert!(!base.join("z-remove.txt").exists());
         assert_eq!(entries.len(), 3);
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
-        assert!(marker.contains("phase: committed"), "{}", marker);
+        assert_eq!(
+            parse_staged_apply_attempt(&marker).unwrap().phase,
+            ApplyAttemptPhase::Committed
+        );
         let state_save_profile =
             mark_staged_apply_attempt_state_save_profiled(&state, "attempt-1").unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
-        assert!(marker.contains("phase: state-save"), "{}", marker);
+        assert_eq!(
+            parse_staged_apply_attempt(&marker).unwrap().phase,
+            ApplyAttemptPhase::StateSave
+        );
         assert!(state_save_profile.committed_to_state_save_us > 0);
         let finish_profile = finish_staged_apply_attempt_profiled(&state, "attempt-1").unwrap();
         assert!(finish_profile.state_save_to_finished_us > 0);
@@ -15198,7 +16943,7 @@ mod tests {
             })
             .unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
-        let parsed = parse_v2_apply_attempt(&marker).unwrap();
+        let parsed = parse_staged_apply_attempt(&marker).unwrap();
         let (stage_parent, _) = parsed.stage_parent.unwrap();
         let (stage_name, _) = parsed.stage.unwrap();
 

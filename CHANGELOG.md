@@ -9,6 +9,7 @@
 - Cached immutable staged-output identities and reused validated destination-parent identities, avoiding redundant metadata syscalls while preserving publication, content, metadata, recovery, and durability checks.
 - Reused a single-use validated staged-output receipt to skip only the duplicate commit-start staged-file hash; commit still fully validates targets and capacity, and publication still rehashes each staged output immediately before mutation.
 - Added local and remote staged-marker lifecycle profiling for prepare, state-save, finish, unlink, and marker-directory durability steps without changing synchronization behavior.
+- Changed new staged recovery markers to a V3 same-inode journal with five preallocated fixed-size BLAKE2b-256 hash-chained phase slots, removing five full-marker replacements and parent-directory fsyncs per lifecycle while retaining V1/V2 recovery and fail-closed cleanup semantics; exact marker removal now quarantines before classification, cleanup, identity verification, and unlink, quarantine restoration syncs the parent, and identical V1/V3 creation retries repeat exact-content marker and parent durability barriers.
 
 ## 0.9.2 - 2026-08-09
 

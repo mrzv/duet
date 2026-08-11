@@ -170,7 +170,22 @@ fn wait_for_marker_phase_while_child_runs(path: &Path, phase: &str, child: &mut 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if fs::read_to_string(path)
-            .map(|contents| contents.contains(&format!("phase: {phase}")))
+            .map(|contents| {
+                contents.lines().any(|line| {
+                    line == format!("phase: {phase}")
+                        || line
+                            .strip_prefix("phase-slot-v3: ")
+                            .map(|record| {
+                                let mut fields = record.split(' ');
+                                fields.next().is_some()
+                                    && fields.next() == Some("applied")
+                                    && fields.next().is_some()
+                                    && fields.next() == Some(phase)
+                                    && fields.next().is_none()
+                            })
+                            .unwrap_or(false)
+                })
+            })
             .unwrap_or(false)
         {
             return;

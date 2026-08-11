@@ -442,7 +442,7 @@ reverse-order pass so child entries are processed before parent directories.
 Regular file output uses a lazy, side-local `StagingArea`. The first output
 creates one mode-0700 `.duet-stage-*` directory under the synchronization base,
 on the destination filesystem, and records its parent, component, and identity
-in the V2 recovery marker. Preparation does not create missing destination
+in the staged recovery marker. Preparation does not create missing destination
 parents or otherwise mutate synchronized target paths.
 For a modified regular file, Duet first attempts a same-filesystem copy-on-write
 clone of the verified old destination (`fclonefileat` on macOS, `FICLONE` on
@@ -492,7 +492,20 @@ form an isolated wave, while a logical file larger than currently usable space i
 admitted only for a verified COW-capable modified-file output.
 
 Within each wave, all outputs are sealed before both sides durably transition
-their V2 marker to `prepared`. The client validates both wave plans and every
+their staged marker to `prepared`. Newly created markers retain the human-readable
+V2 inventory under `duet-apply-attempt-v2-journal-v3`, with an exact initial
+`preparing` phase and five preallocated fixed-size phase slots. Each transition
+overwrites exactly one canonical `pending` slot with its equal-length `applied`
+form through a no-follow, identity-checked descriptor. Applied slots are a
+contiguous BLAKE2b-256 hash-chained prefix; all later slots remain canonical
+zero-digest pending records. The slot update fsyncs and reparses the same marker
+inode without changing its length, replacing it, or fsyncing its parent
+directory. Existing V1 and V2 markers remain readable, and
+V2 transitions retain their atomic replacement and parent-directory durability
+behavior. A malformed chain, illegal sequence, substituted marker, or complete
+invalid, torn, missing, or truncated slot fails closed.
+
+The client validates both wave plans and every
 staged identity while both sides are still abortable, then atomically chooses
 cancellation or commit. Each commit validates again, including a fresh reserve
 check, durably transitions to `committing`, and only then begins target mutation.
@@ -501,6 +514,33 @@ saves both canonical snapshots while both markers remain, and clears the exact-I
 markers only after both saves succeed. The returned manifests become the baseline
 for the next wave. A commit failure can still leave a partial wave and keeps the
 recovery marker authoritative.
+
+The journal makes each marker phase transition durable; it does not make a wave,
+the two hosts, or the complete synchronization globally atomic. Finishing applies
+and fsyncs the `finished` slot, then renames the exact marker to a unique
+descriptor-relative quarantine component, verifies its identity there, unlinks
+it, and syncs the marker directory. This protocol assumes the marker parent is a
+trusted user-owned directory; it prevents a pathname substitution from being
+mistaken for the exact marker but does not support a hostile actor mutating that
+directory throughout the quarantine protocol.
+
+Automatic staged abort and explicit recovery clear quarantine the exact marker
+before parsing its phase or cleaning staging. Parsing uses the retained
+quarantined descriptor, and precommit cleanup is followed by an unchanged-content
+recheck before unlink. A concurrent retained phase transition therefore fails
+its original-path verification; if it made the marker commit-authoritative,
+automatic abort restores the marker and refuses cleanup. Explicit clear retains
+its user-confirmed commit-or-later behavior and removes only the exact marker.
+Every successful quarantine restoration verifies the canonical component and
+syncs the retained marker parent before reporting the original recovery error.
+Creation retries for identical markers revalidate the existing inode, restore
+mode 0600, sync the marker, verify it again, and sync its parent before success.
+
+V3 deliberately retains a V2-prefixed magic so older binaries block rather than
+clear it, but inspection and clearing require a V3-aware Duet binary after a
+downgrade. Recovery inventory remains line-oriented and UTF-8; unsupported names,
+non-UTF-8 names, or fields that cannot be represented safely can fail closed and
+require manual recovery.
 
 Each host computes `usable = available - reserve` from `fstatvfs`; the default
 reserve is 5% of total filesystem capacity, and an optional staging limit further
