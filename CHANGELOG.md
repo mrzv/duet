@@ -12,6 +12,9 @@
 - Added local and remote staged-marker lifecycle profiling for prepare, state-save, finish, unlink, and marker-directory durability steps without changing synchronization behavior.
 - Changed new staged recovery markers to a V3 same-inode journal with five preallocated fixed-size BLAKE2b-256 hash-chained phase slots, removing five full-marker replacements and parent-directory fsyncs per lifecycle while retaining V1/V2 recovery and fail-closed cleanup semantics; exact marker removal now quarantines before classification, cleanup, identity verification, and unlink, quarantine restoration syncs the parent, and identical V1/V3 creation retries repeat exact-content marker and parent durability barriers.
 
+### Fixed
+- Fixed staged creation of missing destination directories on Linux by normalizing restrictive umask results through descriptor-relative operations before reopening the exact directory with a descriptor usable for metadata updates.
+
 ## 0.9.2 - 2026-08-09
 
 ### Added

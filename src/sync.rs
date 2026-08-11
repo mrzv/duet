@@ -3938,18 +3938,94 @@ impl MutationDurabilityLedger {
         Ok(ino)
     }
 
-    fn mkdir_staged(&mut self, token: MutationDurabilityToken, mode: u32) -> Result<fs::File> {
+    fn mkdir_private_staged(&mut self, token: MutationDurabilityToken) -> Result<fs::File> {
+        self.mkdir_private_staged_with_creation_mode(token, 0o700)
+    }
+
+    fn mkdir_private_staged_with_creation_mode(
+        &mut self,
+        token: MutationDurabilityToken,
+        creation_mode: u32,
+    ) -> Result<fs::File> {
         self.before_namespace_mutation(&token.mutation_path)?;
         cvt(unsafe {
             libc::mkdirat(
                 token.directory.as_raw_fd(),
                 token.name.as_ptr(),
-                mode as libc::mode_t,
+                creation_mode as libc::mode_t,
             )
         })?;
-        let directory = open_directory_at_for_access(&token.directory, &token.name)?;
-        self.after_namespace_mutation(&token.mutation_path)?;
+        let created =
+            fstatat_nofollow(token.directory.as_raw_fd(), &token.name).wrap_err_with(|| {
+                format!(
+                    "failed to inspect newly created directory {}",
+                    token.mutation_path.display()
+                )
+            })?;
+        if created.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(eyre!(
+                "new directory path {} is not a directory",
+                token.mutation_path.display()
+            ));
+        }
+        let parent = token.directory.try_clone().wrap_err_with(|| {
+            format!(
+                "failed to retain parent of newly created directory {}",
+                token.mutation_path.display()
+            )
+        })?;
+        let name = token.name.clone();
+        let path = token.mutation_path.clone();
+        let private_mode = 0o700u32 | (created.st_mode as u32 & 0o2000);
+        self.after_namespace_mutation(&path)?;
         self.arm(token)?;
+        cvt(unsafe {
+            libc::fchmodat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                private_mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+        .wrap_err_with(|| {
+            format!(
+                "failed to normalize directory permissions {}",
+                path.display()
+            )
+        })?;
+        let normalized = fstatat_nofollow(parent.as_raw_fd(), &name).wrap_err_with(|| {
+            format!(
+                "failed to verify new directory permissions {}",
+                path.display()
+            )
+        })?;
+        verify_stat_identity(&created, &normalized, libc::S_IFDIR, &path, "new directory")?;
+        // Some filesystems clear an inherited setgid bit when the caller is
+        // not a member of the inherited group. The private permission bits
+        // must still be exact; either setgid state is safe.
+        if normalized.st_mode as u32 & 0o5777 != 0o700 {
+            return Err(eyre!(
+                "new directory {} has mode {:o}, expected private mode 0700 with optional setgid",
+                path.display(),
+                normalized.st_mode as u32 & 0o7777
+            ));
+        }
+        let directory = openat_file(
+            parent.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .wrap_err_with(|| format!("failed to open new directory {}", path.display()))?;
+        let opened = directory
+            .metadata()
+            .wrap_err_with(|| format!("failed to inspect new directory {}", path.display()))?;
+        if opened.dev() != created.st_dev as u64 || opened.ino() != created.st_ino as u64 {
+            return Err(eyre!(
+                "new directory {} changed identity before it could be retained",
+                path.display()
+            ));
+        }
         Ok(directory)
     }
 
@@ -8560,7 +8636,7 @@ fn create_private_directory_staged(
 ) -> Result<()> {
     let token = ledger.prepare_parent(path)?;
     let directory = ledger
-        .mkdir_staged(token, 0o700)
+        .mkdir_private_staged(token)
         .wrap_err_with(|| format!("failed to create directory {}", path.display()))?;
     normalize_private_directory_file(&directory, path)
 }
@@ -12725,7 +12801,26 @@ mod tests {
         create_private_directory_staged(&path, &mut ledger).unwrap();
 
         assert!(path.is_dir());
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o1777, 0o700);
         assert!(!inspected.join("new").exists());
+        assert!(ledger.dirty.contains_key(&parent));
+    }
+
+    #[test]
+    fn staged_private_mkdir_normalizes_an_unreadable_created_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let path = parent.join("new");
+        fs::create_dir(&parent).unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+        let token = ledger.prepare_parent(&path).unwrap();
+
+        let directory = ledger
+            .mkdir_private_staged_with_creation_mode(token, 0)
+            .unwrap();
+
+        assert!(directory.metadata().unwrap().is_dir());
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o1777, 0o700);
         assert!(ledger.dirty.contains_key(&parent));
     }
 
