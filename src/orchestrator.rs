@@ -820,7 +820,7 @@ pub async fn sync(
             };
             record_stream_performance(&mut performance, &mut stream_result);
             let StreamApplyOutcome::Staged {
-                prepared,
+                mut prepared,
                 local_report,
                 remote_report,
             } = stream_result.outcome
@@ -858,10 +858,19 @@ pub async fn sync(
             ))?;
             let validation_start = Instant::now();
             let local_validation = tokio::task::spawn_blocking(move || {
-                let result = prepared.validate_commit();
+                let result = prepared.validate_commit_receipted();
                 (prepared, result)
             });
-            let remote_validation = remote.validate_staged_apply(wave_attempt_id.clone());
+            let remote_validation_receipted = remote_uses_receipted_validation(&remote_info);
+            let remote_validation = async {
+                if remote_validation_receipted {
+                    remote
+                        .validate_staged_apply_receipted(wave_attempt_id.clone())
+                        .await
+                } else {
+                    remote.validate_staged_apply(wave_attempt_id.clone()).await
+                }
+            };
             let (local_validation, remote_validation) =
                 tokio::join!(local_validation, remote_validation);
             let (prepared, local_validation) = match local_validation {
@@ -2817,6 +2826,10 @@ fn has_remote_capability(info: &rpc::ServerInfo, capability: &str) -> bool {
     info.capabilities.iter().any(|c| c == capability)
 }
 
+fn remote_uses_receipted_validation(info: &rpc::ServerInfo) -> bool {
+    has_remote_capability(info, rpc::CAPABILITY_STAGED_VALIDATION_RECEIPT)
+}
+
 fn agreed_capabilities(info: &rpc::ServerInfo) -> Vec<&'static str> {
     rpc::client_capabilities()
         .iter()
@@ -4328,6 +4341,22 @@ mod tests {
             agreed_capabilities(&info),
             vec![rpc::CAPABILITY_STREAMED_DETAILS]
         );
+    }
+
+    #[test]
+    fn receipted_validation_selection_falls_back_for_legacy_servers() {
+        let legacy = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "legacy".to_string(),
+            capabilities: Vec::new(),
+        };
+        let receipted = rpc::ServerInfo {
+            capabilities: vec![rpc::CAPABILITY_STAGED_VALIDATION_RECEIPT.to_string()],
+            ..legacy.clone()
+        };
+
+        assert!(!remote_uses_receipted_validation(&legacy));
+        assert!(remote_uses_receipted_validation(&receipted));
     }
 
     #[test]

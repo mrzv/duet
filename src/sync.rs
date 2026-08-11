@@ -5007,8 +5007,8 @@ impl TempOutput {
         Ok(())
     }
 
-    fn verify_prepared_contents(&self, entry: &Entry) -> Result<()> {
-        let mut file = openat_file(
+    fn reopen_prepared(&self, entry: &Entry) -> Result<(fs::File, fs::Metadata)> {
+        let file = openat_file(
             self.staging.directory.as_raw_fd(),
             &self.output_name,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -5021,14 +5021,57 @@ impl TempOutput {
             )
         })?;
         verify_temp_output_metadata(&metadata, self.identity, &self.temp_path)?;
+        if metadata.size() != entry.size() {
+            return Err(eyre!(
+                "staged output {} size mismatch: expected {}, got {}",
+                entry.path().display(),
+                entry.size(),
+                metadata.size()
+            ));
+        }
+        Ok((file, metadata))
+    }
+
+    fn verify_prepared_contents(&self, entry: &Entry) -> Result<StagedOutputFingerprint> {
+        let (mut file, metadata_a) = self.reopen_prepared(entry)?;
+        let fingerprint_a = StagedOutputFingerprint::from_metadata(&metadata_a);
         self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
         verify_open_file_contents_match_entry(
             &mut file,
-            &metadata,
+            &metadata_a,
             &self.temp_path,
             entry,
             "staged output",
         )?;
+        let metadata_b = file.metadata().wrap_err_with(|| {
+            format!(
+                "failed to reinspect reopened temporary file {}",
+                self.temp_path.display()
+            )
+        })?;
+        let fingerprint_b = StagedOutputFingerprint::from_metadata(&metadata_b);
+        if fingerprint_a != fingerprint_b {
+            return Err(eyre!(
+                "staged output {} changed during validation",
+                entry.path().display()
+            ));
+        }
+        self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
+        Ok(fingerprint_b)
+    }
+
+    fn verify_prepared_fingerprint(
+        &self,
+        entry: &Entry,
+        expected: StagedOutputFingerprint,
+    ) -> Result<()> {
+        let (_file, metadata) = self.reopen_prepared(entry)?;
+        if StagedOutputFingerprint::from_metadata(&metadata) != expected {
+            return Err(eyre!(
+                "staged output {} changed after validation",
+                entry.path().display()
+            ));
+        }
         self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)
     }
 
@@ -6868,6 +6911,52 @@ pub struct DetailApplier {
 pub struct PreparedApply {
     inner: DetailApplier,
     plan: CommitPlan,
+    validation_generation: u64,
+    validation_receipt: Option<CommitValidationReceipt>,
+    #[cfg(test)]
+    validation_hash_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    after_receipt_check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StagedOutputFingerprint {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    nlink: u64,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+}
+
+impl StagedOutputFingerprint {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mode: metadata.mode(),
+            nlink: metadata.nlink(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            size: metadata.size(),
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime_sec: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+struct CommitValidationReceipt {
+    generation: u64,
+    attempt_id: Option<String>,
+    output_slots: usize,
+    fingerprints: Vec<Option<StagedOutputFingerprint>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -7224,7 +7313,16 @@ impl DetailApplier {
             }
             self.recorder = ApplyRecorder::new(self.attempt_state.clone());
         }
-        Ok(PreparedApply { inner: self, plan })
+        Ok(PreparedApply {
+            inner: self,
+            plan,
+            validation_generation: 0,
+            validation_receipt: None,
+            #[cfg(test)]
+            validation_hash_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            after_receipt_check_hook: None,
+        })
     }
 
     fn advance_to_action(&mut self, target_index: usize) -> Result<()> {
@@ -7745,13 +7843,26 @@ fn merge_staged_manifest(
 }
 
 trait PreparedOutputValidator: Sync {
-    fn validate(&self, action_index: usize, output: &PreparedOutput) -> Result<()>;
+    fn validate(
+        &self,
+        action_index: usize,
+        output: &PreparedOutput,
+    ) -> Result<StagedOutputFingerprint>;
 }
 
-struct FilePreparedOutputValidator;
+struct FilePreparedOutputValidator {
+    #[cfg(test)]
+    hash_count: Arc<AtomicUsize>,
+}
 
 impl PreparedOutputValidator for FilePreparedOutputValidator {
-    fn validate(&self, _action_index: usize, output: &PreparedOutput) -> Result<()> {
+    fn validate(
+        &self,
+        _action_index: usize,
+        output: &PreparedOutput,
+    ) -> Result<StagedOutputFingerprint> {
+        #[cfg(test)]
+        self.hash_count.fetch_add(1, AtomicOrdering::SeqCst);
         output.output.verify_prepared_contents(&output.final_entry)
     }
 }
@@ -7819,7 +7930,7 @@ fn validate_prepared_outputs(
     outputs: &[Option<PreparedOutput>],
     workers: usize,
     validator: &dyn PreparedOutputValidator,
-) -> Result<()> {
+) -> Result<Vec<Option<StagedOutputFingerprint>>> {
     validate_prepared_outputs_with_spawn_failure(outputs, workers, validator, None)
 }
 
@@ -7828,14 +7939,14 @@ fn validate_prepared_outputs_with_spawn_failure(
     workers: usize,
     validator: &dyn PreparedOutputValidator,
     injected_spawn_failure: Option<io::ErrorKind>,
-) -> Result<()> {
+) -> Result<Vec<Option<StagedOutputFingerprint>>> {
     let prepared = outputs
         .iter()
         .enumerate()
         .filter_map(|(index, output)| output.as_ref().map(|output| (index, output)))
         .collect::<Vec<_>>();
     if prepared.is_empty() {
-        return Ok(());
+        return Ok(vec![None; outputs.len()]);
     }
 
     let next = AtomicUsize::new(0);
@@ -7889,10 +8000,11 @@ fn validate_prepared_outputs_with_spawn_failure(
             .collect::<Vec<_>>())
     })?;
     results.sort_by_key(|(action_index, _)| *action_index);
-    for (_, result) in results {
-        result?;
+    let mut fingerprints = vec![None; outputs.len()];
+    for (action_index, result) in results {
+        fingerprints[action_index] = Some(result?);
     }
-    Ok(())
+    Ok(fingerprints)
 }
 
 impl PreparedApply {
@@ -7912,12 +8024,40 @@ impl PreparedApply {
     }
 
     pub fn validate_commit(&self) -> Result<()> {
+        self.validate_commit_full().map(|_| ())
+    }
+
+    pub(crate) fn validate_commit_receipted(&mut self) -> Result<()> {
+        self.validation_receipt = None;
+        self.validation_generation = self
+            .validation_generation
+            .checked_add(1)
+            .ok_or_else(|| eyre!("staged validation generation exhausted"))?;
+        let fingerprints = self.validate_commit_full()?;
+        self.validation_receipt = Some(CommitValidationReceipt {
+            generation: self.validation_generation,
+            attempt_id: self.inner.attempt_id.clone(),
+            output_slots: self.inner.prepared_outputs.len(),
+            fingerprints,
+        });
+        Ok(())
+    }
+
+    fn validate_commit_full(&self) -> Result<Vec<Option<StagedOutputFingerprint>>> {
         preflight_commit_plan(&self.inner.base, &self.plan, self.inner.apply_options)?;
-        validate_prepared_outputs(
+        let fingerprints = validate_prepared_outputs(
             &self.inner.prepared_outputs,
             validation_worker_limit(),
-            &FilePreparedOutputValidator,
+            &FilePreparedOutputValidator {
+                #[cfg(test)]
+                hash_count: Arc::clone(&self.validation_hash_count),
+            },
         )?;
+        self.validate_commit_targets_and_capacity()?;
+        Ok(fingerprints)
+    }
+
+    fn validate_commit_targets_and_capacity(&self) -> Result<()> {
         for action in &self.inner.actions {
             let change = match action {
                 Action::Local(change) | Action::ResolvedLocal((_, _), change) => change,
@@ -7950,14 +8090,56 @@ impl PreparedApply {
         Ok(())
     }
 
+    fn receipt_is_structurally_valid(&self, receipt: &CommitValidationReceipt) -> bool {
+        receipt.generation == self.validation_generation
+            && receipt.attempt_id == self.inner.attempt_id
+            && receipt.output_slots == self.inner.prepared_outputs.len()
+            && receipt.fingerprints.len() == self.inner.prepared_outputs.len()
+            && self
+                .inner
+                .prepared_outputs
+                .iter()
+                .zip(&receipt.fingerprints)
+                .all(|(output, fingerprint)| output.is_some() == fingerprint.is_some())
+    }
+
+    fn validate_commit_from_receipt(&self, receipt: &CommitValidationReceipt) -> Result<()> {
+        for (output, fingerprint) in self
+            .inner
+            .prepared_outputs
+            .iter()
+            .zip(&receipt.fingerprints)
+        {
+            if let (Some(output), Some(fingerprint)) = (output, fingerprint) {
+                output
+                    .output
+                    .verify_prepared_fingerprint(&output.final_entry, *fingerprint)?;
+            }
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.after_receipt_check_hook {
+            hook();
+        }
+        preflight_commit_plan(&self.inner.base, &self.plan, self.inner.apply_options)?;
+        self.validate_commit_targets_and_capacity()
+    }
+
     pub fn commit(self) -> Result<Vec<Entry>> {
         self.commit_profiled().map(|(entries, _)| entries)
     }
 
     pub(crate) fn commit_profiled(mut self) -> Result<(Vec<Entry>, StagedCommitProfile)> {
+        let receipt = self.validation_receipt.take();
         let mut profile = StagedCommitProfile::default();
         let started = Instant::now();
-        self.validate_commit()?;
+        match receipt {
+            Some(receipt) if self.receipt_is_structurally_valid(&receipt) => {
+                self.validate_commit_from_receipt(&receipt)?;
+            }
+            _ => {
+                self.validate_commit()?;
+            }
+        }
         profile.revalidation_us = duration_us(started.elapsed());
 
         let started = Instant::now();
@@ -10032,8 +10214,8 @@ mod tests {
         )))];
         let mut applier = DetailApplier::new_with_attempt(base.clone(), actions, Vec::new(), None);
         stream_file(&mut applier, 0, b"new").unwrap();
-        let prepared = applier.finish_preparation().unwrap();
-        prepared.validate_commit().unwrap();
+        let mut prepared = applier.finish_preparation().unwrap();
+        prepared.validate_commit_receipted().unwrap();
         fs::write(base.join("file"), b"race").unwrap();
 
         let error = prepared.commit().unwrap_err();
@@ -10042,6 +10224,183 @@ mod tests {
             .to_string()
             .contains("appeared after staged preparation"));
         assert_eq!(fs::read(base.join("file")).unwrap(), b"race");
+    }
+
+    #[test]
+    fn receipted_commit_still_full_hashes_existing_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let old = synced_existing_file_entry(&base, "file", b"original");
+        let mut new = old.clone();
+        new.set_mode(0o100600);
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        let applier = DetailApplier::new_with_attempt(base.clone(), actions, vec![old], None);
+        let mut prepared = applier.finish_preparation().unwrap();
+        prepared.validate_commit_receipted().unwrap();
+
+        fs::write(base.join("file"), b"mutation").unwrap();
+        let error = prepared.commit().unwrap_err();
+
+        assert!(
+            error.to_string().contains("checksum mismatch"),
+            "{:#}",
+            error
+        );
+        assert_eq!(fs::read(base.join("file")).unwrap(), b"mutation");
+    }
+
+    fn prepared_added_file(base: &Path, path: &str, contents: &[u8]) -> PreparedApply {
+        let actions = vec![Action::Local(Change::Added(test_file_entry(
+            path, contents,
+        )))];
+        let mut applier =
+            DetailApplier::new_with_attempt(base.to_path_buf(), actions, Vec::new(), None);
+        stream_file(&mut applier, 0, contents).unwrap();
+        applier.finish_preparation().unwrap()
+    }
+
+    #[test]
+    fn full_staged_validation_returns_stable_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let prepared = prepared_added_file(dir.path(), "file", b"contents");
+        let output = prepared.inner.prepared_outputs[0].as_ref().unwrap();
+
+        let before = output
+            .output
+            .verify_prepared_contents(&output.final_entry)
+            .unwrap();
+        let after = output
+            .output
+            .verify_prepared_contents(&output.final_entry)
+            .unwrap();
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn receipt_skips_only_commit_start_staged_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prepared = prepared_added_file(dir.path(), "file", b"contents");
+        let hash_count = Arc::clone(&prepared.validation_hash_count);
+
+        prepared.validate_commit_receipted().unwrap();
+        assert_eq!(hash_count.load(AtomicOrdering::SeqCst), 1);
+        prepared.commit().unwrap();
+
+        assert_eq!(hash_count.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"contents");
+    }
+
+    #[test]
+    fn invalid_receipt_generation_falls_back_to_full_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prepared = prepared_added_file(dir.path(), "file", b"contents");
+        let hash_count = Arc::clone(&prepared.validation_hash_count);
+        prepared.validate_commit_receipted().unwrap();
+        prepared.validation_receipt.as_mut().unwrap().generation += 1;
+
+        prepared.commit().unwrap();
+
+        assert_eq!(hash_count.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"contents");
+    }
+
+    #[test]
+    fn failed_receipted_validation_clears_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prepared = prepared_added_file(dir.path(), "file", b"contents");
+        let hash_count = Arc::clone(&prepared.validation_hash_count);
+
+        prepared.validate_commit_receipted().unwrap();
+        let first_generation = prepared.validation_receipt.as_ref().unwrap().generation;
+        prepared.validate_commit_receipted().unwrap();
+        let second_generation = prepared.validation_receipt.as_ref().unwrap().generation;
+        assert!(second_generation > first_generation);
+
+        fs::write(dir.path().join("file"), b"race").unwrap();
+        assert!(prepared.validate_commit_receipted().is_err());
+        assert!(prepared.validation_receipt.is_none());
+        fs::remove_file(dir.path().join("file")).unwrap();
+
+        prepared.commit().unwrap();
+        assert_eq!(hash_count.load(AtomicOrdering::SeqCst), 4);
+    }
+
+    #[test]
+    fn receipt_rejects_same_inode_same_size_mutation_with_restored_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prepared = prepared_added_file(dir.path(), "file", b"contents");
+        let output_path = prepared.inner.prepared_outputs[0]
+            .as_ref()
+            .unwrap()
+            .output
+            .temp_path
+            .clone();
+        prepared.validate_commit_receipted().unwrap();
+        let metadata = fs::metadata(&output_path).unwrap();
+        let mtime =
+            filetime::FileTime::from_unix_time(metadata.mtime(), metadata.mtime_nsec() as u32);
+
+        fs::write(&output_path, b"mutated!").unwrap();
+        filetime::set_file_mtime(&output_path, mtime).unwrap();
+        let error = prepared.commit().unwrap_err();
+
+        assert!(
+            error.to_string().contains("changed after validation"),
+            "{:#}",
+            error
+        );
+        assert!(!dir.path().join("file").exists());
+    }
+
+    #[test]
+    fn receipt_rejects_staged_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prepared = prepared_added_file(dir.path(), "file", b"contents");
+        let output_path = prepared.inner.prepared_outputs[0]
+            .as_ref()
+            .unwrap()
+            .output
+            .temp_path
+            .clone();
+        prepared.validate_commit_receipted().unwrap();
+
+        fs::remove_file(&output_path).unwrap();
+        fs::write(&output_path, b"contents").unwrap();
+        let error = prepared.commit().unwrap_err();
+
+        assert!(
+            error.to_string().contains("prepared output file")
+                || error.to_string().contains("changed after validation"),
+            "{:#}",
+            error
+        );
+        assert!(!dir.path().join("file").exists());
+    }
+
+    #[test]
+    fn publication_hash_catches_mutation_after_receipt_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prepared = prepared_added_file(dir.path(), "file", b"contents");
+        let output_path = prepared.inner.prepared_outputs[0]
+            .as_ref()
+            .unwrap()
+            .output
+            .temp_path
+            .clone();
+        prepared.validate_commit_receipted().unwrap();
+        prepared.after_receipt_check_hook = Some(Arc::new(move || {
+            fs::write(&output_path, b"mutated!").unwrap();
+        }));
+
+        let error = prepared.commit().unwrap_err();
+
+        assert!(
+            error.to_string().contains("checksum mismatch"),
+            "{:#}",
+            error
+        );
+        assert!(!dir.path().join("file").exists());
     }
 
     #[test]
@@ -10118,7 +10477,11 @@ mod tests {
     }
 
     impl PreparedOutputValidator for TestPreparedOutputValidator {
-        fn validate(&self, action_index: usize, _output: &PreparedOutput) -> Result<()> {
+        fn validate(
+            &self,
+            action_index: usize,
+            output: &PreparedOutput,
+        ) -> Result<StagedOutputFingerprint> {
             if self.panic_at == Some(action_index) {
                 panic!("injected validation panic");
             }
@@ -10129,7 +10492,8 @@ mod tests {
             if self.failures.contains(&action_index) {
                 Err(eyre!("validation failed at action {}", action_index))
             } else {
-                Ok(())
+                let metadata = fs::metadata(&output.output.temp_path).unwrap();
+                Ok(StagedOutputFingerprint::from_metadata(&metadata))
             }
         }
     }

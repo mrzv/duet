@@ -47,6 +47,7 @@ pub(crate) const CAPABILITY_STAGING_RESERVE_ENFORCEMENT: &str = "staging-reserve
 pub(crate) const CAPABILITY_STAGING_INODE_CAPACITY: &str = "staging-inode-capacity-v1";
 pub(crate) const CAPABILITY_SCAN_EXCLUDES: &str = "scan-excludes-v1";
 pub(crate) const CAPABILITY_STAGED_COMMIT_PROFILE: &str = "staged-commit-profile-v1";
+pub(crate) const CAPABILITY_STAGED_VALIDATION_RECEIPT: &str = "staged-validation-receipt-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -73,6 +74,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_STAGING_INODE_CAPACITY,
     CAPABILITY_SCAN_EXCLUDES,
     CAPABILITY_STAGED_COMMIT_PROFILE,
+    CAPABILITY_STAGED_VALIDATION_RECEIPT,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -231,6 +233,7 @@ pub trait DuetServer {
         &mut self,
         attempt_id: String,
     ) -> Result<sync::StagedCommitProfile, RPCError>;
+    fn validate_staged_apply_receipted(&mut self, attempt_id: String) -> Result<(), RPCError>;
 }
 
 enum ApplyStream {
@@ -1380,6 +1383,26 @@ impl DuetServer for DuetServerImpl {
             .map_err(|e| rpc_report_error("validate staged apply", Some(state_path), e))
     }
 
+    fn validate_staged_apply_receipted(&mut self, attempt_id: String) -> Result<(), RPCError> {
+        let (state_path, prepared) = match &mut self.staged_apply {
+            Some(StagedApplyState::Prepared {
+                attempt_id: active_id,
+                state_path,
+                prepared,
+            }) if active_id == &attempt_id => (state_path, prepared),
+            _ => {
+                return Err(rpc_error(
+                    "validate staged apply",
+                    None,
+                    "staged apply attempt ID mismatch or attempt is not prepared",
+                ));
+            }
+        };
+        prepared
+            .validate_commit_receipted()
+            .map_err(|e| rpc_report_error("validate staged apply", Some(state_path), e))
+    }
+
     fn commit_staged_apply_profiled(
         &mut self,
         attempt_id: String,
@@ -1694,6 +1717,9 @@ mod tests {
         assert!(client
             .commit_staged_apply_profiled("attempt".to_string())
             .is_err());
+        assert!(client
+            .validate_staged_apply_receipted("attempt".to_string())
+            .is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -1730,6 +1756,7 @@ mod tests {
                 ("set_staging_policy", 46),
                 ("changes_scope", 47),
                 ("commit_staged_apply_profiled", 48),
+                ("validate_staged_apply_receipted", 49),
             ]
         );
     }
@@ -1775,6 +1802,7 @@ mod tests {
                 CAPABILITY_STAGING_INODE_CAPACITY.to_string(),
                 CAPABILITY_SCAN_EXCLUDES.to_string(),
                 CAPABILITY_STAGED_COMMIT_PROFILE.to_string(),
+                CAPABILITY_STAGED_VALIDATION_RECEIPT.to_string(),
             ]
         );
     }
@@ -1920,8 +1948,14 @@ mod tests {
         assert!(server
             .validate_staged_apply("wrong-attempt".to_string())
             .is_err());
+        assert!(server
+            .validate_staged_apply_receipted("wrong-attempt".to_string())
+            .is_err());
         server
             .validate_staged_apply("attempt-1".to_string())
+            .unwrap();
+        server
+            .validate_staged_apply_receipted("attempt-1".to_string())
             .unwrap();
         assert_eq!(
             std::fs::read(server.base.join("sentinel")).unwrap(),
@@ -1930,6 +1964,11 @@ mod tests {
         let state = server.remote_state_for_id("peer").unwrap();
         let marker = sync::describe_apply_attempt(&state).unwrap().unwrap();
         assert!(marker.contains("phase: prepared"), "{}", marker);
+
+        server.abort_staged_apply("attempt-1".to_string()).unwrap();
+        assert!(server
+            .validate_staged_apply_receipted("attempt-1".to_string())
+            .is_err());
     }
 
     #[test]
