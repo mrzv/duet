@@ -1754,23 +1754,46 @@ pub(crate) fn mark_staged_apply_attempt_state_save(
     state_path: &Path,
     attempt_id: &str,
 ) -> Result<()> {
+    mark_staged_apply_attempt_state_save_profiled(state_path, attempt_id).map(|_| ())
+}
+
+pub(crate) fn mark_staged_apply_attempt_state_save_profiled(
+    state_path: &Path,
+    attempt_id: &str,
+) -> Result<StagedMarkerLifecycleProfile> {
+    let started = Instant::now();
     transition_staged_apply_attempt(
         state_path,
         attempt_id,
         &[ApplyAttemptPhase::Committed],
         ApplyAttemptPhase::StateSave,
-    )
+    )?;
+    Ok(StagedMarkerLifecycleProfile {
+        committed_to_state_save_us: duration_us(started.elapsed()),
+        ..StagedMarkerLifecycleProfile::default()
+    })
 }
 
 #[allow(dead_code)]
 pub(crate) fn finish_staged_apply_attempt(state_path: &Path, attempt_id: &str) -> Result<()> {
+    finish_staged_apply_attempt_profiled(state_path, attempt_id).map(|_| ())
+}
+
+pub(crate) fn finish_staged_apply_attempt_profiled(
+    state_path: &Path,
+    attempt_id: &str,
+) -> Result<StagedMarkerLifecycleProfile> {
+    let mut profile = StagedMarkerLifecycleProfile::default();
+    let started = Instant::now();
     transition_staged_apply_attempt(
         state_path,
         attempt_id,
         &[ApplyAttemptPhase::StateSave],
         ApplyAttemptPhase::Finished,
     )?;
-    finish_apply_attempt(state_path)
+    profile.state_save_to_finished_us = duration_us(started.elapsed());
+    finish_apply_attempt_profiled(state_path, &mut profile)?;
+    Ok(profile)
 }
 
 #[allow(dead_code)]
@@ -1963,23 +1986,38 @@ fn applied_change(action: &Action) -> Option<&Change> {
 }
 
 pub fn finish_apply_attempt(state_path: &Path) -> Result<()> {
+    finish_apply_attempt_profiled(state_path, &mut StagedMarkerLifecycleProfile::default())
+}
+
+fn finish_apply_attempt_profiled(
+    state_path: &Path,
+    profile: &mut StagedMarkerLifecycleProfile,
+) -> Result<()> {
     let marker_path = apply_attempt_path(state_path)?;
+    let started = Instant::now();
     match fs::remove_file(&marker_path) {
         Ok(()) => {
+            profile.marker_unlink_us = duration_us(started.elapsed());
             let parent = marker_path.parent().ok_or_else(|| {
                 eyre!(
                     "apply recovery marker {} has no parent directory",
                     marker_path.display()
                 )
             })?;
+            let started = Instant::now();
             sync_directory(parent).wrap_err_with(|| {
                 format!(
                     "unable to sync cleared apply recovery marker directory {}",
                     parent.display()
                 )
-            })
+            })?;
+            profile.marker_parent_sync_us = duration_us(started.elapsed());
+            Ok(())
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            profile.marker_unlink_us = duration_us(started.elapsed());
+            Ok(())
+        }
         Err(e) => Err(e).wrap_err_with(|| {
             format!(
                 "unable to remove apply recovery marker {}",
@@ -6970,6 +7008,34 @@ pub struct StagedCommitProfile {
     pub(crate) committed_marker_transition_us: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedMarkerLifecycleProfile {
+    pub(crate) preparing_to_prepared_us: u64,
+    pub(crate) committed_to_state_save_us: u64,
+    pub(crate) state_save_to_finished_us: u64,
+    pub(crate) marker_unlink_us: u64,
+    pub(crate) marker_parent_sync_us: u64,
+}
+
+impl StagedMarkerLifecycleProfile {
+    #[allow(dead_code)]
+    pub(crate) fn saturating_add_assign(&mut self, other: Self) {
+        self.preparing_to_prepared_us = self
+            .preparing_to_prepared_us
+            .saturating_add(other.preparing_to_prepared_us);
+        self.committed_to_state_save_us = self
+            .committed_to_state_save_us
+            .saturating_add(other.committed_to_state_save_us);
+        self.state_save_to_finished_us = self
+            .state_save_to_finished_us
+            .saturating_add(other.state_save_to_finished_us);
+        self.marker_unlink_us = self.marker_unlink_us.saturating_add(other.marker_unlink_us);
+        self.marker_parent_sync_us = self
+            .marker_parent_sync_us
+            .saturating_add(other.marker_parent_sync_us);
+    }
+}
+
 impl StagedCommitProfile {
     #[allow(dead_code)]
     pub(crate) fn total_us(&self) -> u64 {
@@ -7274,7 +7340,14 @@ impl DetailApplier {
         self.finish_preparation()
     }
 
-    pub fn finish_preparation(mut self) -> Result<PreparedApply> {
+    pub fn finish_preparation(self) -> Result<PreparedApply> {
+        self.finish_preparation_profiled()
+            .map(|(prepared, _)| prepared)
+    }
+
+    pub(crate) fn finish_preparation_profiled(
+        mut self,
+    ) -> Result<(PreparedApply, StagedMarkerLifecycleProfile)> {
         if let Some(failed) = &self.failed {
             return Err(eyre!("detail apply stream already failed: {}", failed));
         }
@@ -7298,9 +7371,11 @@ impl DetailApplier {
             self.scan_policy.as_ref(),
             self.apply_options,
         )?;
+        let mut marker_profile = StagedMarkerLifecycleProfile::default();
         if let (Some(state_path), Some(attempt_id)) =
             (self.attempt_state.as_deref(), self.attempt_id.as_deref())
         {
+            let started = Instant::now();
             if let Some(marker) = self.preparing_marker.take() {
                 marker.transition_to_prepared()?;
             } else {
@@ -7311,18 +7386,22 @@ impl DetailApplier {
                     ApplyAttemptPhase::Prepared,
                 )?;
             }
+            marker_profile.preparing_to_prepared_us = duration_us(started.elapsed());
             self.recorder = ApplyRecorder::new(self.attempt_state.clone());
         }
-        Ok(PreparedApply {
-            inner: self,
-            plan,
-            validation_generation: 0,
-            validation_receipt: None,
-            #[cfg(test)]
-            validation_hash_count: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            after_receipt_check_hook: None,
-        })
+        Ok((
+            PreparedApply {
+                inner: self,
+                plan,
+                validation_generation: 0,
+                validation_receipt: None,
+                #[cfg(test)]
+                validation_hash_count: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
+                after_receipt_check_hook: None,
+            },
+            marker_profile,
+        ))
     }
 
     fn advance_to_action(&mut self, target_index: usize) -> Result<()> {
@@ -10555,6 +10634,26 @@ mod tests {
             ..StagedCommitProfile::default()
         });
         assert_eq!(profile.revalidation_us, u64::MAX);
+    }
+
+    #[test]
+    fn staged_marker_lifecycle_profile_round_trips_and_aggregates() {
+        let mut profile = StagedMarkerLifecycleProfile {
+            preparing_to_prepared_us: 1,
+            committed_to_state_save_us: 2,
+            state_save_to_finished_us: 3,
+            marker_unlink_us: 4,
+            marker_parent_sync_us: 5,
+        };
+        let encoded = serde_json::to_string(&profile).unwrap();
+        let decoded: StagedMarkerLifecycleProfile = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, profile);
+
+        profile.saturating_add_assign(StagedMarkerLifecycleProfile {
+            marker_unlink_us: u64::MAX,
+            ..StagedMarkerLifecycleProfile::default()
+        });
+        assert_eq!(profile.marker_unlink_us, u64::MAX);
     }
 
     #[test]
@@ -14763,7 +14862,7 @@ mod tests {
         );
 
         stream_file(&mut applier, 1, b"new").unwrap();
-        let prepared = applier.finish_preparation().unwrap();
+        let (prepared, prepare_profile) = applier.finish_preparation_profiled().unwrap();
 
         assert_eq!(prepared.report().prepared_file_count, 1);
         assert!(!base.join("a-dir").exists());
@@ -14772,6 +14871,7 @@ mod tests {
         assert_eq!(fs::read(base.join("z-remove.txt")).unwrap(), b"old");
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("phase: prepared"), "{}", marker);
+        assert!(prepare_profile.preparing_to_prepared_us > 0);
 
         let (entries, profile) = prepared.commit_profiled().unwrap();
         assert!(profile.revalidation_us <= profile.total_us());
@@ -14785,10 +14885,15 @@ mod tests {
         assert_eq!(entries.len(), 3);
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("phase: committed"), "{}", marker);
-        mark_staged_apply_attempt_state_save(&state, "attempt-1").unwrap();
+        let state_save_profile =
+            mark_staged_apply_attempt_state_save_profiled(&state, "attempt-1").unwrap();
         let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
         assert!(marker.contains("phase: state-save"), "{}", marker);
-        finish_staged_apply_attempt(&state, "attempt-1").unwrap();
+        assert!(state_save_profile.committed_to_state_save_us > 0);
+        let finish_profile = finish_staged_apply_attempt_profiled(&state, "attempt-1").unwrap();
+        assert!(finish_profile.state_save_to_finished_us > 0);
+        assert!(finish_profile.marker_unlink_us > 0);
+        assert!(finish_profile.marker_parent_sync_us > 0);
         assert!(!apply_attempt_path(&state).unwrap().exists());
     }
 

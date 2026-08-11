@@ -48,6 +48,7 @@ pub(crate) const CAPABILITY_STAGING_INODE_CAPACITY: &str = "staging-inode-capaci
 pub(crate) const CAPABILITY_SCAN_EXCLUDES: &str = "scan-excludes-v1";
 pub(crate) const CAPABILITY_STAGED_COMMIT_PROFILE: &str = "staged-commit-profile-v1";
 pub(crate) const CAPABILITY_STAGED_VALIDATION_RECEIPT: &str = "staged-validation-receipt-v1";
+pub(crate) const CAPABILITY_STAGED_MARKER_PROFILE: &str = "staged-marker-profile-v1";
 const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_PROFILE_FILE_STATE_DIR,
     CAPABILITY_STREAMED_DETAILS,
@@ -75,6 +76,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_SCAN_EXCLUDES,
     CAPABILITY_STAGED_COMMIT_PROFILE,
     CAPABILITY_STAGED_VALIDATION_RECEIPT,
+    CAPABILITY_STAGED_MARKER_PROFILE,
 ];
 
 pub(crate) fn client_capabilities() -> &'static [&'static str] {
@@ -234,6 +236,26 @@ pub trait DuetServer {
         attempt_id: String,
     ) -> Result<sync::StagedCommitProfile, RPCError>;
     fn validate_staged_apply_receipted(&mut self, attempt_id: String) -> Result<(), RPCError>;
+    fn finish_staged_prepare_profiled(
+        &mut self,
+        stream_id: ApplyStreamId,
+        attempt_id: String,
+    ) -> Result<
+        (
+            sync::PreparedApplyReport,
+            sync::StagedMarkerLifecycleProfile,
+        ),
+        RPCError,
+    >;
+    fn save_staged_state_pending_profiled(
+        &mut self,
+        attempt_id: String,
+        strong: bool,
+    ) -> Result<sync::StagedMarkerLifecycleProfile, RPCError>;
+    fn complete_staged_apply_profiled(
+        &mut self,
+        attempt_id: String,
+    ) -> Result<sync::StagedMarkerLifecycleProfile, RPCError>;
 }
 
 enum ApplyStream {
@@ -534,6 +556,149 @@ impl DuetServerImpl {
                 error,
             )),
         }
+    }
+
+    fn finish_staged_prepare_inner(
+        &mut self,
+        stream_id: ApplyStreamId,
+        attempt_id: String,
+    ) -> Result<
+        (
+            sync::PreparedApplyReport,
+            sync::StagedMarkerLifecycleProfile,
+        ),
+        RPCError,
+    > {
+        let state_path = match &self.staged_apply {
+            Some(StagedApplyState::Preparing {
+                attempt_id: active_id,
+                state_path,
+                stream_id: Some(active_stream),
+            }) if active_id == &attempt_id && active_stream == &stream_id => state_path.clone(),
+            Some(StagedApplyState::Preparing {
+                attempt_id: active_id,
+                ..
+            }) => {
+                return Err(rpc_error(
+                    "finish staged prepare",
+                    None,
+                    format!(
+                        "staged apply attempt or stream mismatch; active attempt is {active_id}"
+                    ),
+                ));
+            }
+            _ => {
+                return Err(rpc_error(
+                    "finish staged prepare",
+                    None,
+                    "staged apply attempt is not preparing",
+                ));
+            }
+        };
+        let stream = self.apply_streams.remove(&stream_id).ok_or_else(|| {
+            rpc_error(
+                "finish staged prepare",
+                Some(&state_path),
+                "staged apply stream does not exist",
+            )
+        })?;
+        let ApplyStream::Staged(applier) = stream else {
+            self.apply_streams.insert(stream_id, stream);
+            return Err(rpc_error(
+                "finish staged prepare",
+                Some(&state_path),
+                "apply stream is not staged",
+            ));
+        };
+        self.staged_apply = Some(StagedApplyState::Preparing {
+            attempt_id: attempt_id.clone(),
+            state_path: state_path.clone(),
+            stream_id: None,
+        });
+        let (prepared, profile) = applier
+            .finish_preparation_profiled()
+            .map_err(|e| rpc_report_error("finish staged preparation", Some(&state_path), e))?;
+        let report = prepared.report();
+        self.staged_apply = Some(StagedApplyState::Prepared {
+            attempt_id,
+            state_path,
+            prepared,
+        });
+        Ok((report, profile))
+    }
+
+    fn save_staged_state_pending_inner(
+        &mut self,
+        attempt_id: String,
+        strong: bool,
+    ) -> Result<sync::StagedMarkerLifecycleProfile, RPCError> {
+        let (state_path, state_save_started, state_saved) = match &self.staged_apply {
+            Some(StagedApplyState::Committed {
+                attempt_id: active_id,
+                state_path,
+                state_save_started,
+                state_saved,
+            }) if active_id == &attempt_id => {
+                (state_path.clone(), *state_save_started, *state_saved)
+            }
+            _ => {
+                return Err(rpc_error(
+                    "save staged state",
+                    None,
+                    "staged apply attempt ID mismatch or attempt is not committed",
+                ));
+            }
+        };
+        if state_saved {
+            return Ok(sync::StagedMarkerLifecycleProfile::default());
+        }
+        let mut profile = sync::StagedMarkerLifecycleProfile::default();
+        if !state_save_started {
+            profile = sync::mark_staged_apply_attempt_state_save_profiled(&state_path, &attempt_id)
+                .map_err(|e| rpc_report_error("mark staged state save", Some(&state_path), e))?;
+            if let Some(StagedApplyState::Committed {
+                state_save_started, ..
+            }) = &mut self.staged_apply
+            {
+                *state_save_started = true;
+            }
+        }
+        let format = if strong {
+            SnapshotFormat::V2
+        } else {
+            SnapshotFormat::LegacyV1
+        };
+        crate::state::save_entries_as(&state_path, &self.all_old, format)
+            .map_err(|e| rpc_report_error("save staged state", Some(&state_path), e))?;
+        if let Some(StagedApplyState::Committed { state_saved, .. }) = &mut self.staged_apply {
+            *state_saved = true;
+        }
+        Ok(profile)
+    }
+
+    fn complete_staged_apply_inner(
+        &mut self,
+        attempt_id: String,
+    ) -> Result<sync::StagedMarkerLifecycleProfile, RPCError> {
+        let state_path = match &self.staged_apply {
+            Some(StagedApplyState::Committed {
+                attempt_id: active_id,
+                state_path,
+                state_saved: true,
+                ..
+            }) if active_id == &attempt_id => state_path.clone(),
+            _ => {
+                return Err(rpc_error(
+                    "complete staged apply",
+                    None,
+                    "staged apply attempt ID mismatch or state save is incomplete",
+                ));
+            }
+        };
+        let profile = sync::finish_staged_apply_attempt_profiled(&state_path, &attempt_id)
+            .map_err(|e| rpc_report_error("complete staged apply", Some(&state_path), e))?;
+        self.staged_apply = None;
+        Ok(profile)
     }
 }
 
@@ -1197,62 +1362,8 @@ impl DuetServer for DuetServerImpl {
         stream_id: ApplyStreamId,
         attempt_id: String,
     ) -> Result<sync::PreparedApplyReport, RPCError> {
-        let state_path = match &self.staged_apply {
-            Some(StagedApplyState::Preparing {
-                attempt_id: active_id,
-                state_path,
-                stream_id: Some(active_stream),
-            }) if active_id == &attempt_id && active_stream == &stream_id => state_path.clone(),
-            Some(StagedApplyState::Preparing {
-                attempt_id: active_id,
-                ..
-            }) => {
-                return Err(rpc_error(
-                    "finish staged prepare",
-                    None,
-                    format!(
-                        "staged apply attempt or stream mismatch; active attempt is {active_id}"
-                    ),
-                ));
-            }
-            _ => {
-                return Err(rpc_error(
-                    "finish staged prepare",
-                    None,
-                    "staged apply attempt is not preparing",
-                ));
-            }
-        };
-        let stream = self.apply_streams.remove(&stream_id).ok_or_else(|| {
-            rpc_error(
-                "finish staged prepare",
-                Some(&state_path),
-                "staged apply stream does not exist",
-            )
-        })?;
-        let ApplyStream::Staged(applier) = stream else {
-            self.apply_streams.insert(stream_id, stream);
-            return Err(rpc_error(
-                "finish staged prepare",
-                Some(&state_path),
-                "apply stream is not staged",
-            ));
-        };
-        self.staged_apply = Some(StagedApplyState::Preparing {
-            attempt_id: attempt_id.clone(),
-            state_path: state_path.clone(),
-            stream_id: None,
-        });
-        let prepared = applier
-            .finish_preparation()
-            .map_err(|e| rpc_report_error("finish staged preparation", Some(&state_path), e))?;
-        let report = prepared.report();
-        self.staged_apply = Some(StagedApplyState::Prepared {
-            attempt_id,
-            state_path,
-            prepared,
-        });
-        Ok(report)
+        self.finish_staged_prepare_inner(stream_id, attempt_id)
+            .map(|(report, _)| report)
     }
 
     fn abort_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError> {
@@ -1415,69 +1526,12 @@ impl DuetServer for DuetServerImpl {
         attempt_id: String,
         strong: bool,
     ) -> Result<(), RPCError> {
-        let (state_path, state_save_started, state_saved) = match &self.staged_apply {
-            Some(StagedApplyState::Committed {
-                attempt_id: active_id,
-                state_path,
-                state_save_started,
-                state_saved,
-            }) if active_id == &attempt_id => {
-                (state_path.clone(), *state_save_started, *state_saved)
-            }
-            _ => {
-                return Err(rpc_error(
-                    "save staged state",
-                    None,
-                    "staged apply attempt ID mismatch or attempt is not committed",
-                ));
-            }
-        };
-        if state_saved {
-            return Ok(());
-        }
-        if !state_save_started {
-            sync::mark_staged_apply_attempt_state_save(&state_path, &attempt_id)
-                .map_err(|e| rpc_report_error("mark staged state save", Some(&state_path), e))?;
-            if let Some(StagedApplyState::Committed {
-                state_save_started, ..
-            }) = &mut self.staged_apply
-            {
-                *state_save_started = true;
-            }
-        }
-        let format = if strong {
-            SnapshotFormat::V2
-        } else {
-            SnapshotFormat::LegacyV1
-        };
-        crate::state::save_entries_as(&state_path, &self.all_old, format)
-            .map_err(|e| rpc_report_error("save staged state", Some(&state_path), e))?;
-        if let Some(StagedApplyState::Committed { state_saved, .. }) = &mut self.staged_apply {
-            *state_saved = true;
-        }
-        Ok(())
+        self.save_staged_state_pending_inner(attempt_id, strong)
+            .map(|_| ())
     }
 
     fn complete_staged_apply(&mut self, attempt_id: String) -> Result<(), RPCError> {
-        let state_path = match &self.staged_apply {
-            Some(StagedApplyState::Committed {
-                attempt_id: active_id,
-                state_path,
-                state_saved: true,
-                ..
-            }) if active_id == &attempt_id => state_path.clone(),
-            _ => {
-                return Err(rpc_error(
-                    "complete staged apply",
-                    None,
-                    "staged apply attempt ID mismatch or state save is incomplete",
-                ));
-            }
-        };
-        sync::finish_staged_apply_attempt(&state_path, &attempt_id)
-            .map_err(|e| rpc_report_error("complete staged apply", Some(&state_path), e))?;
-        self.staged_apply = None;
-        Ok(())
+        self.complete_staged_apply_inner(attempt_id).map(|_| ())
     }
 
     fn staging_filesystem_info(&self) -> Result<sync::StagingFilesystemInfo, RPCError> {
@@ -1511,6 +1565,35 @@ impl DuetServer for DuetServerImpl {
         strong: bool,
     ) -> Result<ChangesV2, RPCError> {
         self.scan_changes(scope, locations, ignore, remote_id, strong)
+    }
+
+    fn finish_staged_prepare_profiled(
+        &mut self,
+        stream_id: ApplyStreamId,
+        attempt_id: String,
+    ) -> Result<
+        (
+            sync::PreparedApplyReport,
+            sync::StagedMarkerLifecycleProfile,
+        ),
+        RPCError,
+    > {
+        self.finish_staged_prepare_inner(stream_id, attempt_id)
+    }
+
+    fn save_staged_state_pending_profiled(
+        &mut self,
+        attempt_id: String,
+        strong: bool,
+    ) -> Result<sync::StagedMarkerLifecycleProfile, RPCError> {
+        self.save_staged_state_pending_inner(attempt_id, strong)
+    }
+
+    fn complete_staged_apply_profiled(
+        &mut self,
+        attempt_id: String,
+    ) -> Result<sync::StagedMarkerLifecycleProfile, RPCError> {
+        self.complete_staged_apply_inner(attempt_id)
     }
 }
 
@@ -1720,6 +1803,15 @@ mod tests {
         assert!(client
             .validate_staged_apply_receipted("attempt".to_string())
             .is_err());
+        assert!(client
+            .finish_staged_prepare_profiled(ApplyStreamId(1), "attempt".to_string())
+            .is_err());
+        assert!(client
+            .save_staged_state_pending_profiled("attempt".to_string(), true)
+            .is_err());
+        assert!(client
+            .complete_staged_apply_profiled("attempt".to_string())
+            .is_err());
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -1757,6 +1849,9 @@ mod tests {
                 ("changes_scope", 47),
                 ("commit_staged_apply_profiled", 48),
                 ("validate_staged_apply_receipted", 49),
+                ("finish_staged_prepare_profiled", 50),
+                ("save_staged_state_pending_profiled", 51),
+                ("complete_staged_apply_profiled", 52),
             ]
         );
     }
@@ -1803,6 +1898,7 @@ mod tests {
                 CAPABILITY_SCAN_EXCLUDES.to_string(),
                 CAPABILITY_STAGED_COMMIT_PROFILE.to_string(),
                 CAPABILITY_STAGED_VALIDATION_RECEIPT.to_string(),
+                CAPABILITY_STAGED_MARKER_PROFILE.to_string(),
             ]
         );
     }
@@ -2079,6 +2175,39 @@ mod tests {
         server
             .complete_staged_apply("attempt-1".to_string())
             .unwrap();
+        assert!(sync::describe_apply_attempt(&state).unwrap().is_none());
+        assert!(server.staged_apply.is_none());
+    }
+
+    #[test]
+    fn profiled_staged_marker_rpcs_preserve_state_transitions_and_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = staged_server(&dir);
+        let stream = server.begin_staged_apply("attempt-1".to_string()).unwrap();
+
+        let (report, prepare_profile) = server
+            .finish_staged_prepare_profiled(stream, "attempt-1".to_string())
+            .unwrap();
+        assert_eq!(report.action_count, 0);
+        assert!(prepare_profile.preparing_to_prepared_us > 0);
+        server.commit_staged_apply("attempt-1".to_string()).unwrap();
+
+        let save_profile = server
+            .save_staged_state_pending_profiled("attempt-1".to_string(), true)
+            .unwrap();
+        assert!(save_profile.committed_to_state_save_us > 0);
+        let repeated = server
+            .save_staged_state_pending_profiled("attempt-1".to_string(), true)
+            .unwrap();
+        assert_eq!(repeated, sync::StagedMarkerLifecycleProfile::default());
+
+        let state = server.remote_state_for_id("peer").unwrap();
+        let finish_profile = server
+            .complete_staged_apply_profiled("attempt-1".to_string())
+            .unwrap();
+        assert!(finish_profile.state_save_to_finished_us > 0);
+        assert!(finish_profile.marker_unlink_us > 0);
+        assert!(finish_profile.marker_parent_sync_us > 0);
         assert!(sync::describe_apply_attempt(&state).unwrap().is_none());
         assert!(server.staged_apply.is_none());
     }

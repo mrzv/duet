@@ -619,6 +619,20 @@ fn performance_profile_reports_human_and_json_output() {
         "{}",
         stdout
     );
+    for phase in [
+        "staged_local_marker_preparing_to_prepared",
+        "staged_remote_marker_preparing_to_prepared",
+        "staged_local_marker_committed_to_state_save",
+        "staged_remote_marker_committed_to_state_save",
+        "staged_local_marker_state_save_to_finished",
+        "staged_remote_marker_state_save_to_finished",
+        "staged_local_marker_unlink",
+        "staged_remote_marker_unlink",
+        "staged_local_marker_parent_sync",
+        "staged_remote_marker_parent_sync",
+    ] {
+        assert!(stdout.contains(phase), "missing {} in {}", phase, stdout);
+    }
     assert!(stdout.contains("signatures:"), "{}", stdout);
     assert!(stdout.contains("staging: waves="), "{}", stdout);
     assert!(stdout.contains("stream remote->local"), "{}", stdout);
@@ -644,6 +658,19 @@ fn performance_profile_reports_human_and_json_output() {
         .unwrap()
         .iter()
         .any(|phase| phase["name"] == "staged_remote_commit_forward_apply"));
+    for name in [
+        "staged_local_marker_preparing_to_prepared",
+        "staged_remote_marker_committed_to_state_save",
+        "staged_local_marker_state_save_to_finished",
+        "staged_remote_marker_unlink",
+        "staged_local_marker_parent_sync",
+    ] {
+        assert!(profile["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|phase| phase["name"] == name));
+    }
     assert!(profile["sync_tuning"].is_object());
     let counters = &profile["counters"];
     assert_eq!(counters["streamed_details"], true);

@@ -8,6 +8,7 @@
 - Retained and identity-checked the V2 preparing-marker descriptor while staging outputs, avoiding repeated marker opens without changing content validation or durability barriers.
 - Cached immutable staged-output identities and reused validated destination-parent identities, avoiding redundant metadata syscalls while preserving publication, content, metadata, recovery, and durability checks.
 - Reused a single-use validated staged-output receipt to skip only the duplicate commit-start staged-file hash; commit still fully validates targets and capacity, and publication still rehashes each staged output immediately before mutation.
+- Added local and remote staged-marker lifecycle profiling for prepare, state-save, finish, unlink, and marker-directory durability steps without changing synchronization behavior.
 
 ## 0.9.2 - 2026-08-09
 

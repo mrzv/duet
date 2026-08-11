@@ -806,6 +806,7 @@ pub async fn sync(
                 apply_options,
                 remote_stream_performance_enabled(profiling_enabled, &remote_info),
                 has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
+                remote_uses_staged_marker_profile(&remote_info),
                 Some(&wave_attempt_id),
                 Some(options.staging_policy),
                 Some(&interrupt),
@@ -823,10 +824,24 @@ pub async fn sync(
                 mut prepared,
                 local_report,
                 remote_report,
+                local_marker_profile,
+                remote_marker_profile,
             } = stream_result.outcome
             else {
                 unreachable!("staged stream returned legacy outcome");
             };
+            record_staged_marker_profile(
+                &mut performance,
+                "staged_local_marker",
+                local_marker_profile,
+            );
+            if remote_uses_staged_marker_profile(&remote_info) {
+                record_staged_marker_profile(
+                    &mut performance,
+                    "staged_remote_marker",
+                    remote_marker_profile,
+                );
+            }
             if let Err(error) = validate_staged_prepare_barrier(
                 &local_report,
                 wave_actions.len(),
@@ -1019,7 +1034,15 @@ pub async fn sync(
                 wave_index + 1,
                 plan.waves.len(),
             ));
-            sync_ops::mark_staged_apply_attempt_state_save(&local_state, &wave_attempt_id)?;
+            let local_marker_profile = sync_ops::mark_staged_apply_attempt_state_save_profiled(
+                &local_state,
+                &wave_attempt_id,
+            )?;
+            record_staged_marker_profile(
+                &mut performance,
+                "staged_local_marker",
+                local_marker_profile,
+            );
             let state_save_start = Instant::now();
             let local_state_display = local_state.display().to_string();
             let local_state_for_save = local_state.clone();
@@ -1027,9 +1050,19 @@ pub async fn sync(
             let (remote_result, local_result) = tokio::join!(
                 async {
                     let start = Instant::now();
-                    let result = remote
-                        .save_staged_state_pending(wave_attempt_id.clone(), strong)
-                        .await;
+                    let result = if remote_uses_staged_marker_profile(&remote_info) {
+                        remote
+                            .save_staged_state_pending_profiled(
+                                wave_attempt_id.clone(),
+                                strong,
+                            )
+                            .await
+                    } else {
+                        remote
+                            .save_staged_state_pending(wave_attempt_id.clone(), strong)
+                            .await
+                            .map(|()| sync_ops::StagedMarkerLifecycleProfile::default())
+                    };
                     (result, start.elapsed())
                 },
                 tokio::task::spawn_blocking(move || {
@@ -1053,20 +1086,49 @@ pub async fn sync(
                 )
             })?;
             let (remote_result, remote_state_save_duration) = remote_result;
-            remote_result
+            let remote_marker_profile = remote_result
                 .map_err(|e| post_state_save_rpc_error("failed to save remote state", e))?;
+            if remote_uses_staged_marker_profile(&remote_info) {
+                record_staged_marker_profile(
+                    &mut performance,
+                    "staged_remote_marker",
+                    remote_marker_profile,
+                );
+            }
             lifecycle_progress.set_message(staged_lifecycle_message(
                 "finalizing checkpoint",
                 wave_index + 1,
                 plan.waves.len(),
             ));
-            remote
-                .complete_staged_apply(wave_attempt_id.clone())
-                .await
-                .map_err(|e| {
+            let remote_marker_profile = if remote_uses_staged_marker_profile(&remote_info) {
+                remote
+                    .complete_staged_apply_profiled(wave_attempt_id.clone())
+                    .await
+            } else {
+                remote
+                    .complete_staged_apply(wave_attempt_id.clone())
+                    .await
+                    .map(|()| sync_ops::StagedMarkerLifecycleProfile::default())
+            }
+            .map_err(|e| {
                     post_state_save_rpc_error("failed to complete remote staged apply", e)
                 })?;
-            sync_ops::finish_staged_apply_attempt(&local_state, &wave_attempt_id)?;
+            let local_marker_profile = sync_ops::finish_staged_apply_attempt_profiled(
+                &local_state,
+                &wave_attempt_id,
+            )?;
+            record_staged_marker_profile(
+                &mut performance,
+                "staged_local_marker",
+                local_marker_profile,
+            );
+            if remote_uses_staged_marker_profile(&remote_info) {
+                record_staged_marker_profile(
+                    &mut performance,
+                    "staged_remote_marker",
+                    remote_marker_profile,
+                );
+            }
             drop(lifecycle_progress);
             record_phase_aggregate(
                 &mut performance,
@@ -1121,6 +1183,7 @@ pub async fn sync(
             apply_options,
             remote_stream_performance_enabled(profiling_enabled, &remote_info),
             has_remote_capability(&remote_info, rpc::CAPABILITY_FILE_BYTE_CHUNKS),
+            false,
             None,
             None,
             None,
@@ -2012,6 +2075,8 @@ enum StreamApplyOutcome {
         prepared: sync_ops::PreparedApply,
         local_report: sync_ops::PreparedApplyReport,
         remote_report: sync_ops::PreparedApplyReport,
+        local_marker_profile: sync_ops::StagedMarkerLifecycleProfile,
+        remote_marker_profile: sync_ops::StagedMarkerLifecycleProfile,
     },
 }
 
@@ -2120,6 +2185,29 @@ fn record_staged_commit_profile(
     }
 }
 
+fn record_staged_marker_profile(
+    performance: &mut PerformanceProfile,
+    prefix: &str,
+    profile: sync_ops::StagedMarkerLifecycleProfile,
+) {
+    for (suffix, micros) in [
+        ("preparing_to_prepared", profile.preparing_to_prepared_us),
+        (
+            "committed_to_state_save",
+            profile.committed_to_state_save_us,
+        ),
+        ("state_save_to_finished", profile.state_save_to_finished_us),
+        ("unlink", profile.marker_unlink_us),
+        ("parent_sync", profile.marker_parent_sync_us),
+    ] {
+        record_phase_aggregate(
+            performance,
+            &format!("{prefix}_{suffix}"),
+            Duration::from_micros(micros),
+        );
+    }
+}
+
 fn merge_streaming_profile(target: &mut StreamingProfile, source: StreamingProfile) {
     merge_transfer_stats(&mut target.remote_to_local, source.remote_to_local);
     merge_transfer_stats(&mut target.local_to_remote, source.local_to_remote);
@@ -2196,6 +2284,7 @@ async fn stream_detailed_changes<R>(
     apply_options: sync_ops::ApplyOptions,
     remote_stream_performance: bool,
     file_byte_chunks: bool,
+    staged_marker_profile: bool,
     staged_attempt_id: Option<&str>,
     staging_policy: Option<sync_ops::StagingPolicy>,
     interrupt: Option<&InterruptState>,
@@ -2251,6 +2340,7 @@ where
         apply_options,
         remote_stream_performance,
         file_byte_chunks,
+        staged_marker_profile,
         staged_attempt_id,
         staging_policy,
         staged_remote_apply_stream,
@@ -2317,6 +2407,7 @@ async fn stream_detailed_changes_started<R>(
     apply_options: sync_ops::ApplyOptions,
     remote_stream_performance: bool,
     file_byte_chunks: bool,
+    staged_marker_profile: bool,
     staged_attempt_id: Option<&str>,
     staging_policy: Option<sync_ops::StagingPolicy>,
     staged_remote_apply_stream: Option<sync_ops::ApplyStreamId>,
@@ -2490,8 +2581,8 @@ where
         return Ok(StreamDetailedChangesRun::Interrupted);
     }
     let outcome = if let Some(attempt_id) = staged_attempt_id {
-        let prepared = local_applier
-            .finish_preparation()
+        let (prepared, local_marker_profile) = local_applier
+            .finish_preparation_profiled()
             .wrap_err("Couldn't finish local staged preparation")?;
         if interrupt.is_some_and(InterruptState::is_cancel_requested) {
             let local_cleanup = prepared.abort().err();
@@ -2511,15 +2602,24 @@ where
         let local_report = prepared.report();
         local_apply_duration += start.elapsed();
         let start = Instant::now();
-        let remote_report = remote
-            .finish_staged_prepare(remote_apply_stream, attempt_id.to_string())
-            .await
-            .map_err(|e| remote_rpc_error("Couldn't finish remote staged preparation", e))?;
+        let (remote_report, remote_marker_profile) = if staged_marker_profile {
+            remote
+                .finish_staged_prepare_profiled(remote_apply_stream, attempt_id.to_string())
+                .await
+        } else {
+            remote
+                .finish_staged_prepare(remote_apply_stream, attempt_id.to_string())
+                .await
+                .map(|report| (report, sync_ops::StagedMarkerLifecycleProfile::default()))
+        }
+        .map_err(|e| remote_rpc_error("Couldn't finish remote staged preparation", e))?;
         remote_apply_duration += start.elapsed();
         StreamApplyOutcome::Staged {
             prepared,
             local_report,
             remote_report,
+            local_marker_profile,
+            remote_marker_profile,
         }
     } else {
         let local_all_old = local_applier
@@ -2828,6 +2928,10 @@ fn has_remote_capability(info: &rpc::ServerInfo, capability: &str) -> bool {
 
 fn remote_uses_receipted_validation(info: &rpc::ServerInfo) -> bool {
     has_remote_capability(info, rpc::CAPABILITY_STAGED_VALIDATION_RECEIPT)
+}
+
+fn remote_uses_staged_marker_profile(info: &rpc::ServerInfo) -> bool {
+    has_remote_capability(info, rpc::CAPABILITY_STAGED_MARKER_PROFILE)
 }
 
 fn agreed_capabilities(info: &rpc::ServerInfo) -> Vec<&'static str> {
@@ -4357,6 +4461,41 @@ mod tests {
 
         assert!(!remote_uses_receipted_validation(&legacy));
         assert!(remote_uses_receipted_validation(&receipted));
+    }
+
+    #[test]
+    fn staged_marker_profile_selection_falls_back_for_legacy_servers() {
+        let legacy = rpc::ServerInfo {
+            protocol_version: rpc::PROTOCOL_VERSION,
+            duet_version: "legacy".to_string(),
+            capabilities: Vec::new(),
+        };
+        let profiled = rpc::ServerInfo {
+            capabilities: vec![rpc::CAPABILITY_STAGED_MARKER_PROFILE.to_string()],
+            ..legacy.clone()
+        };
+
+        assert!(!remote_uses_staged_marker_profile(&legacy));
+        assert!(remote_uses_staged_marker_profile(&profiled));
+    }
+
+    #[test]
+    fn staged_marker_profile_aggregates_sub_millisecond_waves() {
+        let mut performance = PerformanceProfile::default();
+        let profile = sync_ops::StagedMarkerLifecycleProfile {
+            preparing_to_prepared_us: 600,
+            ..sync_ops::StagedMarkerLifecycleProfile::default()
+        };
+
+        record_staged_marker_profile(&mut performance, "staged_local_marker", profile);
+        record_staged_marker_profile(&mut performance, "staged_local_marker", profile);
+
+        let phase = performance
+            .phases
+            .iter()
+            .find(|phase| phase.name == "staged_local_marker_preparing_to_prepared")
+            .unwrap();
+        assert_eq!(phase.ms, 1);
     }
 
     #[test]
