@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Changed
+- Replaced staged commit's action-inferred directory durability discovery with an exact identity-checked, descriptor-relative mutation and retirement ledger that records only successfully dirtied namespace parents, retires only descriptor-verified and confirmed-unlinked directories, and syncs remaining obligations deepest-first before syncing accumulated recovery records and entering the committed phase.
 - Parallelized staged-output commit validation with bounded deterministic workers, reduced recovery-marker writes, skipped irrelevant directory durability discovery, and added local/remote staged commit subphase profiling.
 - Reconstructed staged checkpoint manifests with a linear move-based merge and reused immutable commit-plan data across validation, mutation, and durability planning.
 - Retained and identity-checked the V2 preparing-marker descriptor while staging outputs, avoiding repeated marker opens without changing content validation or durability barriers.

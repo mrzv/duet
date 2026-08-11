@@ -3,6 +3,7 @@ use color_eyre::eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::TryFrom;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -3682,6 +3683,523 @@ struct DirectoryIdentity {
     ino: u64,
 }
 
+struct MutationDurabilityLedger {
+    dirty: HashMap<PathBuf, DirectoryIdentity>,
+    #[cfg(test)]
+    sync_hook: Option<Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>>,
+    #[cfg(test)]
+    before_retirement_hook: Option<Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>>,
+    #[cfg(test)]
+    after_retirement_verify_hook: Option<Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>>,
+    #[cfg(test)]
+    before_namespace_mutation_hook: Option<Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>>,
+    #[cfg(test)]
+    after_namespace_mutation_hook: Option<Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>>,
+}
+
+struct MutationDurabilityToken {
+    path: PathBuf,
+    mutation_path: PathBuf,
+    identity: DirectoryIdentity,
+    directory: fs::File,
+    name: std::ffi::CString,
+}
+
+struct DirectoryRetirementToken {
+    path: PathBuf,
+    identity: DirectoryIdentity,
+    directory: fs::File,
+    #[cfg(target_vendor = "apple")]
+    retained_path: Vec<u8>,
+}
+
+impl MutationDurabilityLedger {
+    fn new() -> Self {
+        Self {
+            dirty: HashMap::new(),
+            #[cfg(test)]
+            sync_hook: None,
+            #[cfg(test)]
+            before_retirement_hook: None,
+            #[cfg(test)]
+            after_retirement_verify_hook: None,
+            #[cfg(test)]
+            before_namespace_mutation_hook: None,
+            #[cfg(test)]
+            after_namespace_mutation_hook: None,
+        }
+    }
+
+    fn prepare_parent(&mut self, mutated_path: &Path) -> Result<MutationDurabilityToken> {
+        let parent = output_parent(mutated_path);
+        let name = path_component_cstring(
+            mutated_path.file_name().ok_or_else(|| {
+                eyre!(
+                    "mutation path {} has no final component",
+                    mutated_path.display()
+                )
+            })?,
+            "mutation path component",
+        )?;
+        let directory = open_directory_for_access(parent).wrap_err_with(|| {
+            format!(
+                "unable to open mutation parent directory {}",
+                parent.display()
+            )
+        })?;
+        self.prepare_retained(parent, directory, name, mutated_path.to_path_buf())
+    }
+
+    fn prepare_retained(
+        &mut self,
+        path: &Path,
+        directory: fs::File,
+        name: std::ffi::CString,
+        mutation_path: PathBuf,
+    ) -> Result<MutationDurabilityToken> {
+        let identity = directory_identity(&directory, path, "mutation parent directory")?;
+        verify_path_identity(path, &directory, "mutation parent directory")?;
+        if self
+            .dirty
+            .get(path)
+            .is_some_and(|recorded| *recorded != identity)
+        {
+            return Err(eyre!(
+                "mutation parent path {} no longer refers to its recorded directory",
+                path.display()
+            ));
+        }
+        self.dirty
+            .try_reserve(1)
+            .map_err(|error| eyre!("unable to reserve mutation durability ledger: {error}"))?;
+        Ok(MutationDurabilityToken {
+            path: path.to_path_buf(),
+            mutation_path,
+            identity,
+            directory,
+            name,
+        })
+    }
+
+    fn arm(&mut self, token: MutationDurabilityToken) -> Result<()> {
+        verify_directory_handle_identity(
+            &token.directory,
+            token.identity,
+            &token.path,
+            "mutation parent directory",
+        )?;
+        verify_path_identity(&token.path, &token.directory, "mutation parent directory")?;
+        self.dirty.insert(token.path, token.identity);
+        Ok(())
+    }
+
+    fn before_namespace_mutation(&self, _path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &self.before_namespace_mutation_hook {
+            hook(_path)?;
+        }
+        Ok(())
+    }
+
+    fn after_namespace_mutation(&self, _path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &self.after_namespace_mutation_hook {
+            hook(_path)?;
+        }
+        Ok(())
+    }
+
+    fn unlink_staged(&mut self, token: MutationDurabilityToken, flags: libc::c_int) -> Result<()> {
+        self.before_namespace_mutation(&token.mutation_path)?;
+        unlinkat(token.directory.as_raw_fd(), &token.name, flags)?;
+        self.after_namespace_mutation(&token.mutation_path)?;
+        self.arm(token)
+    }
+
+    fn unlink_staged_unarmed(
+        &self,
+        token: &MutationDurabilityToken,
+        flags: libc::c_int,
+    ) -> Result<()> {
+        self.before_namespace_mutation(&token.mutation_path)?;
+        unlinkat(token.directory.as_raw_fd(), &token.name, flags)?;
+        self.after_namespace_mutation(&token.mutation_path)
+    }
+
+    fn symlink_staged(&mut self, token: MutationDurabilityToken, target: &Path) -> Result<()> {
+        let target = std::ffi::CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| eyre!("symlink target contains an interior NUL byte"))?;
+        self.before_namespace_mutation(&token.mutation_path)?;
+        cvt(unsafe {
+            libc::symlinkat(
+                target.as_ptr(),
+                token.directory.as_raw_fd(),
+                token.name.as_ptr(),
+            )
+        })?;
+        self.after_namespace_mutation(&token.mutation_path)?;
+        self.arm(token)
+    }
+
+    fn symlink_times_staged(
+        &mut self,
+        token: MutationDurabilityToken,
+        requested_mtime: i64,
+    ) -> Result<u64> {
+        verify_directory_handle_identity(
+            &token.directory,
+            token.identity,
+            &token.path,
+            "symlink metadata parent directory",
+        )?;
+        verify_path_identity(
+            &token.path,
+            &token.directory,
+            "symlink metadata parent directory",
+        )?;
+        let before =
+            fstatat_nofollow(token.directory.as_raw_fd(), &token.name).wrap_err_with(|| {
+                format!(
+                    "failed to read metadata for {}",
+                    token.mutation_path.display()
+                )
+            })?;
+        if before.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            return Err(eyre!(
+                "metadata target {} is not a symlink",
+                token.mutation_path.display()
+            ));
+        }
+        let mtime_sec = libc::time_t::try_from(requested_mtime).map_err(|_| {
+            eyre!(
+                "symlink mtime {} is out of range for {}",
+                requested_mtime,
+                token.mutation_path.display()
+            )
+        })?;
+        let times = [
+            stat_atime_timespec(&before),
+            libc::timespec {
+                tv_sec: mtime_sec,
+                tv_nsec: 0,
+            },
+        ];
+        self.before_namespace_mutation(&token.mutation_path)?;
+        // A concurrent final-component replacement may receive this update, but
+        // the exact post-stat below rejects it before the ledger can be armed.
+        let update = cvt(unsafe {
+            libc::utimensat(
+                token.directory.as_raw_fd(),
+                token.name.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+        .wrap_err_with(|| format!("failed to set time for {}", token.mutation_path.display()));
+        let restore = self.after_namespace_mutation(&token.mutation_path);
+        update?;
+        restore?;
+        verify_directory_handle_identity(
+            &token.directory,
+            token.identity,
+            &token.path,
+            "symlink metadata parent directory",
+        )?;
+        verify_path_identity(
+            &token.path,
+            &token.directory,
+            "symlink metadata parent directory",
+        )?;
+        let after =
+            fstatat_nofollow(token.directory.as_raw_fd(), &token.name).wrap_err_with(|| {
+                format!(
+                    "failed to verify metadata for {}",
+                    token.mutation_path.display()
+                )
+            })?;
+        let after_atime = stat_atime_timespec(&after);
+        let after_mtime = stat_mtime_timespec(&after);
+        if after.st_mode & libc::S_IFMT != libc::S_IFLNK
+            || after.st_mode & libc::S_IFMT != before.st_mode & libc::S_IFMT
+            || after.st_dev != before.st_dev
+            || after.st_ino != before.st_ino
+            || after_atime.tv_sec != times[0].tv_sec
+            || after_atime.tv_nsec != times[0].tv_nsec
+            || after_mtime.tv_sec != times[1].tv_sec
+            || after_mtime.tv_nsec != times[1].tv_nsec
+        {
+            return Err(eyre!(
+                "symlink metadata target {} changed identity or did not preserve exact timestamps",
+                token.mutation_path.display()
+            ));
+        }
+        let ino = before.st_ino as u64;
+        self.arm(token)?;
+        Ok(ino)
+    }
+
+    fn mkdir_staged(&mut self, token: MutationDurabilityToken, mode: u32) -> Result<fs::File> {
+        self.before_namespace_mutation(&token.mutation_path)?;
+        cvt(unsafe {
+            libc::mkdirat(
+                token.directory.as_raw_fd(),
+                token.name.as_ptr(),
+                mode as libc::mode_t,
+            )
+        })?;
+        let directory = open_directory_at_for_access(&token.directory, &token.name)?;
+        self.after_namespace_mutation(&token.mutation_path)?;
+        self.arm(token)?;
+        Ok(directory)
+    }
+
+    fn rename_staged_same_parent(
+        &self,
+        token: &MutationDurabilityToken,
+        destination: &std::ffi::CStr,
+    ) -> Result<()> {
+        self.before_namespace_mutation(&token.mutation_path)?;
+        cvt(unsafe {
+            libc::renameat(
+                token.directory.as_raw_fd(),
+                token.name.as_ptr(),
+                token.directory.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        })?;
+        self.after_namespace_mutation(&token.mutation_path)
+    }
+
+    fn mark_synced(&mut self, path: &Path, identity: DirectoryIdentity) {
+        if self.dirty.get(path) == Some(&identity) {
+            self.dirty.remove(path);
+        }
+    }
+
+    fn prepare_retirement(&self, path: &Path) -> Result<DirectoryRetirementToken> {
+        let directory = open_directory_for_access(path)
+            .wrap_err_with(|| format!("unable to open retiring directory {}", path.display()))?;
+        let identity = directory_identity(&directory, path, "retiring directory")?;
+        verify_path_identity(path, &directory, "retiring directory")?;
+        if self
+            .dirty
+            .get(path)
+            .is_some_and(|recorded| *recorded != identity)
+        {
+            return Err(eyre!(
+                "retiring directory path {} does not match its dirty durability identity",
+                path.display()
+            ));
+        }
+        Ok(DirectoryRetirementToken {
+            path: path.to_path_buf(),
+            identity,
+            #[cfg(target_vendor = "apple")]
+            retained_path: retained_directory_path(&directory, path)?,
+            directory,
+        })
+    }
+
+    fn before_retirement(&self, _path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &self.before_retirement_hook {
+            hook(_path)?;
+        }
+        Ok(())
+    }
+
+    fn after_retirement_verify(&self, _path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &self.after_retirement_verify_hook {
+            hook(_path)?;
+        }
+        Ok(())
+    }
+
+    fn retire_matching(&mut self, path: &Path, identity: DirectoryIdentity) -> Result<()> {
+        match self.dirty.get(path) {
+            Some(recorded) if *recorded != identity => Err(eyre!(
+                "retiring directory path {} does not match its dirty durability identity",
+                path.display()
+            )),
+            Some(_) => {
+                self.dirty.remove(path);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn sync_remaining(&mut self) -> Result<()> {
+        let mut dirty = Vec::new();
+        dirty
+            .try_reserve(self.dirty.len())
+            .map_err(|error| eyre!("unable to reserve directory durability barriers: {error}"))?;
+        dirty.extend(
+            self.dirty
+                .iter()
+                .map(|(path, identity)| (path.clone(), *identity)),
+        );
+        dirty.sort_by(|(left, _), (right, _)| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        for (path, identity) in dirty {
+            #[cfg(test)]
+            if let Some(hook) = &self.sync_hook {
+                hook(&path)?;
+            }
+            sync_recorded_directory(&path, identity)?;
+            self.mark_synced(&path, identity);
+        }
+        Ok(())
+    }
+}
+
+impl DirectoryRetirementToken {
+    fn verify_source(&self) -> Result<()> {
+        verify_directory_handle_identity(
+            &self.directory,
+            self.identity,
+            &self.path,
+            "retiring directory",
+        )?;
+        verify_path_identity(&self.path, &self.directory, "retiring directory")
+    }
+
+    fn finish_removed(self, ledger: &mut MutationDurabilityLedger) -> Result<()> {
+        verify_directory_handle_identity(
+            &self.directory,
+            self.identity,
+            &self.path,
+            "removed directory",
+        )?;
+        #[cfg(not(target_vendor = "apple"))]
+        verify_retained_directory_unlinked(&self.directory, &self.path)?;
+        #[cfg(target_vendor = "apple")]
+        verify_retained_directory_unlinked(&self.directory, &self.path, &self.retained_path)?;
+        verify_retired_source_absent(&self.path)?;
+        // This is the final proof available without locking an externally mutable
+        // namespace; a hostile process can still relink after this check.
+        ledger.retire_matching(&self.path, self.identity)
+    }
+
+    fn finish_renamed(
+        self,
+        destination: &Path,
+        ledger: &mut MutationDurabilityLedger,
+    ) -> Result<()> {
+        verify_directory_handle_identity(
+            &self.directory,
+            self.identity,
+            destination,
+            "quarantined directory",
+        )?;
+        verify_path_identity(destination, &self.directory, "quarantined directory")?;
+        verify_retired_source_absent(&self.path)?;
+        ledger.retire_matching(&self.path, self.identity)
+    }
+}
+
+// Unix keeps an open descriptor valid after rmdir. Platforms that clear nlink
+// can distinguish that inode from a renamed original directly. macOS retains
+// the old directory nlink, so F_GETPATH must instead report no live pathname.
+#[cfg(not(target_vendor = "apple"))]
+fn verify_retained_directory_unlinked(directory: &fs::File, path: &Path) -> Result<()> {
+    let metadata = directory
+        .metadata()
+        .wrap_err_with(|| format!("unable to inspect removed directory {}", path.display()))?;
+    if metadata.nlink() != 0 {
+        return Err(eyre!(
+            "removed directory inode for {} is still linked (link count {})",
+            path.display(),
+            metadata.nlink()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn retained_directory_path(directory: &fs::File, path: &Path) -> Result<Vec<u8>> {
+    let mut retained_path = [0_u8; libc::PATH_MAX as usize];
+    let result = unsafe {
+        libc::fcntl(
+            directory.as_raw_fd(),
+            libc::F_GETPATH,
+            retained_path.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error()).wrap_err_with(|| {
+            format!(
+                "unable to capture retiring directory pathname for {}",
+                path.display()
+            )
+        });
+    }
+    let end = retained_path
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(retained_path.len());
+    Ok(retained_path[..end].to_vec())
+}
+
+#[cfg(target_vendor = "apple")]
+fn verify_retained_directory_unlinked(
+    directory: &fs::File,
+    path: &Path,
+    expected_retained_path: &[u8],
+) -> Result<()> {
+    let mut retained_path = [0_u8; libc::PATH_MAX as usize];
+    let result = unsafe {
+        libc::fcntl(
+            directory.as_raw_fd(),
+            libc::F_GETPATH,
+            retained_path.as_mut_ptr(),
+        )
+    };
+    if result == 0 {
+        let end = retained_path
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(retained_path.len());
+        if retained_path[..end] == *expected_retained_path {
+            return Ok(());
+        }
+        return Err(eyre!(
+            "removed directory inode for {} is still linked at {}",
+            path.display(),
+            String::from_utf8_lossy(&retained_path[..end])
+        ));
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error).wrap_err_with(|| {
+            format!(
+                "unable to verify removed directory inode for {}",
+                path.display()
+            )
+        })
+    }
+}
+
+fn verify_retired_source_absent(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .wrap_err_with(|| format!("unable to verify retired directory {}", path.display())),
+        Ok(_) => Err(eyre!(
+            "retired directory source path {} was replaced during mutation",
+            path.display()
+        )),
+    }
+}
+
 fn directory_identity(
     directory: &fs::File,
     path: &Path,
@@ -3938,20 +4456,24 @@ fn complete_apply_phase_planned(
     if has_local_actions && !already_synced.contains(base) {
         sync_directory(&base.join("."))?;
     }
-    if let Some(state_path) = attempt_state {
-        let marker_path = apply_attempt_path(state_path)?;
-        fs::OpenOptions::new()
-            .read(true)
-            .open(&marker_path)
-            .and_then(|file| file.sync_all())
-            .wrap_err_with(|| {
-                format!(
-                    "unable to sync accumulated apply recovery records {}",
-                    marker_path.display()
-                )
-            })?;
-    }
-    Ok(())
+    sync_apply_recovery_records(attempt_state)
+}
+
+fn sync_apply_recovery_records(attempt_state: Option<&Path>) -> Result<()> {
+    let Some(state_path) = attempt_state else {
+        return Ok(());
+    };
+    let marker_path = apply_attempt_path(state_path)?;
+    fs::OpenOptions::new()
+        .read(true)
+        .open(&marker_path)
+        .and_then(|file| file.sync_all())
+        .wrap_err_with(|| {
+            format!(
+                "unable to sync accumulated apply recovery records {}",
+                marker_path.display()
+            )
+        })
 }
 
 fn apply_attempt_description(state_path: &Path, marker_path: &Path, marker: &str) -> String {
@@ -4189,42 +4711,20 @@ struct SourceRead {
 struct CommitPlan {
     removal_policy: RemovalBlockerPolicy,
     removed_destination_paths: HashSet<PathBuf>,
-    metadata_synced_directories: HashSet<PathBuf>,
     readonly_directory_metadata_changes: HashSet<PathBuf>,
     planned_destination_directories: HashSet<PathBuf>,
     metadata_targets: Vec<PathBuf>,
     parent_mutations: Vec<ParentMutation>,
     source_reads: Vec<SourceRead>,
-    durability_candidates: HashSet<PathBuf>,
-    has_local_actions: bool,
 }
 
 impl CommitPlan {
     fn new(
-        base: &Path,
+        _base: &Path,
         actions: &[Action],
         scan_policy: Option<&ScanPolicy>,
         apply_options: ApplyOptions,
     ) -> Result<Self> {
-        let metadata_synced_directories = metadata_synced_directories(base, actions);
-        let mut durability_candidates = HashSet::new();
-        let mut has_local_actions = false;
-        for change in actions.iter().filter_map(applied_change) {
-            has_local_actions = true;
-            let mut path = base.join(change.path());
-            if path != base && !path.pop() {
-                continue;
-            }
-            while path != base {
-                if !metadata_synced_directories.contains(&path) {
-                    durability_candidates.insert(path.clone());
-                }
-                if !path.pop() {
-                    break;
-                }
-            }
-        }
-
         let mut source_reads = Vec::new();
         for action in actions {
             if let Some(kind) = source_detail_kind(action) {
@@ -4253,14 +4753,11 @@ impl CommitPlan {
         Ok(Self {
             removal_policy: RemovalBlockerPolicy::new(scan_policy, apply_options)?,
             removed_destination_paths: removed_destination_paths(actions),
-            metadata_synced_directories,
             readonly_directory_metadata_changes: readonly_directory_metadata_changes(actions),
             planned_destination_directories: planned_destination_directories(actions),
             metadata_targets: apply_metadata_targets(actions),
             parent_mutations: apply_parent_mutations(actions),
             source_reads,
-            durability_candidates,
-            has_local_actions,
         })
     }
 }
@@ -4697,6 +5194,7 @@ fn prune_ignored_removal_blockers(
     removed_paths: &HashSet<PathBuf>,
     policy: &RemovalBlockerPolicy,
     attempt_state: Option<&Path>,
+    mut durability: Option<&mut MutationDurabilityLedger>,
 ) -> Result<()> {
     for entry in fs::read_dir(dirname).wrap_err_with(|| {
         format!(
@@ -4722,7 +5220,14 @@ fn prune_ignored_removal_blockers(
             .wrap_err_with(|| format!("unable to preflight directory entry {}", path.display()))?;
         if removed_paths.contains(relative_path) {
             if file_type.is_dir() {
-                prune_ignored_removal_blockers(base, &path, removed_paths, policy, attempt_state)?;
+                prune_ignored_removal_blockers(
+                    base,
+                    &path,
+                    removed_paths,
+                    policy,
+                    attempt_state,
+                    durability.as_deref_mut(),
+                )?;
             }
             continue;
         }
@@ -4735,13 +5240,30 @@ fn prune_ignored_removal_blockers(
                         format!("failed to read sync base metadata for {}", base.display())
                     })?
                     .dev();
-                remove_ignored_dir_all_same_device(base, &path, base_dev, policy, attempt_state)
-                    .wrap_err_with(|| {
-                        format!("failed to prune ignored directory {}", path.display())
-                    })?;
+                remove_ignored_dir_all_same_device(
+                    base,
+                    &path,
+                    base_dev,
+                    policy,
+                    attempt_state,
+                    durability.as_deref_mut(),
+                )
+                .wrap_err_with(|| {
+                    format!("failed to prune ignored directory {}", path.display())
+                })?;
             } else {
-                fs::remove_file(&path)
-                    .wrap_err_with(|| format!("failed to prune file {}", path.display()))?;
+                let token = durability
+                    .as_deref_mut()
+                    .map(|ledger| ledger.prepare_parent(&path))
+                    .transpose()?;
+                if let (Some(ledger), Some(token)) = (durability.as_deref_mut(), token) {
+                    ledger
+                        .unlink_staged(token, 0)
+                        .wrap_err_with(|| format!("failed to prune file {}", path.display()))?;
+                } else {
+                    fs::remove_file(&path)
+                        .wrap_err_with(|| format!("failed to prune file {}", path.display()))?;
+                }
             }
             record_committed_step(attempt_state, "prune-blocker", &relative_path.to_path_buf())?;
         } else {
@@ -4853,18 +5375,54 @@ fn remove_ignored_dir_all_same_device(
     base_dev: u64,
     policy: &RemovalBlockerPolicy,
     attempt_state: Option<&Path>,
+    mut durability: Option<&mut MutationDurabilityLedger>,
 ) -> Result<()> {
     preflight_prunable_ignored_dir(base, path, base_dev, policy)?;
 
     let temp_path = ignored_prune_temp_path(path)?;
+    let temp_name = path_component_cstring(
+        temp_path
+            .file_name()
+            .ok_or_else(|| eyre!("ignored prune path has no final component"))?,
+        "ignored prune path component",
+    )?;
+    let token = durability
+        .as_deref_mut()
+        .map(|ledger| ledger.prepare_parent(path))
+        .transpose()?;
+    let retirement = durability
+        .as_deref()
+        .map(|ledger| ledger.prepare_retirement(path))
+        .transpose()?;
     record_staged_file(attempt_state, &temp_path)?;
-    fs::rename(path, &temp_path).wrap_err_with(|| {
-        format!(
-            "failed to move ignored directory {} aside for pruning",
-            path.display()
-        )
-    })?;
-    remove_quarantined_ignored_path(&temp_path, base_dev)
+    if let (Some(ledger), Some(retirement)) = (durability.as_deref(), retirement.as_ref()) {
+        ledger.before_retirement(path)?;
+        retirement.verify_source()?;
+    }
+    if let (Some(ledger), Some(token)) = (durability.as_deref(), token.as_ref()) {
+        ledger
+            .rename_staged_same_parent(token, &temp_name)
+            .wrap_err_with(|| {
+                format!(
+                    "failed to move ignored directory {} aside for pruning",
+                    path.display()
+                )
+            })?;
+    } else {
+        fs::rename(path, &temp_path).wrap_err_with(|| {
+            format!(
+                "failed to move ignored directory {} aside for pruning",
+                path.display()
+            )
+        })?;
+    }
+    if let Some(ledger) = durability.as_deref_mut() {
+        retirement
+            .expect("staged prune retirement is prepared")
+            .finish_renamed(&temp_path, ledger)?;
+        ledger.arm(token.expect("staged prune token is prepared"))?;
+    }
+    remove_quarantined_ignored_path(&temp_path, base_dev, durability)
 }
 
 fn ignored_prune_temp_path(path: &Path) -> Result<PathBuf> {
@@ -4899,12 +5457,26 @@ fn ignored_prune_temp_path(path: &Path) -> Result<PathBuf> {
     ))
 }
 
-fn remove_quarantined_ignored_path(path: &Path, base_dev: u64) -> Result<()> {
+fn remove_quarantined_ignored_path(
+    path: &Path,
+    base_dev: u64,
+    mut durability: Option<&mut MutationDurabilityLedger>,
+) -> Result<()> {
     let meta = fs::symlink_metadata(path)
         .wrap_err_with(|| format!("failed to read ignored path {}", path.display()))?;
     if !meta.is_dir() {
-        fs::remove_file(path)
-            .wrap_err_with(|| format!("failed to prune ignored file {}", path.display()))?;
+        let token = durability
+            .as_deref_mut()
+            .map(|ledger| ledger.prepare_parent(path))
+            .transpose()?;
+        if let (Some(ledger), Some(token)) = (durability.as_deref_mut(), token) {
+            ledger
+                .unlink_staged(token, 0)
+                .wrap_err_with(|| format!("failed to prune ignored file {}", path.display()))?;
+        } else {
+            fs::remove_file(path)
+                .wrap_err_with(|| format!("failed to prune ignored file {}", path.display()))?;
+        }
         return Ok(());
     }
     if meta.dev() != base_dev {
@@ -4927,15 +5499,51 @@ fn remove_quarantined_ignored_path(path: &Path, base_dev: u64) -> Result<()> {
         let child_meta = fs::symlink_metadata(&child)
             .wrap_err_with(|| format!("failed to read ignored path {}", child.display()))?;
         if child_meta.is_dir() {
-            remove_quarantined_ignored_path(&child, base_dev)?;
+            remove_quarantined_ignored_path(&child, base_dev, durability.as_deref_mut())?;
         } else {
-            fs::remove_file(&child)
-                .wrap_err_with(|| format!("failed to prune ignored file {}", child.display()))?;
+            let token = durability
+                .as_deref_mut()
+                .map(|ledger| ledger.prepare_parent(&child))
+                .transpose()?;
+            if let (Some(ledger), Some(token)) = (durability.as_deref_mut(), token) {
+                ledger.unlink_staged(token, 0).wrap_err_with(|| {
+                    format!("failed to prune ignored file {}", child.display())
+                })?;
+            } else {
+                fs::remove_file(&child).wrap_err_with(|| {
+                    format!("failed to prune ignored file {}", child.display())
+                })?;
+            }
         }
     }
 
-    fs::remove_dir(path)
-        .wrap_err_with(|| format!("failed to prune ignored directory {}", path.display()))?;
+    let token = durability
+        .as_deref_mut()
+        .map(|ledger| ledger.prepare_parent(path))
+        .transpose()?;
+    let retirement = durability
+        .as_deref()
+        .map(|ledger| ledger.prepare_retirement(path))
+        .transpose()?;
+    if let (Some(ledger), Some(retirement)) = (durability.as_deref(), retirement.as_ref()) {
+        ledger.before_retirement(path)?;
+        retirement.verify_source()?;
+        ledger.after_retirement_verify(path)?;
+    }
+    if let (Some(ledger), Some(token)) = (durability.as_deref(), token.as_ref()) {
+        ledger
+            .unlink_staged_unarmed(token, libc::AT_REMOVEDIR)
+            .wrap_err_with(|| format!("failed to prune ignored directory {}", path.display()))?;
+    } else {
+        fs::remove_dir(path)
+            .wrap_err_with(|| format!("failed to prune ignored directory {}", path.display()))?;
+    }
+    if let Some(ledger) = durability.as_deref_mut() {
+        retirement
+            .expect("staged prune retirement is prepared")
+            .finish_removed(ledger)?;
+        ledger.arm(token.expect("staged prune token is prepared"))?;
+    }
     Ok(())
 }
 
@@ -5769,6 +6377,50 @@ impl StagingArea {
         self.shared.verify_identity()
     }
 
+    fn finish_staged(mut self, ledger: &mut MutationDurabilityLedger) -> Result<()> {
+        self.shared.verify_stage_parent_identity()?;
+        let stage_parent_guard = WritableDirGuard::from_retained(
+            &self.shared.stage_parent_path,
+            &self.shared.stage_parent_directory,
+        )?;
+        self.shared.verify_stage_path_identity()?;
+        self.shared.directory.sync_all().wrap_err_with(|| {
+            format!(
+                "failed to sync temporary directory {}",
+                self.shared.path.display()
+            )
+        })?;
+        self.shared.verify_stage_parent_identity()?;
+        self.shared.verify_stage_path_identity()?;
+        unlinkat(
+            self.shared.stage_parent_directory.as_raw_fd(),
+            &self.shared.name,
+            libc::AT_REMOVEDIR,
+        )
+        .wrap_err_with(|| {
+            format!(
+                "failed to remove temporary directory {}",
+                self.shared.path.display()
+            )
+        })?;
+        self.finished = true;
+        if let Some(guard) = stage_parent_guard {
+            guard.restore()?;
+        }
+
+        sync_retained_directory(
+            &self.shared.stage_parent_path,
+            &self.shared.stage_parent_directory,
+            Some(self.shared.stage_parent_identity),
+            "temporary directory parent",
+        )?;
+        ledger.mark_synced(
+            &self.shared.stage_parent_path,
+            self.shared.stage_parent_identity,
+        );
+        Ok(())
+    }
+
     fn finish(mut self, metadata_synced: &HashSet<PathBuf>) -> Result<HashSet<PathBuf>> {
         self.shared.verify_stage_parent_identity()?;
         let stage_parent_guard = WritableDirGuard::from_retained(
@@ -6150,6 +6802,7 @@ impl TempOutput {
         mut self,
         final_entry: Entry,
         expected: &Entry,
+        mut durability: Option<&mut MutationDurabilityLedger>,
         on_commit: impl FnOnce(&Entry) -> Result<()>,
     ) -> Result<Entry> {
         self.reopen_and_verify_contents(&final_entry, "staged output")?;
@@ -6157,6 +6810,17 @@ impl TempOutput {
         self.prepare_publication_parent()?;
         verify_current_matches_entry(&self.final_path, expected, "rename target")?;
         self.with_publication_parent(|parent_directory| {
+            let token = durability
+                .as_deref_mut()
+                .map(|ledger| {
+                    ledger.prepare_retained(
+                        &self.parent_path,
+                        parent_directory.try_clone()?,
+                        self.final_name.clone(),
+                        self.final_path.clone(),
+                    )
+                })
+                .transpose()?;
             self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
             self.staging.verify_identity()?;
             cvt(unsafe {
@@ -6174,6 +6838,9 @@ impl TempOutput {
                     self.final_path.display()
                 )
             })?;
+            if let (Some(ledger), Some(token)) = (durability.as_deref_mut(), token) {
+                ledger.arm(token)?;
+            }
             on_commit(&final_entry)?;
             let parent_identity = verify_path_identity_and_get(
                 &self.parent_path,
@@ -6191,12 +6858,24 @@ impl TempOutput {
         mut self,
         final_entry: Entry,
         description: &str,
+        mut durability: Option<&mut MutationDurabilityLedger>,
         on_commit: impl FnOnce(&Entry) -> Result<()>,
     ) -> Result<Entry> {
         self.reopen_and_verify_contents(&final_entry, "staged output")?;
         let final_entry = self.prepare_metadata(&final_entry)?;
         self.prepare_publication_parent()?;
         self.with_publication_parent(|parent_directory| {
+            let token = durability
+                .as_deref_mut()
+                .map(|ledger| {
+                    ledger.prepare_retained(
+                        &self.parent_path,
+                        parent_directory.try_clone()?,
+                        self.final_name.clone(),
+                        self.final_path.clone(),
+                    )
+                })
+                .transpose()?;
             self.verify_at_identity(&self.staging.directory, &self.output_name, &self.temp_path)?;
             self.staging.verify_identity()?;
             match cvt(unsafe {
@@ -6225,6 +6904,9 @@ impl TempOutput {
                         )
                     });
                 }
+            }
+            if let (Some(ledger), Some(token)) = (durability.as_deref_mut(), token) {
+                ledger.arm(token)?;
             }
             on_commit(&final_entry)?;
             let parent_identity = verify_path_identity_and_get(
@@ -6263,7 +6945,7 @@ impl TempOutput {
         prepared.output.sync_all()?;
         prepared
             .output
-            .publish_without_replacing(prepared.final_entry, description, |_| Ok(()))
+            .publish_without_replacing(prepared.final_entry, description, None, |_| Ok(()))
     }
 
     #[cfg(test)]
@@ -6663,10 +7345,10 @@ impl FilePublicationBatch {
             };
             match publication {
                 OutputPublication::Replace { expected } => {
-                    output.publish_replacing(final_entry, &expected, on_commit)?;
+                    output.publish_replacing(final_entry, &expected, None, on_commit)?;
                 }
                 OutputPublication::NoReplace { description } => {
-                    output.publish_without_replacing(final_entry, &description, on_commit)?;
+                    output.publish_without_replacing(final_entry, &description, None, on_commit)?;
                 }
             }
         }
@@ -6968,6 +7650,20 @@ fn fstatat_nofollow(directory: RawFd, name: &std::ffi::CStr) -> io::Result<libc:
         )
     })?;
     Ok(unsafe { stat.assume_init() })
+}
+
+fn stat_atime_timespec(stat: &libc::stat) -> libc::timespec {
+    libc::timespec {
+        tv_sec: stat.st_atime,
+        tv_nsec: stat.st_atime_nsec,
+    }
+}
+
+fn stat_mtime_timespec(stat: &libc::stat) -> libc::timespec {
+    libc::timespec {
+        tv_sec: stat.st_mtime,
+        tv_nsec: stat.st_mtime_nsec,
+    }
 }
 
 fn unlink_file_at_identity(
@@ -7830,16 +8526,63 @@ fn ensure_parent_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn ensure_parent_directory_staged(
+    path: &Path,
+    ledger: &mut MutationDurabilityLedger,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let mut missing = Vec::new();
+        let mut current = parent;
+        while !current.try_exists().wrap_err_with(|| {
+            format!(
+                "failed to check destination parent directory {}",
+                current.display()
+            )
+        })? {
+            missing.push(current);
+            current = current.parent().ok_or_else(|| {
+                eyre!(
+                    "destination parent directory {} has no existing ancestor",
+                    parent.display()
+                )
+            })?;
+        }
+        for directory in missing.into_iter().rev() {
+            create_private_directory_staged(directory, ledger)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_private_directory_staged(
+    path: &Path,
+    ledger: &mut MutationDurabilityLedger,
+) -> Result<()> {
+    let token = ledger.prepare_parent(path)?;
+    let directory = ledger
+        .mkdir_staged(token, 0o700)
+        .wrap_err_with(|| format!("failed to create directory {}", path.display()))?;
+    normalize_private_directory_file(&directory, path)
+}
+
 fn create_private_directory(path: &Path) -> Result<()> {
     fs::DirBuilder::new()
         .mode(0o700)
         .create(path)
         .wrap_err_with(|| format!("failed to create directory {}", path.display()))?;
+    normalize_private_directory(path)
+}
+
+fn normalize_private_directory(path: &Path) -> Result<()> {
     let directory = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .wrap_err_with(|| format!("failed to open new directory {}", path.display()))?;
+    normalize_private_directory_file(&directory, path)
+}
+
+fn normalize_private_directory_file(directory: &fs::File, path: &Path) -> Result<()> {
     let meta = directory
         .metadata()
         .wrap_err_with(|| format!("failed to inspect new directory {}", path.display()))?;
@@ -7858,6 +8601,172 @@ fn create_private_directory(path: &Path) -> Result<()> {
                 path.display()
             )
         })
+}
+
+fn update_meta_staged(
+    path: &PathBuf,
+    entry: &Entry,
+    ledger: &mut MutationDurabilityLedger,
+) -> Result<Entry> {
+    if entry.is_symlink() {
+        let token = ledger.prepare_parent(path)?;
+        let ino = ledger.symlink_times_staged(token, entry.mtime())?;
+        let mut result = entry.clone();
+        result.set_ino(ino);
+        return Ok(result);
+    }
+
+    if entry.is_dir() {
+        return update_directory_meta_staged(path, entry, ledger);
+    }
+
+    update_meta(path, entry)
+}
+
+fn update_directory_meta_staged(
+    path: &Path,
+    entry: &Entry,
+    ledger: &mut MutationDurabilityLedger,
+) -> Result<Entry> {
+    let directory = open_directory_for_metadata_staged(path)?;
+    let identity = directory_identity(&directory, path, "metadata target directory")?;
+    verify_path_identity(path, &directory, "metadata target directory")?;
+    if ledger
+        .dirty
+        .get(path)
+        .is_some_and(|recorded| *recorded != identity)
+    {
+        return Err(eyre!(
+            "metadata target directory {} does not match its dirty durability identity",
+            path.display()
+        ));
+    }
+    let metadata = directory
+        .metadata()
+        .wrap_err_with(|| format!("failed to read metadata for {}", path.display()))?;
+    let desired_mode = synced_mode(entry.mode());
+    ledger.before_namespace_mutation(path)?;
+    let update = (|| {
+        set_retained_directory_mode(&directory, desired_mode, path)
+            .wrap_err_with(|| format!("failed to set permissions for {}", path.display()))?;
+        filetime::set_file_handle_times(
+            &directory,
+            Some(filetime::FileTime::from_unix_time(metadata.atime(), 0)),
+            Some(filetime::FileTime::from_unix_time(entry.mtime(), 0)),
+        )
+        .wrap_err_with(|| format!("failed to set time for {}", path.display()))?;
+        sync_exact_directory_descriptor(&directory, path, identity, desired_mode)
+    })();
+    let restore = ledger.after_namespace_mutation(path);
+    update?;
+    restore?;
+    verify_directory_handle_identity(&directory, identity, path, "metadata target directory")?;
+    verify_path_identity(path, &directory, "metadata target directory")?;
+    let final_metadata = directory
+        .metadata()
+        .wrap_err_with(|| format!("failed to verify metadata for {}", path.display()))?;
+    let mut result = entry.clone();
+    result.set_ino(final_metadata.ino());
+    ledger.mark_synced(path, identity);
+    Ok(result)
+}
+
+fn open_directory_for_metadata_staged(path: &Path) -> Result<fs::File> {
+    let access = open_directory_for_access(path)
+        .wrap_err_with(|| format!("failed to open metadata target {}", path.display()))?;
+    let metadata = access
+        .metadata()
+        .wrap_err_with(|| format!("failed to inspect metadata target {}", path.display()))?;
+    let original_mode = metadata.permissions().mode() & 0o7777;
+    let dot = std::ffi::CStr::from_bytes_with_nul(b".\0").expect("dot is a C string");
+    let open_readable = || {
+        openat_file(
+            access.as_raw_fd(),
+            dot,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    let readable = match open_readable() {
+        Ok(readable) => readable,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            set_retained_directory_mode(&access, original_mode | 0o500, path)?;
+            let readable = open_readable();
+            let restore = set_retained_directory_mode(&access, original_mode, path);
+            match (readable, restore) {
+                (Ok(readable), Ok(())) => readable,
+                (Err(error), Ok(())) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!("failed to reopen metadata target {}", path.display())
+                    });
+                }
+                (_, Err(restore)) => {
+                    return Err(restore).wrap_err_with(|| {
+                        format!(
+                            "failed to restore metadata target mode for {}",
+                            path.display()
+                        )
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .wrap_err_with(|| format!("failed to reopen metadata target {}", path.display()));
+        }
+    };
+    verify_same_directory_handles(&access, &readable, path, "metadata target directory")?;
+    verify_path_identity(path, &readable, "metadata target directory")?;
+    Ok(readable)
+}
+
+fn sync_exact_directory_descriptor(
+    directory: &fs::File,
+    path: &Path,
+    identity: DirectoryIdentity,
+    desired_mode: u32,
+) -> Result<()> {
+    match directory.sync_all() {
+        Ok(()) => return Ok(()),
+        Err(error) if access_descriptor_needs_readable_sync(&error) => {}
+        Err(error) => {
+            return Err(error)
+                .wrap_err_with(|| format!("failed to sync metadata for {}", path.display()));
+        }
+    }
+
+    set_retained_directory_mode(directory, desired_mode | 0o500, path)?;
+    let dot = std::ffi::CStr::from_bytes_with_nul(b".\0").expect("dot is a C string");
+    let readable = openat_file(
+        directory.as_raw_fd(),
+        dot,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    );
+    let readable = match readable {
+        Ok(readable) => readable,
+        Err(error) => {
+            let restore = set_retained_directory_mode(directory, desired_mode, path);
+            return match restore {
+                Ok(()) => Err(error).wrap_err_with(|| {
+                    format!("failed to reopen metadata directory {} for syncing", path.display())
+                }),
+                Err(restore) => Err(eyre!(
+                    "failed to reopen metadata directory {} for syncing: {}; additionally failed to restore mode {:04o}: {}",
+                    path.display(),
+                    error,
+                    desired_mode,
+                    restore
+                )),
+            };
+        }
+    };
+    set_retained_directory_mode(directory, desired_mode, path)?;
+    verify_same_directory_handles(directory, &readable, path, "metadata target directory")?;
+    verify_directory_handle_identity(&readable, identity, path, "metadata target directory")?;
+    readable
+        .sync_all()
+        .wrap_err_with(|| format!("failed to sync metadata for {}", path.display()))
 }
 
 enum ApplyState {
@@ -7975,6 +8884,12 @@ pub struct PreparedApply {
     validation_hash_count: Arc<AtomicUsize>,
     #[cfg(test)]
     after_receipt_check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    durability_sync_hook: Option<Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>>,
+    #[cfg(test)]
+    durability_marker_sync_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    after_namespace_mutation_hook: Option<Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8095,6 +9010,23 @@ impl StagedCommitProfile {
 fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u64::MAX as u128) as u64
 }
+
+#[cfg(debug_assertions)]
+fn test_pause_for_marker_observation(variable: &str) {
+    let Some(ms) = std::env::var(variable)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    // Integration tests still synchronize on the durable phase marker and use
+    // the interrupt-aware orchestrator pause. This short hold only keeps the
+    // remote phase observable until its prepare/commit RPC can return.
+    thread::sleep(Duration::from_millis(ms.min(1_000)));
+}
+
+#[cfg(not(debug_assertions))]
+fn test_pause_for_marker_observation(_variable: &str) {}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -8407,6 +9339,7 @@ impl DetailApplier {
                 )?;
             }
             marker_profile.preparing_to_prepared_us = duration_us(started.elapsed());
+            test_pause_for_marker_observation("DUET_TEST_PAUSE_AFTER_STAGED_PREPARE_MS");
             self.recorder = ApplyRecorder::new(self.attempt_state.clone());
         }
         Ok((
@@ -8419,6 +9352,12 @@ impl DetailApplier {
                 validation_hash_count: Arc::new(AtomicUsize::new(0)),
                 #[cfg(test)]
                 after_receipt_check_hook: None,
+                #[cfg(test)]
+                durability_sync_hook: None,
+                #[cfg(test)]
+                durability_marker_sync_hook: None,
+                #[cfg(test)]
+                after_namespace_mutation_hook: None,
             },
             marker_profile,
         ))
@@ -8437,26 +9376,32 @@ impl DetailApplier {
         Ok(())
     }
 
-    fn apply_action_without_detail(&mut self, action_index: usize) -> Result<()> {
+    fn apply_action_without_detail(
+        &mut self,
+        action_index: usize,
+        durability: &mut MutationDurabilityLedger,
+    ) -> Result<()> {
         match &self.actions[action_index] {
             Action::Local(change) | Action::ResolvedLocal((_, _), change) => match change {
                 Change::Removed(e) => {
                     let filename = safe_join(&self.base, e.path())?;
                     if !e.is_dir() {
                         verify_current_matches_entry(&filename, e, "remove target")?;
-                        fs::remove_file(&filename)?;
+                        let token = durability.prepare_parent(&filename)?;
+                        durability.unlink_staged(token, 0)?;
                         self.recorder
                             .record_committed_step("remove-file", e.path())?;
                     }
                 }
                 Change::Added(e) => {
                     let filename = safe_join(&self.base, e.path())?;
-                    ensure_parent_directory(&filename)?;
+                    ensure_parent_directory_staged(&filename, durability)?;
                     if let Some(p) = e.target() {
-                        std::os::unix::fs::symlink(p, &filename)?;
+                        let token = durability.prepare_parent(&filename)?;
+                        durability.symlink_staged(token, p)?;
                         self.recorder
                             .record_committed_step("create-symlink", e.path())?;
-                        let result = update_meta(&filename, e)?;
+                        let result = update_meta_staged(&filename, e, durability)?;
                         assign_local_result(
                             &self.actions,
                             &mut self.local_results,
@@ -8466,7 +9411,7 @@ impl DetailApplier {
                         self.recorder
                             .record_committed_step("update-metadata", e.path())?;
                     } else if e.is_dir() {
-                        create_private_directory(&filename)?;
+                        create_private_directory_staged(&filename, durability)?;
                         self.recorder
                             .record_committed_step("create-dir", e.path())?;
                     } else {
@@ -8485,7 +9430,7 @@ impl DetailApplier {
                             } else {
                                 verify_current_matches_entry(&filename, e1, "metadata target")?;
                             }
-                            let result = update_meta(&filename, e2)?;
+                            let result = update_meta_staged(&filename, e2, durability)?;
                             assign_local_result(
                                 &self.actions,
                                 &mut self.local_results,
@@ -8496,14 +9441,16 @@ impl DetailApplier {
                                 .record_committed_step("update-metadata", e2.path())?;
                         } else {
                             verify_current_matches_entry(&filename, e1, "replace target")?;
-                            fs::remove_file(&filename)?;
+                            let token = durability.prepare_parent(&filename)?;
+                            durability.unlink_staged(token, 0)?;
                             self.recorder
                                 .record_committed_step("remove-file", e1.path())?;
                             if let Some(p) = e2.target() {
-                                std::os::unix::fs::symlink(p, &filename)?;
+                                let token = durability.prepare_parent(&filename)?;
+                                durability.symlink_staged(token, p)?;
                                 self.recorder
                                     .record_committed_step("create-symlink", e2.path())?;
-                                let result = update_meta(&filename, e2)?;
+                                let result = update_meta_staged(&filename, e2, durability)?;
                                 assign_local_result(
                                     &self.actions,
                                     &mut self.local_results,
@@ -8513,7 +9460,7 @@ impl DetailApplier {
                                 self.recorder
                                     .record_committed_step("update-metadata", e2.path())?;
                             } else if e2.is_dir() {
-                                create_private_directory(&filename)?;
+                                create_private_directory_staged(&filename, durability)?;
                                 self.recorder
                                     .record_committed_step("create-dir", e2.path())?;
                             } else {
@@ -8528,14 +9475,16 @@ impl DetailApplier {
                             return Err(eyre!("missing file detail for {}", e2.path().display()));
                         }
                         verify_current_matches_entry(&filename, e1, "replace target")?;
-                        fs::remove_file(&filename)?;
+                        let token = durability.prepare_parent(&filename)?;
+                        durability.unlink_staged(token, 0)?;
                         self.recorder
                             .record_committed_step("remove-symlink", e1.path())?;
                         if let Some(p) = e2.target() {
-                            std::os::unix::fs::symlink(p, &filename)?;
+                            let token = durability.prepare_parent(&filename)?;
+                            durability.symlink_staged(token, p)?;
                             self.recorder
                                 .record_committed_step("create-symlink", e2.path())?;
-                            let result = update_meta(&filename, e2)?;
+                            let result = update_meta_staged(&filename, e2, durability)?;
                             assign_local_result(
                                 &self.actions,
                                 &mut self.local_results,
@@ -8545,7 +9494,7 @@ impl DetailApplier {
                             self.recorder
                                 .record_committed_step("update-metadata", e2.path())?;
                         } else if e2.is_dir() {
-                            create_private_directory(&filename)?;
+                            create_private_directory_staged(&filename, durability)?;
                             self.recorder
                                 .record_committed_step("create-dir", e2.path())?;
                         }
@@ -8741,7 +9690,11 @@ impl DetailApplier {
         Ok(())
     }
 
-    fn publish_prepared_output(&mut self, action_index: usize) -> Result<()> {
+    fn publish_prepared_output(
+        &mut self,
+        action_index: usize,
+        durability: &mut MutationDurabilityLedger,
+    ) -> Result<()> {
         let PreparedOutput {
             output,
             final_entry,
@@ -8749,7 +9702,7 @@ impl DetailApplier {
         } = self.prepared_outputs[action_index]
             .take()
             .ok_or_else(|| eyre!("missing prepared output for action {}", action_index))?;
-        ensure_parent_directory(&output.final_path)?;
+        ensure_parent_directory_staged(&output.final_path, durability)?;
         let actions = &self.actions;
         let action = &actions[action_index];
         let recorder = &mut self.recorder;
@@ -8767,16 +9720,25 @@ impl DetailApplier {
         };
         match publication {
             OutputPublication::Replace { expected } => {
-                output.publish_replacing(final_entry, &expected, on_commit)?;
+                output.publish_replacing(final_entry, &expected, Some(durability), on_commit)?;
             }
             OutputPublication::NoReplace { description } => {
-                output.publish_without_replacing(final_entry, &description, on_commit)?;
+                output.publish_without_replacing(
+                    final_entry,
+                    &description,
+                    Some(durability),
+                    on_commit,
+                )?;
             }
         }
         Ok(())
     }
 
-    fn apply_directory_second_pass(&mut self, plan: &CommitPlan) -> Result<()> {
+    fn apply_directory_second_pass(
+        &mut self,
+        plan: &CommitPlan,
+        durability: &mut MutationDurabilityLedger,
+    ) -> Result<()> {
         for (action_index, action) in self.actions.iter().enumerate().rev() {
             match action {
                 Action::Local(change) | Action::ResolvedLocal((_, _), change) => {
@@ -8793,14 +9755,22 @@ impl DetailApplier {
                                 &plan.removed_destination_paths,
                                 &plan.removal_policy,
                                 self.attempt_state.as_deref(),
+                                Some(durability),
                             )?;
-                            fs::remove_dir(&dirname)?;
+                            let token = durability.prepare_parent(&dirname)?;
+                            let retirement = durability.prepare_retirement(&dirname)?;
+                            durability.before_retirement(&dirname)?;
+                            retirement.verify_source()?;
+                            durability.after_retirement_verify(&dirname)?;
+                            durability.unlink_staged_unarmed(&token, libc::AT_REMOVEDIR)?;
+                            retirement.finish_removed(durability)?;
+                            durability.arm(token)?;
                             self.recorder
                                 .record_committed_step("remove-dir", e.path())?;
                         }
                         Change::Added(e) => {
                             let dirname = safe_join(&self.base, e.path())?;
-                            let result = update_meta(&dirname, e)?;
+                            let result = update_meta_staged(&dirname, e, durability)?;
                             assign_local_result(
                                 &self.actions,
                                 &mut self.local_results,
@@ -8820,7 +9790,7 @@ impl DetailApplier {
                             if e1.is_dir() && e2.is_dir() {
                                 verify_current_matches_entry(&dirname, e1, "metadata target")?;
                             }
-                            let result = update_meta(&dirname, e2)?;
+                            let result = update_meta_staged(&dirname, e2, durability)?;
                             assign_local_result(
                                 &self.actions,
                                 &mut self.local_results,
@@ -9255,21 +10225,30 @@ impl PreparedApply {
             self.inner.recorder = ApplyRecorder::new(self.inner.attempt_state.clone());
         }
         profile.committing_marker_transition_us = duration_us(started.elapsed());
+        let mut durability = MutationDurabilityLedger::new();
+        #[cfg(test)]
+        {
+            durability.sync_hook = self.durability_sync_hook.clone();
+            durability.after_namespace_mutation_hook = self.after_namespace_mutation_hook.clone();
+        }
 
         let started = Instant::now();
         self.inner.action_index = 0;
         for action_index in 0..self.inner.actions.len() {
             if self.inner.prepared_outputs[action_index].is_some() {
-                self.inner.publish_prepared_output(action_index)?;
+                self.inner
+                    .publish_prepared_output(action_index, &mut durability)?;
             } else {
-                self.inner.apply_action_without_detail(action_index)?;
+                self.inner
+                    .apply_action_without_detail(action_index, &mut durability)?;
             }
             self.inner.action_index = action_index + 1;
         }
         profile.forward_apply_publication_us = duration_us(started.elapsed());
 
         let started = Instant::now();
-        self.inner.apply_directory_second_pass(&self.plan)?;
+        self.inner
+            .apply_directory_second_pass(&self.plan, &mut durability)?;
         profile.reverse_directory_pass_us = duration_us(started.elapsed());
 
         let started = Instant::now();
@@ -9281,18 +10260,15 @@ impl PreparedApply {
         profile.manifest_finalization_us = duration_us(started.elapsed());
 
         let started = Instant::now();
-        let already_synced = match self.inner.staging.take() {
-            Some(staging) => staging.finish(&self.plan.metadata_synced_directories)?,
-            None => HashSet::new(),
-        };
-        complete_apply_phase_planned(
-            &self.inner.base,
-            self.inner.attempt_state.as_deref(),
-            &already_synced,
-            &self.plan.metadata_synced_directories,
-            &self.plan.durability_candidates,
-            self.plan.has_local_actions,
-        )?;
+        if let Some(staging) = self.inner.staging.take() {
+            staging.finish_staged(&mut durability)?;
+        }
+        durability.sync_remaining()?;
+        #[cfg(test)]
+        if let Some(hook) = &self.durability_marker_sync_hook {
+            hook();
+        }
+        sync_apply_recovery_records(self.inner.attempt_state.as_deref())?;
         profile.durability_staging_cleanup_us = duration_us(started.elapsed());
 
         let started = Instant::now();
@@ -9307,6 +10283,7 @@ impl PreparedApply {
                 &[ApplyAttemptPhase::Committing],
                 ApplyAttemptPhase::Committed,
             )?;
+            test_pause_for_marker_observation("DUET_TEST_PAUSE_AFTER_STAGED_COMMIT_MS");
         }
         profile.committed_marker_transition_us = duration_us(started.elapsed());
         Ok((entries, profile))
@@ -9857,6 +10834,7 @@ fn apply_detailed_changes_with_output_batch(
                             &removed_paths,
                             &removal_policy,
                             attempt_state,
+                            None,
                         )?;
                         fs::remove_dir(&dirname).wrap_err_with(|| {
                             format!("failed to remove directory {}", dirname.display())
@@ -9879,6 +10857,7 @@ fn apply_detailed_changes_with_output_batch(
                                 &removed_paths,
                                 &removal_policy,
                                 attempt_state,
+                                None,
                             )?;
                             fs::remove_dir(&dirname).wrap_err_with(|| {
                                 format!("failed to remove directory {}", dirname.display())
@@ -11399,6 +12378,905 @@ mod tests {
         applier.finish_preparation().unwrap()
     }
 
+    fn ledger_paths(ledger: &MutationDurabilityLedger) -> HashSet<PathBuf> {
+        ledger.dirty.keys().cloned().collect()
+    }
+
+    fn dirty_directory(ledger: &mut MutationDurabilityLedger, directory: &Path) {
+        let child = directory.join("ledger-child");
+        let token = ledger.prepare_parent(&child).unwrap();
+        fs::write(&child, b"x").unwrap();
+        ledger.arm(token).unwrap();
+        let token = ledger.prepare_parent(&child).unwrap();
+        fs::remove_file(&child).unwrap();
+        ledger.arm(token).unwrap();
+    }
+
+    fn install_parent_aba(
+        ledger: &mut MutationDurabilityLedger,
+        trigger: PathBuf,
+        parent: PathBuf,
+        saved: PathBuf,
+        replacement: PathBuf,
+        inspected_replacement: PathBuf,
+    ) {
+        let state = Arc::new(AtomicUsize::new(0));
+        ledger.before_namespace_mutation_hook = Some({
+            let state = Arc::clone(&state);
+            let trigger = trigger.clone();
+            let parent = parent.clone();
+            let saved = saved.clone();
+            let replacement = replacement.clone();
+            Arc::new(move |path| {
+                if path == trigger
+                    && state
+                        .compare_exchange(0, 1, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+                        .is_ok()
+                {
+                    fs::rename(&parent, &saved)?;
+                    fs::rename(&replacement, &parent)?;
+                }
+                Ok(())
+            })
+        });
+        ledger.after_namespace_mutation_hook = Some({
+            let state = Arc::clone(&state);
+            Arc::new(move |path| {
+                if path == trigger
+                    && state
+                        .compare_exchange(1, 2, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+                        .is_ok()
+                {
+                    fs::rename(&parent, &inspected_replacement)?;
+                    fs::rename(&saved, &parent)?;
+                }
+                Ok(())
+            })
+        });
+    }
+
+    #[test]
+    fn staged_descriptor_relative_remove_defeats_parent_aba() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let replacement = dir.path().join("replacement");
+        let saved = dir.path().join("saved");
+        let inspected = dir.path().join("inspected");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(parent.join("file"), b"a").unwrap();
+        fs::write(replacement.join("file"), b"b").unwrap();
+        let path = parent.join("file");
+        let mut ledger = MutationDurabilityLedger::new();
+        let token = ledger.prepare_parent(&path).unwrap();
+        install_parent_aba(
+            &mut ledger,
+            path.clone(),
+            parent.clone(),
+            saved,
+            replacement,
+            inspected.clone(),
+        );
+
+        ledger.unlink_staged(token, 0).unwrap();
+
+        assert!(!path.exists());
+        assert_eq!(fs::read(inspected.join("file")).unwrap(), b"b");
+        assert!(ledger.dirty.contains_key(&parent));
+    }
+
+    #[test]
+    fn staged_descriptor_relative_symlink_create_defeats_parent_aba() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let replacement = dir.path().join("replacement");
+        let saved = dir.path().join("saved");
+        let inspected = dir.path().join("inspected");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let path = parent.join("link");
+        let mut ledger = MutationDurabilityLedger::new();
+        let token = ledger.prepare_parent(&path).unwrap();
+        install_parent_aba(
+            &mut ledger,
+            path.clone(),
+            parent.clone(),
+            saved,
+            replacement,
+            inspected.clone(),
+        );
+
+        ledger.symlink_staged(token, Path::new("target")).unwrap();
+
+        assert_eq!(fs::read_link(&path).unwrap(), Path::new("target"));
+        assert!(!inspected.join("link").exists());
+        assert!(ledger.dirty.contains_key(&parent));
+    }
+
+    #[test]
+    fn staged_descriptor_relative_symlink_metadata_defeats_parent_aba() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let replacement = dir.path().join("replacement");
+        let saved = dir.path().join("saved");
+        let inspected = dir.path().join("inspected");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let path = parent.join("link");
+        let replacement_path = replacement.join("link");
+        std::os::unix::fs::symlink("target", &path).unwrap();
+        std::os::unix::fs::symlink("target", &replacement_path).unwrap();
+        filetime::set_symlink_file_times(
+            &path,
+            filetime::FileTime::from_unix_time(111, 0),
+            filetime::FileTime::from_unix_time(111, 0),
+        )
+        .unwrap();
+        filetime::set_symlink_file_times(
+            &replacement_path,
+            filetime::FileTime::from_unix_time(222, 0),
+            filetime::FileTime::from_unix_time(222, 0),
+        )
+        .unwrap();
+        let entry = Entry::test_symlink_with_mode_and_mtime(
+            PathBuf::from("link"),
+            PathBuf::from("target"),
+            0o120777,
+            333,
+        );
+        let mut ledger = MutationDurabilityLedger::new();
+        install_parent_aba(
+            &mut ledger,
+            path.clone(),
+            parent.clone(),
+            saved,
+            replacement,
+            inspected.clone(),
+        );
+
+        update_meta_staged(&path, &entry, &mut ledger).unwrap();
+
+        let updated = fs::symlink_metadata(&path).unwrap();
+        let untouched = fs::symlink_metadata(inspected.join("link")).unwrap();
+        assert_eq!(updated.atime(), 111);
+        assert_eq!(updated.mtime(), 333);
+        assert_eq!(untouched.mtime(), 222);
+        assert!(ledger.dirty.contains_key(&parent));
+    }
+
+    #[test]
+    fn staged_symlink_metadata_rejects_final_component_aba_before_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("link");
+        let saved = parent.join("saved-link");
+        let replacement = parent.join("replacement-link");
+        std::os::unix::fs::symlink("original", &path).unwrap();
+        std::os::unix::fs::symlink("replacement", &replacement).unwrap();
+        filetime::set_symlink_file_times(
+            &replacement,
+            filetime::FileTime::from_unix_time(222, 0),
+            filetime::FileTime::from_unix_time(222, 0),
+        )
+        .unwrap();
+        let entry = Entry::test_symlink_with_mode_and_mtime(
+            PathBuf::from("link"),
+            PathBuf::from("original"),
+            0o120777,
+            333,
+        );
+        let mut ledger = MutationDurabilityLedger::new();
+        ledger.after_namespace_mutation_hook = Some({
+            let path = path.clone();
+            let saved = saved.clone();
+            let replacement = replacement.clone();
+            Arc::new(move |mutation_path| {
+                if mutation_path == path {
+                    fs::rename(&path, &saved)?;
+                    fs::rename(&replacement, &path)?;
+                }
+                Ok(())
+            })
+        });
+
+        let error = update_meta_staged(&path, &entry, &mut ledger).unwrap_err();
+
+        assert!(error.to_string().contains("changed identity"));
+        assert!(ledger.dirty.is_empty());
+        assert_eq!(fs::read_link(&path).unwrap(), Path::new("replacement"));
+        assert_eq!(fs::symlink_metadata(&path).unwrap().mtime(), 222);
+        assert_eq!(fs::read_link(&saved).unwrap(), Path::new("original"));
+        assert_eq!(fs::symlink_metadata(&saved).unwrap().mtime(), 333);
+    }
+
+    #[test]
+    fn staged_symlink_metadata_component_aba_keeps_marker_committing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir(&base).unwrap();
+        let path = base.join("link");
+        let saved = base.join("saved-link");
+        let replacement = base.join("replacement-link");
+        std::os::unix::fs::symlink("original", &path).unwrap();
+        std::os::unix::fs::symlink("replacement", &replacement).unwrap();
+        filetime::set_symlink_file_times(
+            &path,
+            filetime::FileTime::from_unix_time(111, 0),
+            filetime::FileTime::from_unix_time(111, 0),
+        )
+        .unwrap();
+        filetime::set_symlink_file_times(
+            &replacement,
+            filetime::FileTime::from_unix_time(222, 0),
+            filetime::FileTime::from_unix_time(222, 0),
+        )
+        .unwrap();
+        let old = Entry::test_symlink_with_mode_and_mtime(
+            PathBuf::from("link"),
+            PathBuf::from("original"),
+            0o120777,
+            111,
+        );
+        let new = Entry::test_symlink_with_mode_and_mtime(
+            PathBuf::from("link"),
+            PathBuf::from("original"),
+            0o120777,
+            333,
+        );
+        let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            actions,
+            vec![old],
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        let mut prepared = applier.finish_preparation().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        prepared.after_namespace_mutation_hook = Some({
+            let calls = Arc::clone(&calls);
+            let path = path.clone();
+            let saved = saved.clone();
+            let replacement = replacement.clone();
+            Arc::new(move |mutation_path| {
+                if mutation_path == path && calls.fetch_add(1, AtomicOrdering::SeqCst) == 2 {
+                    fs::rename(&path, &saved)?;
+                    fs::rename(&replacement, &path)?;
+                }
+                Ok(())
+            })
+        });
+
+        let error = prepared.commit().unwrap_err();
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+
+        assert!(error.to_string().contains("changed identity"));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(
+            parse_staged_apply_attempt(&marker).unwrap().phase,
+            ApplyAttemptPhase::Committing
+        );
+        assert_eq!(fs::read_link(&path).unwrap(), Path::new("replacement"));
+        assert_eq!(fs::symlink_metadata(&path).unwrap().mtime(), 222);
+        assert_eq!(fs::read_link(&saved).unwrap(), Path::new("original"));
+        assert_eq!(fs::symlink_metadata(&saved).unwrap().mtime(), 333);
+    }
+
+    #[test]
+    fn staged_symlink_metadata_preserves_nonzero_atime_nanoseconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("link");
+        std::os::unix::fs::symlink("target", &path).unwrap();
+        filetime::set_symlink_file_times(
+            &path,
+            filetime::FileTime::from_unix_time(777, 123_456_789),
+            filetime::FileTime::from_unix_time(111, 0),
+        )
+        .unwrap();
+        let before = fs::symlink_metadata(&path).unwrap();
+        if before.atime_nsec() == 0 {
+            return;
+        }
+        let entry = Entry::test_symlink_with_mode_and_mtime(
+            PathBuf::from("link"),
+            PathBuf::from("target"),
+            0o120777,
+            888,
+        );
+        let mut ledger = MutationDurabilityLedger::new();
+
+        update_meta_staged(&path, &entry, &mut ledger).unwrap();
+
+        let after = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(after.atime(), before.atime());
+        assert_eq!(after.atime_nsec(), before.atime_nsec());
+        assert_eq!(after.mtime(), 888);
+        assert_eq!(after.mtime_nsec(), 0);
+        assert!(ledger.dirty.contains_key(&parent));
+    }
+
+    #[test]
+    fn staged_descriptor_relative_implicit_mkdir_defeats_parent_aba() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let replacement = dir.path().join("replacement");
+        let saved = dir.path().join("saved");
+        let inspected = dir.path().join("inspected");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let path = parent.join("new");
+        let mut ledger = MutationDurabilityLedger::new();
+        install_parent_aba(
+            &mut ledger,
+            path.clone(),
+            parent.clone(),
+            saved,
+            replacement,
+            inspected.clone(),
+        );
+
+        create_private_directory_staged(&path, &mut ledger).unwrap();
+
+        assert!(path.is_dir());
+        assert!(!inspected.join("new").exists());
+        assert!(ledger.dirty.contains_key(&parent));
+    }
+
+    #[test]
+    fn staged_descriptor_relative_prune_file_defeats_parent_aba() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let parent = base.join("parent");
+        let replacement = base.join("replacement");
+        let saved = base.join("saved");
+        let inspected = base.join("inspected");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(parent.join("ignored.tmp"), b"a").unwrap();
+        fs::write(replacement.join("ignored.tmp"), b"b").unwrap();
+        let path = parent.join("ignored.tmp");
+        let policy = RemovalBlockerPolicy::new(
+            Some(&ScanPolicy::with_prune(
+                Vec::new(),
+                Vec::new(),
+                vec!["*.tmp".to_string()],
+            )),
+            ApplyOptions::default(),
+        )
+        .unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+        install_parent_aba(
+            &mut ledger,
+            path.clone(),
+            parent.clone(),
+            saved,
+            replacement,
+            inspected.clone(),
+        );
+
+        prune_ignored_removal_blockers(
+            &base,
+            &parent,
+            &HashSet::new(),
+            &policy,
+            None,
+            Some(&mut ledger),
+        )
+        .unwrap();
+
+        assert!(!path.exists());
+        assert_eq!(fs::read(inspected.join("ignored.tmp")).unwrap(), b"b");
+        assert!(ledger.dirty.contains_key(&parent));
+    }
+
+    #[test]
+    fn staged_exact_directory_metadata_defeats_path_aba() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let replacement = dir.path().join("replacement");
+        let saved = dir.path().join("saved");
+        let inspected = dir.path().join("inspected");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut entry = Entry::test_dir(PathBuf::from("target"));
+        entry.set_mode(0o40700);
+        let mut ledger = MutationDurabilityLedger::new();
+        let identity = directory_path_identity(&target, "test metadata directory").unwrap();
+        ledger.dirty.insert(target.clone(), identity);
+        install_parent_aba(
+            &mut ledger,
+            target.clone(),
+            target.clone(),
+            saved,
+            replacement,
+            inspected.clone(),
+        );
+
+        update_directory_meta_staged(&target, &entry, &mut ledger).unwrap();
+
+        assert_eq!(mode(&target), 0o700);
+        assert_eq!(mode(&inspected), 0o755);
+        assert!(!ledger.dirty.contains_key(&target));
+    }
+
+    fn install_retirement_swap(
+        ledger: &mut MutationDurabilityLedger,
+        target: PathBuf,
+        saved: PathBuf,
+    ) {
+        ledger.before_retirement_hook = Some(Arc::new(move |path| {
+            if path == target {
+                fs::rename(&target, &saved)?;
+                fs::create_dir(&target)?;
+            }
+            Ok(())
+        }));
+    }
+
+    fn install_post_verify_retirement_swap(
+        ledger: &mut MutationDurabilityLedger,
+        target: PathBuf,
+        saved: PathBuf,
+    ) {
+        ledger.after_retirement_verify_hook = Some(Arc::new(move |path| {
+            if path == target {
+                fs::rename(&target, &saved)?;
+                fs::create_dir(&target)?;
+            }
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn staged_deep_publication_records_only_immediate_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let parent = base.join("one/two/three");
+        fs::create_dir_all(&parent).unwrap();
+        let synced = Arc::new(Mutex::new(Vec::new()));
+        let mut prepared = prepared_added_file(base, "one/two/three/file", b"contents");
+        prepared.durability_sync_hook = Some({
+            let synced = Arc::clone(&synced);
+            Arc::new(move |path| {
+                synced.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            })
+        });
+
+        prepared.commit().unwrap();
+
+        assert_eq!(*synced.lock().unwrap(), vec![parent]);
+    }
+
+    #[test]
+    fn staged_regular_metadata_only_has_no_directory_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        fs::write(&path, b"contents").unwrap();
+        let mut entry = test_file_entry("file", b"contents");
+        entry.set_mode(0o100600);
+        let mut ledger = MutationDurabilityLedger::new();
+
+        update_meta_staged(&path, &entry, &mut ledger).unwrap();
+
+        assert!(ledger.dirty.is_empty());
+    }
+
+    #[test]
+    fn staged_directory_metadata_satisfies_then_child_mutation_redirties() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("parent");
+        fs::create_dir(&directory).unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+        let child = directory.join("child");
+        let token = ledger.prepare_parent(&child).unwrap();
+        fs::write(&child, b"x").unwrap();
+        ledger.arm(token).unwrap();
+        assert!(ledger.dirty.contains_key(&directory));
+
+        update_meta_staged(
+            &directory,
+            &Entry::test_dir(PathBuf::from("parent")),
+            &mut ledger,
+        )
+        .unwrap();
+        assert!(!ledger.dirty.contains_key(&directory));
+
+        let later = directory.join("later");
+        let token = ledger.prepare_parent(&later).unwrap();
+        fs::write(&later, b"y").unwrap();
+        ledger.arm(token).unwrap();
+        assert!(ledger.dirty.contains_key(&directory));
+    }
+
+    #[test]
+    fn staged_symlink_mutations_record_exact_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("link");
+        let mut ledger = MutationDurabilityLedger::new();
+
+        let token = ledger.prepare_parent(&path).unwrap();
+        std::os::unix::fs::symlink("first", &path).unwrap();
+        ledger.arm(token).unwrap();
+        update_meta_staged(
+            &path,
+            &Entry::test_symlink(PathBuf::from("parent/link"), PathBuf::from("first")),
+            &mut ledger,
+        )
+        .unwrap();
+        let token = ledger.prepare_parent(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        ledger.arm(token).unwrap();
+        let token = ledger.prepare_parent(&path).unwrap();
+        std::os::unix::fs::symlink("second", &path).unwrap();
+        ledger.arm(token).unwrap();
+
+        assert_eq!(ledger_paths(&ledger), HashSet::from([parent]));
+    }
+
+    #[test]
+    fn staged_implicit_parent_ledger_syncs_deepest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+        ensure_parent_directory_staged(&base.join("a/b/c/file"), &mut ledger).unwrap();
+        assert_eq!(
+            ledger_paths(&ledger),
+            HashSet::from([base.clone(), base.join("a"), base.join("a/b")])
+        );
+        let order = Arc::new(Mutex::new(Vec::new()));
+        ledger.sync_hook = Some({
+            let order = Arc::clone(&order);
+            Arc::new(move |path| {
+                order.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            })
+        });
+
+        ledger.sync_remaining().unwrap();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![base.join("a/b"), base.join("a"), base]
+        );
+    }
+
+    #[test]
+    fn staged_child_then_parent_removal_retires_removed_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let parent = outer.join("parent");
+        fs::create_dir_all(&parent).unwrap();
+        let child = parent.join("child");
+        fs::write(&child, b"x").unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+
+        let token = ledger.prepare_parent(&child).unwrap();
+        fs::remove_file(&child).unwrap();
+        ledger.arm(token).unwrap();
+        let token = ledger.prepare_parent(&parent).unwrap();
+        let retirement = ledger.prepare_retirement(&parent).unwrap();
+        retirement.verify_source().unwrap();
+        fs::remove_dir(&parent).unwrap();
+        retirement.finish_removed(&mut ledger).unwrap();
+        ledger.arm(token).unwrap();
+
+        assert_eq!(ledger_paths(&ledger), HashSet::from([outer]));
+    }
+
+    #[test]
+    fn staged_exact_directory_retirement_removes_matching_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+        dirty_directory(&mut ledger, &target);
+        let retirement = ledger.prepare_retirement(&target).unwrap();
+
+        retirement.verify_source().unwrap();
+        fs::remove_dir(&target).unwrap();
+        retirement.finish_removed(&mut ledger).unwrap();
+
+        assert!(!ledger.dirty.contains_key(&target));
+    }
+
+    #[test]
+    fn staged_retirement_rejects_post_remove_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+        dirty_directory(&mut ledger, &target);
+        let expected = ledger.dirty[&target];
+        let retirement = ledger.prepare_retirement(&target).unwrap();
+
+        retirement.verify_source().unwrap();
+        fs::remove_dir(&target).unwrap();
+        fs::create_dir(&target).unwrap();
+        let error = retirement.finish_removed(&mut ledger).unwrap_err();
+
+        assert!(error.to_string().contains("was replaced"));
+        assert_eq!(ledger.dirty.get(&target), Some(&expected));
+    }
+
+    #[test]
+    fn staged_retirement_rejects_removed_replacement_with_linked_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let saved = dir.path().join("saved");
+        fs::create_dir(&target).unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+        dirty_directory(&mut ledger, &target);
+        let expected = ledger.dirty[&target];
+        let retirement = ledger.prepare_retirement(&target).unwrap();
+
+        retirement.verify_source().unwrap();
+        fs::rename(&target, &saved).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::remove_dir(&target).unwrap();
+        let error = retirement.finish_removed(&mut ledger).unwrap_err();
+
+        assert!(error.to_string().contains("still linked"));
+        assert_eq!(ledger.dirty.get(&target), Some(&expected));
+        assert!(saved.is_dir());
+    }
+
+    #[test]
+    fn staged_tracked_removal_rejects_post_verify_replacement_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let target = base.join("target");
+        let saved = base.join("saved");
+        fs::create_dir_all(&target).unwrap();
+        let old = synced_existing_dir_entry(&base, "target");
+        let actions = vec![Action::Local(Change::Removed(old.clone()))];
+        let plan = CommitPlan::new(&base, &actions, None, ApplyOptions::default()).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(base.clone(), actions, vec![old], None);
+        let mut ledger = MutationDurabilityLedger::new();
+        dirty_directory(&mut ledger, &target);
+        let expected = ledger.dirty[&target];
+        install_post_verify_retirement_swap(&mut ledger, target.clone(), saved.clone());
+
+        let error = applier
+            .apply_directory_second_pass(&plan, &mut ledger)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("still linked"));
+        assert_eq!(ledger.dirty.get(&target), Some(&expected));
+        assert!(!ledger.dirty.contains_key(&base));
+        assert!(!target.exists());
+        assert!(saved.is_dir());
+    }
+
+    #[test]
+    fn staged_tracked_directory_retirement_rejects_pre_remove_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let target = base.join("target");
+        let saved = base.join("saved");
+        fs::create_dir_all(&target).unwrap();
+        let old = synced_existing_dir_entry(&base, "target");
+        let actions = vec![Action::Local(Change::Removed(old.clone()))];
+        let plan = CommitPlan::new(&base, &actions, None, ApplyOptions::default()).unwrap();
+        let mut applier = DetailApplier::new_with_attempt(base, actions, vec![old], None);
+        let mut ledger = MutationDurabilityLedger::new();
+        dirty_directory(&mut ledger, &target);
+        let expected = ledger.dirty[&target];
+        install_retirement_swap(&mut ledger, target.clone(), saved);
+
+        let error = applier
+            .apply_directory_second_pass(&plan, &mut ledger)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("retiring directory"));
+        assert_eq!(ledger.dirty.get(&target), Some(&expected));
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn staged_quarantine_rename_retirement_rejects_source_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let target = base.join("ignored");
+        let saved = base.join("saved");
+        fs::create_dir_all(&target).unwrap();
+        let policy = RemovalBlockerPolicy::new(None, ApplyOptions::default()).unwrap();
+        let base_dev = fs::symlink_metadata(&base).unwrap().dev();
+        let mut ledger = MutationDurabilityLedger::new();
+        dirty_directory(&mut ledger, &target);
+        let expected = ledger.dirty[&target];
+        install_retirement_swap(&mut ledger, target.clone(), saved);
+
+        let error = remove_ignored_dir_all_same_device(
+            &base,
+            &target,
+            base_dev,
+            &policy,
+            None,
+            Some(&mut ledger),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("retiring directory"));
+        assert_eq!(ledger.dirty.get(&target), Some(&expected));
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn staged_recursive_quarantine_retirement_rejects_pre_remove_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("quarantine");
+        let saved = dir.path().join("saved");
+        fs::create_dir(&target).unwrap();
+        let base_dev = fs::symlink_metadata(dir.path()).unwrap().dev();
+        let mut ledger = MutationDurabilityLedger::new();
+        dirty_directory(&mut ledger, &target);
+        let expected = ledger.dirty[&target];
+        install_retirement_swap(&mut ledger, target.clone(), saved);
+
+        let error =
+            remove_quarantined_ignored_path(&target, base_dev, Some(&mut ledger)).unwrap_err();
+
+        assert!(format!("{error:#}").contains("retiring directory"));
+        assert_eq!(ledger.dirty.get(&target), Some(&expected));
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn staged_pruning_retires_quarantined_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let gone = base.join("gone");
+        fs::create_dir_all(gone.join("cache/sub")).unwrap();
+        fs::write(gone.join("direct.tmp"), b"x").unwrap();
+        fs::write(gone.join("cache/sub/data"), b"y").unwrap();
+        let policy = RemovalBlockerPolicy::new(
+            Some(&ScanPolicy::with_prune(
+                Vec::new(),
+                Vec::new(),
+                vec!["*.tmp".to_string(), "cache".to_string()],
+            )),
+            ApplyOptions::default(),
+        )
+        .unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+
+        prune_ignored_removal_blockers(
+            &base,
+            &gone,
+            &HashSet::new(),
+            &policy,
+            None,
+            Some(&mut ledger),
+        )
+        .unwrap();
+        let token = ledger.prepare_parent(&gone).unwrap();
+        let retirement = ledger.prepare_retirement(&gone).unwrap();
+        retirement.verify_source().unwrap();
+        fs::remove_dir(&gone).unwrap();
+        retirement.finish_removed(&mut ledger).unwrap();
+        ledger.arm(token).unwrap();
+
+        assert_eq!(ledger_paths(&ledger), HashSet::from([base]));
+    }
+
+    #[test]
+    fn staged_ledger_fails_closed_on_parent_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        let mut ledger = MutationDurabilityLedger::new();
+        let child = parent.join("child");
+        let token = ledger.prepare_parent(&child).unwrap();
+        fs::write(&child, b"x").unwrap();
+        ledger.arm(token).unwrap();
+        fs::rename(&parent, dir.path().join("old-parent")).unwrap();
+        fs::create_dir(&parent).unwrap();
+
+        let error = ledger.sync_remaining().unwrap_err();
+
+        assert!(format!("{error:#}").contains("recorded directory"));
+    }
+
+    #[test]
+    fn staged_directory_sync_failure_keeps_marker_committing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir_all(base.join("deep")).unwrap();
+        let actions = vec![Action::Local(Change::Added(test_file_entry(
+            "deep/file",
+            b"contents",
+        )))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        stream_file(&mut applier, 0, b"contents").unwrap();
+        let mut prepared = applier.finish_preparation().unwrap();
+        prepared.durability_sync_hook = Some(Arc::new(|_| Err(eyre!("injected sync failure"))));
+
+        let error = prepared.commit().unwrap_err();
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+
+        assert!(error.to_string().contains("injected sync failure"));
+        assert_eq!(
+            parse_staged_apply_attempt(&marker).unwrap().phase,
+            ApplyAttemptPhase::Committing
+        );
+    }
+
+    #[test]
+    fn staged_marker_record_sync_follows_directory_barriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let state = dir.path().join("profile.snp");
+        fs::create_dir_all(base.join("deep")).unwrap();
+        let actions = vec![Action::Local(Change::Added(test_file_entry(
+            "deep/file",
+            b"contents",
+        )))];
+        start_staged_apply_attempt("local", &state, &base, &actions, "attempt-1").unwrap();
+        let mut applier = DetailApplier::new_staged_with_attempt_and_policy(
+            base,
+            actions,
+            Vec::new(),
+            state.clone(),
+            "attempt-1".to_string(),
+            None,
+            ApplyOptions::default(),
+        );
+        stream_file(&mut applier, 0, b"contents").unwrap();
+        let mut prepared = applier.finish_preparation().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        prepared.durability_sync_hook = Some({
+            let events = Arc::clone(&events);
+            Arc::new(move |_| {
+                events.lock().unwrap().push("directory");
+                Ok(())
+            })
+        });
+        prepared.durability_marker_sync_hook = Some({
+            let events = Arc::clone(&events);
+            let state = state.clone();
+            Arc::new(move || {
+                let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+                assert_eq!(
+                    parse_staged_apply_attempt(&marker).unwrap().phase,
+                    ApplyAttemptPhase::Committing
+                );
+                events.lock().unwrap().push("marker");
+            })
+        });
+
+        prepared.commit().unwrap();
+
+        assert_eq!(*events.lock().unwrap(), vec!["directory", "marker"]);
+        let marker = fs::read_to_string(apply_attempt_path(&state).unwrap()).unwrap();
+        assert_eq!(
+            parse_staged_apply_attempt(&marker).unwrap().phase,
+            ApplyAttemptPhase::Committed
+        );
+    }
+
     #[test]
     fn full_staged_validation_returns_stable_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
@@ -11544,7 +13422,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_plan_retains_removal_policy_and_runtime_durability_inputs() {
+    fn commit_plan_retains_removal_policy() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         let actions = vec![
@@ -11565,20 +13443,6 @@ mod tests {
         assert!(plan.removed_destination_paths.contains(Path::new("gone")));
         let kind = plan.removal_policy.classify(Path::new("gone/blocker.tmp"));
         assert!(plan.removal_policy.should_prune(&kind));
-        assert!(plan.durability_candidates.contains(&base.join("parent")));
-
-        fs::create_dir(base.join("parent")).unwrap();
-        fs::set_permissions(base.join("parent"), fs::Permissions::from_mode(0o300)).unwrap();
-        let result = complete_apply_phase_planned(
-            base,
-            None,
-            &HashSet::new(),
-            &plan.metadata_synced_directories,
-            &plan.durability_candidates,
-            plan.has_local_actions,
-        );
-        fs::set_permissions(base.join("parent"), fs::Permissions::from_mode(0o700)).unwrap();
-        result.unwrap();
     }
 
     fn prepared_test_output(
@@ -11598,6 +13462,50 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    #[test]
+    fn regular_publication_ledger_records_descriptor_identity_for_add_and_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let staging = StagingArea::new(base).unwrap();
+        let expected_parent = directory_path_identity(base, "test parent").unwrap();
+        let added = test_file_entry("added", b"new");
+        let PreparedOutput {
+            output,
+            final_entry,
+            ..
+        } = prepared_test_output(base, &staging, &added, b"new");
+        let mut ledger = MutationDurabilityLedger::new();
+
+        output
+            .publish_without_replacing(final_entry, "test target", Some(&mut ledger), |_| Ok(()))
+            .unwrap();
+        assert_eq!(ledger.dirty.get(base), Some(&expected_parent));
+
+        let old = synced_existing_file_entry(base, "replaced", b"old");
+        let replacement = test_file_entry("replaced", b"replacement");
+        let mut output = TempOutput::new(base.join("replaced"), staging.shared()).unwrap();
+        output
+            .file
+            .as_mut()
+            .unwrap()
+            .write_all(b"replacement")
+            .unwrap();
+        output.verify_contents(&replacement, "test output").unwrap();
+        let prepared = output
+            .prepare(
+                &replacement,
+                OutputPublication::Replace {
+                    expected: old.clone(),
+                },
+            )
+            .unwrap();
+        prepared
+            .output
+            .publish_replacing(prepared.final_entry, &old, Some(&mut ledger), |_| Ok(()))
+            .unwrap();
+        assert_eq!(ledger.dirty.get(base), Some(&expected_parent));
     }
 
     struct NoopSyncWorker;
