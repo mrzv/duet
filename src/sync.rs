@@ -397,10 +397,12 @@ fn validate_staging_group_side(
             return Ok((true, true));
         }
         return Err(eyre!(
-            "{side} staging dependency group at {} requires {required} logical bytes, but only {} bytes are usable after reserving {} bytes; only an isolated single COW diff may rely on prepare-time physical-space monitoring",
+            "not enough free space for {side} staging at {}: this dependency group needs {}, but only {} is available above the configured minimum free-space reserve of {}.\n{}\nThis dependency group cannot be split further. The only exception is an isolated modified file that can use filesystem copy-on-write and prepare-time physical-space monitoring.",
             path.display(),
-            budget.usable_bytes,
-            budget.reserve_bytes
+            format_staging_bytes(required),
+            format_staging_bytes(budget.usable_bytes),
+            format_staging_bytes(budget.reserve_bytes),
+            staging_reserve_guidance(side, budget.reserve_bytes)
         ));
     }
     if required <= budget.budget_bytes {
@@ -414,6 +416,41 @@ fn validate_staging_group_side(
         ));
     }
     Ok((true, false))
+}
+
+fn format_staging_bytes(bytes: u64) -> String {
+    const KB: u64 = 1_000;
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000_000_000;
+    const TB: u64 = 1_000_000_000_000;
+    let human = if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else if bytes < GB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes < TB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    };
+    format!("{human} ({bytes} bytes)")
+}
+
+fn staging_reserve_guidance(side: &str, reserve_bytes: u64) -> String {
+    let host = if side == "remote" {
+        "the remote host"
+    } else {
+        "this host"
+    };
+    if reserve_bytes == 0 {
+        return format!(
+            "The staging reserve is already disabled (--staging-reserve 0%), so free disk space on {host} before retrying."
+        );
+    }
+    format!(
+        "The reserve is the minimum space Duet leaves free on {host} (5% of the filesystem's total capacity by default). Free disk space there, or set --staging-reserve <size|percent> below the displayed reserve; --staging-reserve 0% disables it. Absolute sizes such as 10GiB are also accepted."
+    )
 }
 
 fn staging_wave_from_group(
@@ -11687,8 +11724,72 @@ mod tests {
         .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("local"), "{}", message);
-        assert!(message.contains("requires 13"), "{}", message);
-        assert!(message.contains("usable after reserving 7"), "{}", message);
+        assert!(message.contains("needs 13 B (13 bytes)"), "{}", message);
+        assert!(
+            message.contains("minimum free-space reserve of 7 B (7 bytes)"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("below the displayed reserve"),
+            "{}",
+            message
+        );
+        assert!(message.contains("--staging-reserve 0%"), "{}", message);
+    }
+
+    #[test]
+    fn staging_capacity_error_formats_realistic_sizes_and_remote_guidance() {
+        let error = plan_staging_waves(
+            &[remote_file("large", 73_174_082)],
+            staging_budget(100_000_000, 100_000_000),
+            StagingBudget {
+                reserve_bytes: 49_733_129_216,
+                usable_bytes: 0,
+                budget_bytes: 0,
+                cow_clone_supported: false,
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("remote staging at large")
+                && message.contains("73.17 MB (73174082 bytes)")
+                && message.contains("49.73 GB (49733129216 bytes)")
+                && message.contains("remote host"),
+            "{}",
+            message
+        );
+    }
+
+    #[test]
+    fn staging_capacity_error_explains_when_reserve_is_already_disabled() {
+        let message = validate_staging_group_side(
+            "local",
+            1,
+            1,
+            false,
+            false,
+            StagingBudget {
+                reserve_bytes: 0,
+                usable_bytes: 0,
+                budget_bytes: 0,
+                cow_clone_supported: false,
+            },
+            Path::new("file"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("reserve is already disabled"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("below the displayed reserve"),
+            "{}",
+            message
+        );
     }
 
     #[test]
@@ -11714,7 +11815,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("only an isolated single COW diff"));
+            .contains("isolated modified file that can use filesystem copy-on-write"));
     }
 
     #[test]
@@ -11727,7 +11828,7 @@ mod tests {
         .unwrap_err();
         assert!(error
             .to_string()
-            .contains("only an isolated single COW diff"));
+            .contains("isolated modified file that can use filesystem copy-on-write"));
     }
 
     #[test]
@@ -11741,7 +11842,7 @@ mod tests {
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("only an isolated single COW diff"));
+            .contains("isolated modified file that can use filesystem copy-on-write"));
     }
 
     #[test]
