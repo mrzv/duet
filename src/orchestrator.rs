@@ -213,6 +213,46 @@ struct LocalIds {
     legacy: Option<String>,
 }
 
+fn apply_profile_staging_reserve(
+    options: &mut SyncOptions,
+    profile_reserve: Option<sync_ops::StagingReserve>,
+) -> bool {
+    if options.staging_reserve_explicit {
+        return false;
+    }
+    if let Some(reserve) = profile_reserve {
+        options.staging_policy.reserve = reserve;
+        options.staging_policy_explicit = true;
+        return true;
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingPolicySource {
+    Default,
+    CliLimit,
+    CliReserve,
+    CliLimitAndReserve,
+    Profile,
+    CliLimitAndProfile,
+}
+
+impl StagingPolicySource {
+    fn configured_by(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::CliLimit => Some("the --staging-limit option"),
+            Self::CliReserve => Some("the --staging-reserve option"),
+            Self::CliLimitAndReserve => Some("the --staging-limit and --staging-reserve options"),
+            Self::Profile => Some("the profile [staging] reserve setting"),
+            Self::CliLimitAndProfile => {
+                Some("the --staging-limit option and profile [staging] reserve setting")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyStrategy {
     StagedStream,
@@ -229,7 +269,7 @@ impl ApplyStrategy {
 pub async fn sync(
     source: ProfileSource,
     path: Option<PathBuf>,
-    options: SyncOptions,
+    mut options: SyncOptions,
 ) -> Result<SyncOutcome> {
     let interrupt = InterruptState::new();
     install_ctrlc_handler(interrupt.clone())?;
@@ -262,6 +302,23 @@ pub async fn sync(
         remote_state_dir,
         server_log,
     } = context;
+    let cli_staging_limit_explicit = options.staging_policy.limit_bytes.is_some();
+    let cli_staging_reserve_explicit = options.staging_reserve_explicit;
+    let profile_staging_reserve_applied =
+        apply_profile_staging_reserve(&mut options, prf.staging_reserve);
+    let staging_policy_source = match (
+        cli_staging_limit_explicit,
+        cli_staging_reserve_explicit,
+        profile_staging_reserve_applied,
+    ) {
+        (false, false, false) => StagingPolicySource::Default,
+        (true, false, false) => StagingPolicySource::CliLimit,
+        (false, true, false) => StagingPolicySource::CliReserve,
+        (true, true, false) => StagingPolicySource::CliLimitAndReserve,
+        (false, false, true) => StagingPolicySource::Profile,
+        (true, false, true) => StagingPolicySource::CliLimitAndProfile,
+        (_, true, true) => unreachable!("a CLI reserve must override the profile reserve"),
+    };
     let apply_attempt_id = new_apply_attempt_id(&local_id);
     let locations = outbound_scan_locations(&prf.locations);
     let scan_ignore = prf.scan_ignore();
@@ -509,14 +566,14 @@ pub async fn sync(
     let mut apply_strategy = select_apply_strategy(
         &remote_info,
         can_stream_details,
-        options.staging_policy_explicit,
+        staging_policy_source,
     )?;
     if apply_strategy == ApplyStrategy::StagedStream
         && actions_have_directory_to_nondirectory_change(actions.as_ref())
     {
-        if options.staging_policy_explicit {
+        if let Some(configured_by) = staging_policy_source.configured_by() {
             return Err(eyre!(
-                "--staging-limit/--staging-reserve cannot currently be enforced for directory-to-nondirectory replacements"
+                "{configured_by} cannot currently be enforced for directory-to-nondirectory replacements"
             ));
         }
         log::debug!("using legacy stream for a directory-to-nondirectory replacement");
@@ -573,7 +630,7 @@ pub async fn sync(
                     &remote_info,
                     plan.waves.len(),
                     migration,
-                    options.staging_policy_explicit,
+                    staging_policy_source,
                 )? {
                     log::debug!(
                         "falling back to legacy streaming because checkpointed staging is unavailable"
@@ -1535,12 +1592,12 @@ fn remote_stream_performance_enabled(profiling_enabled: bool, info: &rpc::Server
 fn select_apply_strategy(
     info: &rpc::ServerInfo,
     can_stream_details: bool,
-    staging_policy_explicit: bool,
+    staging_policy_source: StagingPolicySource,
 ) -> Result<ApplyStrategy> {
     if !can_stream_details {
-        if staging_policy_explicit {
+        if let Some(configured_by) = staging_policy_source.configured_by() {
             return Err(eyre!(
-                "--staging-limit/--staging-reserve requires a streamable staged apply plan"
+                "{configured_by} requires a streamable staged apply plan"
             ));
         }
         return Ok(ApplyStrategy::LegacyNonStream);
@@ -1551,9 +1608,9 @@ fn select_apply_strategy(
     {
         return Ok(ApplyStrategy::StagedStream);
     }
-    if staging_policy_explicit {
+    if let Some(configured_by) = staging_policy_source.configured_by() {
         return Err(eyre!(
-            "remote duet {} cannot enforce --staging-limit/--staging-reserve; upgrade it to a version supporting {}",
+            "remote duet {} cannot enforce {configured_by}; upgrade it to a version supporting {}",
             info.duet_version,
             rpc::CAPABILITY_STAGING_RESERVE_ENFORCEMENT
         ));
@@ -1565,7 +1622,7 @@ fn can_use_staging_plan(
     info: &rpc::ServerInfo,
     wave_count: usize,
     migration: bool,
-    staging_policy_explicit: bool,
+    staging_policy_source: StagingPolicySource,
 ) -> Result<bool> {
     if wave_count <= 1 {
         return Ok(true);
@@ -1580,9 +1637,9 @@ fn can_use_staging_plan(
     let Some(reason) = unavailable else {
         return Ok(true);
     };
-    if staging_policy_explicit {
+    if let Some(configured_by) = staging_policy_source.configured_by() {
         return Err(eyre!(
-            "staging policy requires {wave_count} waves, but {reason}; increase --staging-limit/free space or upgrade the remote peer"
+            "{configured_by} requires {wave_count} staging waves, but {reason}; increase usable staging capacity or upgrade the remote peer"
         ));
     }
     Ok(false)
@@ -3556,6 +3613,56 @@ mod tests {
     use super::*;
     use crate::scan;
 
+    fn staging_test_options() -> SyncOptions {
+        SyncOptions {
+            interactive: false,
+            yes: false,
+            dry_run: false,
+            batch: true,
+            force: false,
+            verbose: false,
+            debug_info: false,
+            prune_ignored: false,
+            excludes: Vec::new(),
+            profile_performance: false,
+            profile_performance_json: None,
+            staging_policy: sync_ops::StagingPolicy {
+                limit_bytes: Some(123),
+                reserve: sync_ops::StagingReserve::BasisPoints(500),
+            },
+            staging_policy_explicit: true,
+            staging_reserve_explicit: false,
+        }
+    }
+
+    #[test]
+    fn profile_staging_reserve_applies_unless_cli_overrides_it() {
+        let mut options = staging_test_options();
+        assert!(apply_profile_staging_reserve(
+            &mut options,
+            Some(sync_ops::StagingReserve::Bytes(10_000))
+        ));
+        assert_eq!(
+            options.staging_policy,
+            sync_ops::StagingPolicy {
+                limit_bytes: Some(123),
+                reserve: sync_ops::StagingReserve::Bytes(10_000),
+            }
+        );
+        assert!(options.staging_policy_explicit);
+
+        options.staging_reserve_explicit = true;
+        options.staging_policy.reserve = sync_ops::StagingReserve::Bytes(20_000);
+        assert!(!apply_profile_staging_reserve(
+            &mut options,
+            Some(sync_ops::StagingReserve::Bytes(30_000))
+        ));
+        assert_eq!(
+            options.staging_policy.reserve,
+            sync_ops::StagingReserve::Bytes(20_000)
+        );
+    }
+
     #[test]
     fn precommit_interrupt_wins_over_commit() {
         let interrupt = InterruptState::new();
@@ -4061,6 +4168,7 @@ mod tests {
                 locations: Vec::new(),
                 ignore: Vec::new(),
                 prune: Vec::new(),
+                staging_reserve: None,
             },
             local_state: PathBuf::from("profile.snp"),
             remote_state_dir: PathBuf::from("profile.remotes"),
@@ -4279,26 +4387,39 @@ mod tests {
         };
 
         assert_eq!(
-            select_apply_strategy(&staged, true, false).unwrap(),
+            select_apply_strategy(&staged, true, StagingPolicySource::Default).unwrap(),
             ApplyStrategy::StagedStream
         );
         assert_eq!(
-            select_apply_strategy(&staged, false, false).unwrap(),
+            select_apply_strategy(&staged, false, StagingPolicySource::Default).unwrap(),
             ApplyStrategy::LegacyNonStream
         );
-        assert!(select_apply_strategy(&staged, false, true).is_err());
+        assert!(select_apply_strategy(&staged, false, StagingPolicySource::CliLimit).is_err());
         assert_eq!(
-            select_apply_strategy(&legacy, true, false).unwrap(),
+            select_apply_strategy(&legacy, true, StagingPolicySource::Default).unwrap(),
             ApplyStrategy::LegacyStream
         );
         assert_eq!(
-            select_apply_strategy(&staged_without_capacity, true, false).unwrap(),
+            select_apply_strategy(&staged_without_capacity, true, StagingPolicySource::Default,)
+                .unwrap(),
             ApplyStrategy::LegacyStream
         );
-        let error = select_apply_strategy(&staged_without_capacity, true, true)
-            .unwrap_err()
-            .to_string();
+        let error = select_apply_strategy(
+            &staged_without_capacity,
+            true,
+            StagingPolicySource::CliReserve,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains(rpc::CAPABILITY_STAGING_RESERVE_ENFORCEMENT));
+        assert!(error.contains("--staging-reserve"));
+        assert!(!error.contains("--staging-limit/"));
+        let profile_error =
+            select_apply_strategy(&staged_without_capacity, true, StagingPolicySource::Profile)
+                .unwrap_err()
+                .to_string();
+        assert!(profile_error.contains("profile [staging] reserve"));
+        assert!(!profile_error.contains("--staging-limit/--staging-reserve"));
     }
 
     #[test]
@@ -4351,12 +4472,24 @@ mod tests {
             capabilities: vec![rpc::CAPABILITY_CHECKPOINTED_STAGING.to_string()],
         };
 
-        assert!(can_use_staging_plan(&legacy_staged, 1, false, true).unwrap());
-        assert!(!can_use_staging_plan(&legacy_staged, 2, false, false).unwrap());
-        assert!(can_use_staging_plan(&legacy_staged, 2, false, true).is_err());
-        assert!(!can_use_staging_plan(&checkpointed, 2, true, false).unwrap());
-        assert!(can_use_staging_plan(&checkpointed, 2, true, true).is_err());
-        assert!(can_use_staging_plan(&checkpointed, 2, false, true).unwrap());
+        assert!(
+            can_use_staging_plan(&legacy_staged, 1, false, StagingPolicySource::CliLimit).unwrap()
+        );
+        assert!(
+            !can_use_staging_plan(&legacy_staged, 2, false, StagingPolicySource::Default,).unwrap()
+        );
+        assert!(
+            can_use_staging_plan(&legacy_staged, 2, false, StagingPolicySource::CliLimit).is_err()
+        );
+        assert!(
+            !can_use_staging_plan(&checkpointed, 2, true, StagingPolicySource::Default,).unwrap()
+        );
+        assert!(
+            can_use_staging_plan(&checkpointed, 2, true, StagingPolicySource::CliLimit).is_err()
+        );
+        assert!(
+            can_use_staging_plan(&checkpointed, 2, false, StagingPolicySource::CliLimit).unwrap()
+        );
     }
 
     #[test]

@@ -48,6 +48,14 @@ impl SyncCase {
     }
 
     fn new_with_rules(rules: &str) -> Self {
+        Self::new_with_rules_and_reserve(rules, Some("0%"))
+    }
+
+    fn new_without_staging_settings(rules: &str) -> Self {
+        Self::new_with_rules_and_reserve(rules, None)
+    }
+
+    fn new_with_rules_and_reserve(rules: &str, reserve: Option<&str>) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let local = temp.path().join("local");
         let remote = temp.path().join("remote");
@@ -55,14 +63,18 @@ impl SyncCase {
 
         fs::create_dir(&local).unwrap();
         fs::create_dir(&remote).unwrap();
+        let staging = reserve
+            .map(|reserve| format!("\n[staging]\nreserve = {reserve}\n"))
+            .unwrap_or_default();
         fs::write(
             &profile,
             format!(
-                "{}\n{} {}\n{}",
+                "{}\n{} {}\n{}{}",
                 local.display(),
                 duet_bin().display(),
                 remote.display(),
-                rules
+                rules,
+                staging,
             ),
         )
         .unwrap();
@@ -89,6 +101,47 @@ impl SyncCase {
             .output()
             .unwrap()
     }
+}
+
+#[test]
+fn profile_staging_reserve_is_enforced_and_cli_can_override_it() {
+    let case = SyncCase::new_with_rules_and_reserve("+a.txt\n", Some("18EB"));
+    write(&case.local.join("a.txt"), "from local");
+
+    let blocked = case.sync();
+    assert!(!blocked.status.success());
+    let blocked_output = combined_output(&blocked);
+    assert!(
+        blocked_output.contains("minimum free-space reserve"),
+        "{}",
+        blocked_output
+    );
+
+    assert_success(case.sync_with_args(&["--staging-reserve", "0%"]));
+    assert_eq!(read(&case.remote.join("a.txt")), "from local");
+}
+
+#[test]
+fn unconfigured_profile_uses_default_policy_after_bootstrap() {
+    let case = SyncCase::new_without_staging_settings("+a.txt\n");
+    write(&case.local.join("a.txt"), "from local");
+    assert_success(case.sync_with_args(&["--staging-reserve", "0%"]));
+
+    let mut permissions = fs::metadata(case.local.join("a.txt"))
+        .unwrap()
+        .permissions();
+    permissions.set_mode(0o640);
+    fs::set_permissions(case.local.join("a.txt"), permissions).unwrap();
+
+    assert_success(case.sync());
+    assert_eq!(
+        fs::metadata(case.remote.join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
 }
 
 fn duet_bin() -> PathBuf {
@@ -202,8 +255,6 @@ fn checkpointed_staging_runs_multiple_bidirectional_waves() {
     assert_success(case.sync_with_args(&[
         "--staging-limit",
         "4KiB",
-        "--staging-reserve",
-        "0%",
         "--profile-performance-json",
         profile_json.to_str().unwrap(),
     ]));
@@ -229,7 +280,7 @@ fn checkpointed_staging_runs_multiple_bidirectional_waves() {
         assert_eq!(fs::read(case.remote.join(name)).unwrap(), *expected);
     }
 
-    assert_success(case.sync_with_args(&["--staging-limit", "4KiB", "--staging-reserve", "0%"]));
+    assert_success(case.sync_with_args(&["--staging-limit", "4KiB"]));
 }
 
 #[test]
@@ -553,7 +604,7 @@ fn named_profile_debug_info_reports_negotiated_capabilities() {
     fs::write(
         config.join("work.prf"),
         format!(
-            "{}\n{} {}\n+a.txt\n",
+            "{}\n{} {}\n+a.txt\n[staging]\nreserve = 0%\n",
             local.display(),
             duet_bin().display(),
             remote.display()

@@ -88,6 +88,7 @@ Profiles are parsed by `src/profile.rs`. A profile contains:
 - include/exclude location rules
 - optional ignore glob patterns under `[ignore]`
 - optional disposable prune glob patterns under `[prune]`
+- an optional profile-specific minimum free-space reserve under `[staging]`
 
 Duet supports two profile sources:
 

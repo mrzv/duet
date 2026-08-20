@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Added profile-level `[staging]` `reserve = <size|percent>` configuration before the ignore/prune sections, with `--staging-reserve` taking precedence.
+
 ### Changed
 
 - Clarified dependency-group staging-capacity failures with human-readable sizes, the minimum-free-space reserve policy, and actionable `--staging-reserve` guidance.

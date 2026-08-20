@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use shellexpand;
 
 use crate::scan::location::{Location, Locations};
+use crate::sync::StagingReserve;
 
 pub type Ignore = Vec<String>;
 pub type Prune = Vec<String>;
@@ -17,6 +18,7 @@ pub struct Profile {
     pub locations: Locations,
     pub ignore: Ignore,
     pub prune: Prune,
+    pub staging_reserve: Option<StagingReserve>,
 }
 
 impl Profile {
@@ -224,6 +226,7 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
         locations: vec![Location::Exclude(PathBuf::from("."))], // implicitly exclude .
         ignore: Vec::new(),
         prune: Vec::new(),
+        staging_reserve: None,
     };
 
     let mut locations = 0;
@@ -253,6 +256,10 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
             section = ProfileSection::Prune;
             continue;
         }
+        if trimmed == "[staging]" && section == ProfileSection::Locations {
+            section = ProfileSection::Staging;
+            continue;
+        }
 
         match section {
             ProfileSection::Locations => {
@@ -268,6 +275,26 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
             }
             ProfileSection::Ignore => p.ignore.push(line),
             ProfileSection::Prune => p.prune.push(line),
+            ProfileSection::Staging => {
+                let Some((key, value)) = trimmed.split_once('=') else {
+                    return parse_error(&line);
+                };
+                if key.trim() != "reserve" || value.trim().is_empty() {
+                    return parse_error(&line);
+                }
+                if p.staging_reserve.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "duplicate staging reserve setting",
+                    ));
+                }
+                p.staging_reserve = Some(value.trim().parse().map_err(|error: String| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid staging reserve: {error}"),
+                    )
+                })?);
+            }
         }
     }
 
@@ -279,6 +306,7 @@ enum ProfileSection {
     Locations,
     Ignore,
     Prune,
+    Staging,
 }
 
 fn parse_error(line: &str) -> Result<Profile, io::Error> {
@@ -332,6 +360,67 @@ mod tests {
             profile.scan_ignore(),
             vec!["*.tmp".to_string(), "__pycache__".to_string()]
         );
+        assert_eq!(profile.staging_reserve, None);
+    }
+
+    #[test]
+    fn parses_staging_reserve_and_can_switch_to_later_sections() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "/local").unwrap();
+        writeln!(file, "remote /remote").unwrap();
+        writeln!(file, "+.").unwrap();
+        writeln!(file, "[staging]").unwrap();
+        writeln!(file, "reserve = 12.5%").unwrap();
+        writeln!(file, "[ignore]").unwrap();
+        writeln!(file, "*.tmp").unwrap();
+
+        let profile = parse_file(file.path()).unwrap();
+
+        assert_eq!(
+            profile.staging_reserve,
+            Some(StagingReserve::BasisPoints(1250))
+        );
+        assert_eq!(profile.ignore, vec!["*.tmp".to_string()]);
+    }
+
+    #[test]
+    fn rejects_invalid_duplicate_or_unknown_staging_settings() {
+        for settings in [
+            "reserve = invalid",
+            "limit = 1GiB",
+            "reserve = 1GiB\nreserve = 2GiB",
+            "reserve",
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "/local").unwrap();
+            writeln!(file, "remote /remote").unwrap();
+            writeln!(file, "+.").unwrap();
+            writeln!(file, "[staging]").unwrap();
+            writeln!(file, "{settings}").unwrap();
+
+            assert!(parse_file(file.path()).is_err(), "accepted {:?}", settings);
+        }
+    }
+
+    #[test]
+    fn staging_header_remains_a_literal_pattern_after_ignore_or_prune() {
+        for section in ["ignore", "prune"] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "/local").unwrap();
+            writeln!(file, "remote /remote").unwrap();
+            writeln!(file, "+.").unwrap();
+            writeln!(file, "[{section}]").unwrap();
+            writeln!(file, "[staging]").unwrap();
+
+            let profile = parse_file(file.path()).unwrap();
+            let patterns = if section == "ignore" {
+                &profile.ignore
+            } else {
+                &profile.prune
+            };
+            assert_eq!(patterns, &["[staging]".to_string()]);
+            assert_eq!(profile.staging_reserve, None);
+        }
     }
 
     #[test]

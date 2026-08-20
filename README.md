@@ -80,6 +80,9 @@ ssh my_server duet ~
 -Path3/Path5
 +Path6
 
+[staging]
+reserve = 10GiB
+
 [ignore]
 glob1*
 glob2*
@@ -116,6 +119,14 @@ Use `[prune]` for generated, disposable basename globs that should be ignored an
 automatically deleted when they are the only reason a synced parent directory
 cannot be removed. Excluded paths (`-path`) are never pruned automatically.
 Run `duet --dry-run <profile> [path]` to inspect blockers before applying a sync.
+
+An optional `[staging]` section can set the minimum free-space reserve for this
+profile. `reserve` accepts the same absolute sizes or percentages as
+`--staging-reserve`, for example `10GiB` or `5%`. The command-line option takes
+precedence when both are specified. If neither is specified, the reserve is 5%
+of each staging filesystem's total capacity. Put `[staging]` after the path
+rules and before `[ignore]` or `[prune]`; in those pattern sections,
+`[staging]` remains a literal pattern for compatibility.
 
 ## Metadata And Permissions
 

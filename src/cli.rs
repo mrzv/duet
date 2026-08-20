@@ -20,6 +20,7 @@ pub struct SyncOptions {
     pub profile_performance_json: Option<PathBuf>,
     pub staging_policy: StagingPolicy,
     pub staging_policy_explicit: bool,
+    pub staging_reserve_explicit: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -111,6 +112,7 @@ fn parse(mut pargs: pico_args::Arguments) -> Result<Command> {
             reserve: staging_reserve.unwrap_or(StagingReserve::BasisPoints(500)),
         },
         staging_policy_explicit,
+        staging_reserve_explicit: staging_reserve.is_some(),
     };
 
     if let Some(profile_file) = profile_file {
@@ -369,6 +371,7 @@ mod tests {
             profile_performance_json: None,
             staging_policy: StagingPolicy::default(),
             staging_policy_explicit: false,
+            staging_reserve_explicit: false,
         }
     }
 
@@ -424,6 +427,7 @@ mod tests {
                     profile_performance_json: None,
                     staging_policy: StagingPolicy::default(),
                     staging_policy_explicit: false,
+                    staging_reserve_explicit: false,
                 },
             }
         );
@@ -478,6 +482,7 @@ mod tests {
                     profile_performance_json: None,
                     staging_policy: StagingPolicy::default(),
                     staging_policy_explicit: false,
+                    staging_reserve_explicit: false,
                 },
             }
         );
@@ -509,6 +514,7 @@ mod tests {
                     profile_performance_json: Some(PathBuf::from("profile.json")),
                     staging_policy: StagingPolicy::default(),
                     staging_policy_explicit: false,
+                    staging_reserve_explicit: false,
                 },
             }
         );
@@ -535,6 +541,7 @@ mod tests {
                     profile_performance_json: None,
                     staging_policy: StagingPolicy::default(),
                     staging_policy_explicit: false,
+                    staging_reserve_explicit: false,
                 },
             }
         );
@@ -567,6 +574,8 @@ mod tests {
                 reserve: StagingReserve::BasisPoints(725),
             }
         );
+        assert!(options.staging_policy_explicit);
+        assert!(options.staging_reserve_explicit);
 
         let Command::Sync { options, .. } = parse_args(&["--staging-reserve", "250 MB", "work"])
         else {
@@ -579,11 +588,21 @@ mod tests {
                 reserve: StagingReserve::Bytes(250_000_000),
             }
         );
+        assert!(options.staging_policy_explicit);
+        assert!(options.staging_reserve_explicit);
+
+        let Command::Sync { options, .. } = parse_args(&["--staging-limit", "1GiB", "work"]) else {
+            panic!("expected sync command");
+        };
+        assert!(options.staging_policy_explicit);
+        assert!(!options.staging_reserve_explicit);
+
         let Command::Sync { options, .. } = parse_args(&["work"]) else {
             panic!("expected sync command");
         };
         assert_eq!(options.staging_policy, StagingPolicy::default());
         assert!(!options.staging_policy_explicit);
+        assert!(!options.staging_reserve_explicit);
     }
 
     #[test]
