@@ -80,9 +80,6 @@ ssh my_server duet ~
 -Path3/Path5
 +Path6
 
-[staging]
-reserve = 10GiB
-
 [ignore]
 glob1*
 glob2*
@@ -90,6 +87,9 @@ glob2*
 [prune]
 __pycache__
 target
+
+[staging]
+reserve = 10GiB
 ```
 The first two lines specify the directories to synchronize. Either both are
 local, or the second one can have the form `ssh server-name path/to/duet
@@ -119,14 +119,6 @@ Use `[prune]` for generated, disposable basename globs that should be ignored an
 automatically deleted when they are the only reason a synced parent directory
 cannot be removed. Excluded paths (`-path`) are never pruned automatically.
 Run `duet --dry-run <profile> [path]` to inspect blockers before applying a sync.
-
-An optional `[staging]` section can set the minimum free-space reserve for this
-profile. `reserve` accepts the same absolute sizes or percentages as
-`--staging-reserve`, for example `10GiB` or `5%`. The command-line option takes
-precedence when both are specified. If neither is specified, the reserve is 5%
-of each staging filesystem's total capacity. Put `[staging]` after the path
-rules and before `[ignore]` or `[prune]`; in those pattern sections,
-`[staging]` remains a literal pattern for compatibility.
 
 ## Metadata And Permissions
 
@@ -217,6 +209,12 @@ atomically. This can make physical staging proportional to changed blocks rather
 than full logical file size. Additions and clone-unavailable modifications still
 require materialized staging. Explicit staging controls require a peer that can
 enforce them; default settings retain legacy fallback for older peers.
+
+An optional `[staging]` section in the profile can set the minimum free-space
+reserve for this profile. `reserve` accepts the same absolute sizes or
+percentages as `--staging-reserve`, for example `10GiB` or `5%`. The
+command-line option takes precedence when both are specified. If neither is
+specified, the reserve is 5% of each staging filesystem's total capacity.
 
 ## Recovery
 

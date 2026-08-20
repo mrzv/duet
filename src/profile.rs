@@ -256,7 +256,7 @@ pub fn parse_file(profile_location: &Path) -> Result<Profile, io::Error> {
             section = ProfileSection::Prune;
             continue;
         }
-        if trimmed == "[staging]" && section == ProfileSection::Locations {
+        if trimmed == "[staging]" {
             section = ProfileSection::Staging;
             continue;
         }
@@ -403,14 +403,16 @@ mod tests {
     }
 
     #[test]
-    fn staging_header_remains_a_literal_pattern_after_ignore_or_prune() {
+    fn staging_section_can_follow_ignore_or_prune() {
         for section in ["ignore", "prune"] {
             let mut file = tempfile::NamedTempFile::new().unwrap();
             writeln!(file, "/local").unwrap();
             writeln!(file, "remote /remote").unwrap();
             writeln!(file, "+.").unwrap();
             writeln!(file, "[{section}]").unwrap();
+            writeln!(file, "*.tmp").unwrap();
             writeln!(file, "[staging]").unwrap();
+            writeln!(file, "reserve = 2GiB").unwrap();
 
             let profile = parse_file(file.path()).unwrap();
             let patterns = if section == "ignore" {
@@ -418,8 +420,11 @@ mod tests {
             } else {
                 &profile.prune
             };
-            assert_eq!(patterns, &["[staging]".to_string()]);
-            assert_eq!(profile.staging_reserve, None);
+            assert_eq!(patterns, &["*.tmp".to_string()]);
+            assert_eq!(
+                profile.staging_reserve,
+                Some(StagingReserve::Bytes(2 * 1024 * 1024 * 1024))
+            );
         }
     }
 

@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added profile-level `[staging]` `reserve = <size|percent>` configuration before the ignore/prune sections, with `--staging-reserve` taking precedence.
+- Added profile-level `[staging]` `reserve = <size|percent>` configuration, with `--staging-reserve` taking precedence.
 
 ### Changed
 
