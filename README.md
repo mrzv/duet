@@ -209,6 +209,9 @@ atomically. This can make physical staging proportional to changed blocks rather
 than full logical file size. Additions and clone-unavailable modifications still
 require materialized staging. Explicit staging controls require a peer that can
 enforce them; default settings retain legacy fallback for older peers.
+On macOS, cloned staging files are normalized before opening them for writing,
+so read-only source permissions do not prevent delta application. Normalization
+changes only the private clone; synchronized output receives its planned metadata.
 
 An optional `[staging]` section in the profile can set the minimum free-space
 reserve for this profile. `reserve` accepts the same absolute sizes or

@@ -6222,11 +6222,42 @@ impl StagingState {
                 let file = openat_file(
                     self.directory.as_raw_fd(),
                     &name,
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                )
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to open cloned staging file {} for metadata normalization (inherited mode {:04o})",
+                        path.display(),
+                        created.st_mode & 0o7777
+                    )
+                })?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file()
+                    || metadata.dev() != created.st_dev as u64
+                    || metadata.ino() != created.st_ino as u64
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                {
+                    return Err(eyre!(
+                        "cloned output {} changed identity or ownership before normalization",
+                        path.display()
+                    ));
+                }
+                // Clones inherit read-only modes and ACLs. Normalize through a read-only
+                // descriptor before requesting write access, without changing the source.
+                normalize_macos_cloned_file(&file, &path)?;
+                let file = openat_file(
+                    self.directory.as_raw_fd(),
+                    &name,
                     libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     0,
                 )
-                .wrap_err_with(|| format!("failed to open cloned file {}", path.display()))?;
-                normalize_macos_cloned_file(&file, &path)?;
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to reopen normalized cloned staging file {} for writing",
+                        path.display()
+                    )
+                })?;
                 let metadata = file.metadata().wrap_err_with(|| {
                     format!("failed to inspect cloned file {}", path.display())
                 })?;
@@ -6320,7 +6351,6 @@ fn normalize_macos_cloned_file(file: &fs::File, path: &Path) -> Result<()> {
     cvt(unsafe { libc::fchflags(file.as_raw_fd(), 0) })
         .wrap_err_with(|| format!("failed to clear cloned file flags {}", path.display()))?;
     clear_macos_acl(file, path)?;
-    remove_macos_xattrs(file, path)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .wrap_err_with(|| {
             format!(
@@ -6328,6 +6358,7 @@ fn normalize_macos_cloned_file(file: &fs::File, path: &Path) -> Result<()> {
                 path.display()
             )
         })?;
+    remove_macos_xattrs(file, path)?;
 
     let metadata = file
         .metadata()
@@ -6676,7 +6707,12 @@ impl TempOutput {
         staging: Arc<StagingState>,
         source: &fs::File,
     ) -> Result<Option<Self>> {
-        let created = match staging.clone_output(source)? {
+        let created = match staging.clone_output(source).wrap_err_with(|| {
+            format!(
+                "failed to prepare a private clone for synchronized target {}",
+                final_path.display()
+            )
+        })? {
             CloneOutput::Cloned(path, name, file) => (path, name, file),
             CloneOutput::Unsupported => return Ok(None),
         };
@@ -15878,7 +15914,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("source");
         fs::write(&source_path, b"clone contents").unwrap();
-        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o744)).unwrap();
         let source = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -15903,6 +15938,7 @@ mod tests {
                 0
             );
         }
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o444)).unwrap();
 
         let staging = StagingArea::new(dir.path()).unwrap();
         let (path, name, mut file) = match staging.shared.clone_output(&source).unwrap() {
@@ -15928,7 +15964,7 @@ mod tests {
         file.flush().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"clone COW");
         assert_eq!(fs::read(&source_path).unwrap(), b"clone contents");
-        assert_eq!(fs::metadata(&source_path).unwrap().mode() & 0o7777, 0o744);
+        assert_eq!(fs::metadata(&source_path).unwrap().mode() & 0o7777, 0o444);
 
         drop(file);
         unlinkat(staging.shared.directory.as_raw_fd(), &name, 0).unwrap();
