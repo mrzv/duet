@@ -248,3 +248,24 @@ and clear quarantine before phase classification or staging cleanup, preventing
 an active same-inode phase transition from being mistaken for an abandoned
 precommit attempt. Use `--yes` with `--clear` only for non-interactive cleanup
 after inspection.
+
+### Oversized recovery journals
+
+An “apply recovery marker” size error refers to Duet's journal, not to the size
+of a synchronized file. Marker readers currently enforce a 16 MiB limit, while
+V1 journals append staged-file and committed-operation records as work proceeds.
+A large sync can therefore produce a journal that Duet cannot subsequently read,
+including through `recover` or `recover --clear`. The error reports the marker
+path, its size in bytes, and the reader limit. The size alone does not establish
+which operations completed or whether either side saved its snapshot.
+
+Stop syncing the affected profile and preserve both trees, snapshots, and markers
+before making recovery changes. Inspect the journal with a text viewer on its
+owning machine; named local profiles normally keep it at
+`~/.config/duet/.<profile>.snp.duet-apply`. Use `duet recover --remote <profile>`
+to inspect the remote marker or obtain its path from the diagnostic. Reconcile
+both synchronized trees and their snapshots before clearing markers. Do not
+truncate or delete an oversized marker to bypass this check, and do not blindly
+regenerate snapshots: doing so can hide changes that have not reached the other
+side. Recovery assistance needs the journal size and both peers' Duet versions;
+avoid sharing journal paths or file names publicly if they contain private data.

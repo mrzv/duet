@@ -1783,11 +1783,7 @@ fn finalize_existing_apply_marker(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(marker_path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_STAGED_MARKER_BYTES {
-        return Err(eyre!(
-            "existing apply recovery marker is invalid or oversized"
-        ));
-    }
+    validate_apply_marker_metadata(marker_path, &metadata)?;
     let identity = FileIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
@@ -2048,6 +2044,33 @@ fn write_apply_marker_atomic(marker_path: &Path, contents: &str) -> Result<()> {
     sync_directory(parent)
 }
 
+fn validate_apply_marker_metadata(marker_path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if !metadata.is_file() {
+        return Err(eyre!(
+            "apply recovery marker {} is not a regular file",
+            marker_path.display()
+        ));
+    }
+    if metadata.len() > MAX_STAGED_MARKER_BYTES {
+        return Err(eyre!(
+            "apply recovery marker {} is {} bytes; the reader limit is {} bytes (16 MiB).\n\
+             This limit applies to Duet's recovery journal, not to a synchronized file. \
+             Large syncs can exceed it because the journal records paths and operations.\n\
+             Duet cannot read or automatically clear this marker. Its size does not tell \
+             which filesystem changes completed or whether snapshots were saved.\n\
+             Stop syncing this profile. Preserve both trees, snapshots, and recovery markers; \
+             inspect this marker with a text viewer on the machine that owns it. \
+             Reconcile both trees and snapshots before clearing any marker. \
+             Do not truncate/delete the marker or rerun sync against stale snapshots. \
+             Report the marker size and Duet versions on both peers for recovery assistance.",
+            marker_path.display(),
+            metadata.len(),
+            MAX_STAGED_MARKER_BYTES
+        ));
+    }
+    Ok(())
+}
+
 fn read_staged_marker_path(marker_path: &Path) -> Result<String> {
     read_staged_marker_snapshot(marker_path).map(|(contents, _)| contents)
 }
@@ -2065,12 +2088,7 @@ fn read_staged_marker_snapshot_with_hook(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(marker_path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(eyre!("apply recovery marker is not a regular file"));
-    }
-    if metadata.len() > MAX_STAGED_MARKER_BYTES {
-        return Err(eyre!("apply recovery marker exceeds the size limit"));
-    }
+    validate_apply_marker_metadata(marker_path, &metadata)?;
     after_metadata()?;
     let mut contents = String::with_capacity(metadata.len() as usize);
     std::io::Read::by_ref(&mut file)
@@ -2208,7 +2226,13 @@ fn write_all_at(file: &fs::File, mut bytes: &[u8], mut offset: u64) -> io::Resul
 
 fn read_staged_marker_descriptor(file: &mut fs::File, expected_length: u64) -> Result<String> {
     if expected_length > MAX_STAGED_MARKER_BYTES {
-        return Err(eyre!("staged apply marker exceeds the size limit"));
+        return Err(eyre!(
+            "staged apply marker is {} bytes; the reader limit is {} bytes (16 MiB). \
+             Preserve the marker and reconcile both trees and snapshots before clearing it; \
+             do not rerun sync against stale snapshots",
+            expected_length,
+            MAX_STAGED_MARKER_BYTES
+        ));
     }
     file.seek(SeekFrom::Start(0))?;
     let mut contents = String::with_capacity(expected_length as usize);
@@ -2663,9 +2687,7 @@ fn quarantine_apply_marker_with_hook(
         0,
     )?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_STAGED_MARKER_BYTES {
-        return Err(eyre!("apply recovery marker is invalid or oversized"));
-    }
+    validate_apply_marker_metadata(&marker_path, &metadata)?;
     let identity = FileIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
