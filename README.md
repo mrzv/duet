@@ -254,21 +254,33 @@ after inspection.
 
 ### Oversized recovery journals
 
-An “apply recovery marker” size error refers to Duet's journal, not to the size
-of a synchronized file. Marker readers currently enforce a 16 MiB limit, while
-V1 journals append staged-file and committed-operation records as work proceeds.
-A large sync can therefore produce a journal that Duet cannot subsequently read,
-including through `recover` or `recover --clear`. The error reports the marker
-path, its size in bytes, and the reader limit. The size alone does not establish
-which operations completed or whether either side saved its snapshot.
+Recovery journals can exceed 16 MiB. Duet reads existing V1, V2, and V3 journals
+incrementally rather than loading their full text into memory. Journal size alone
+does not prevent inspection, phase updates, completion, or explicit clearing.
+Individual records are limited to 16 KiB. Known staged-inventory records remain
+validated; V3 additionally rejects unknown or incomplete records and invalid
+phase-slot checksums. V1 and V2 retain their legacy parsing behavior, including
+V1's unescaped path text and V2's tolerance of unknown append tails.
 
-Stop syncing the affected profile and preserve both trees, snapshots, and markers
-before making recovery changes. Inspect the journal with a text viewer on its
-owning machine; named local profiles normally keep it at
-`~/.config/duet/.<profile>.snp.duet-apply`. Use `duet recover --remote <profile>`
-to inspect the remote marker or obtain its path from the diagnostic. Reconcile
-both synchronized trees and their snapshots before clearing markers. Do not
-truncate or delete an oversized marker to bypass this check, and do not blindly
-regenerate snapshots: doing so can hide changes that have not reached the other
-side. Recovery assistance needs the journal size and both peers' Duet versions;
-avoid sharing journal paths or file names publicly if they contain private data.
+`duet recover <profile>` and `duet recover --remote <profile>` scan the complete
+journal but display a bounded preview with counts from all records. A truncated
+preview is not a truncated journal: records beyond the preview are still
+validated. Inspect the full journal on its owning machine when reconciling paths
+not shown in the preview. Named local profiles normally keep it at
+`~/.config/duet/.<profile>.snp.duet-apply`; remote inspection reports the remote
+marker path. Processing retains the staged-file identity index needed for safe
+cleanup, so memory can still grow with the number of distinct staged entries,
+but not with the full history of staged-file and committed-operation text.
+
+If an older binary reports the former 16 MiB reader limit, update Duet on the
+machine that owns the journal. For `recover --remote`, the remote server must
+also support oversized journals. No journal-format conversion is needed.
+
+Preserve both trees, snapshots, and markers before making recovery changes.
+The journal's size does not establish which operations completed or whether
+either side saved its snapshot. Inspect both sides and reconcile partial
+changes before using `--clear`; oversized-journal support does not make this
+automatic reconciliation. Do not truncate or delete a journal to bypass an
+error, and do not blindly regenerate snapshots: doing so can hide changes that
+have not reached the other side. Avoid sharing journal paths or file names
+publicly if they contain private data.

@@ -295,9 +295,10 @@ mod tests {
         let marker = dir.path().join(".profile.snp.duet-apply");
         std::fs::write(&marker, "not a duet marker\n").unwrap();
 
-        let error = recover(state, true, true).unwrap_err().to_string();
-
-        assert!(error.contains("refusing to remove malformed"), "{}", error);
-        assert!(marker.exists());
+        assert!(recover(state, true, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "not a duet marker\n"
+        );
     }
 }

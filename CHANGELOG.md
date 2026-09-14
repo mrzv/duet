@@ -8,7 +8,7 @@
 
 ### Changed
 
-- Improved oversized recovery-journal errors with the marker path, actual size, read limit, and safe recovery guidance.
+- Supported recovery journals larger than 16 MiB with incremental validation, bounded inspection output, streamed legacy phase rewrites, and existing V3 same-inode phase updates, while preserving record-size limits and identity-checked cleanup.
 - Clarified dependency-group staging-capacity failures with human-readable sizes, the minimum-free-space reserve policy, and actionable `--staging-reserve` guidance.
 - Replaced staged commit's action-inferred directory durability discovery with an exact identity-checked, descriptor-relative mutation and retirement ledger that records only successfully dirtied namespace parents, retires only descriptor-verified and confirmed-unlinked directories, and syncs remaining obligations deepest-first before syncing accumulated recovery records and entering the committed phase.
 - Parallelized staged-output commit validation with bounded deterministic workers, reduced recovery-marker writes, skipped irrelevant directory durability discovery, and added local/remote staged commit subphase profiling.
