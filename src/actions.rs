@@ -213,23 +213,25 @@ fn escape_control_chars(value: &str) -> String {
 
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self {
-            // actions are reversed:
-            // local action means remote change, and remote action means local change
-            Action::Local(l) => write!(f, "  <---- {} {}", l, show_path(l.path())),
-            Action::Remote(r) => write!(f, "{} ---->   {}", r, show_path(r.path())),
-            Action::Conflict(l, r) => write!(
-                f,
-                "{} {} {} {}",
-                l,
-                "<===>".bright_red(),
-                r,
-                show_path(l.path())
-            ),
-            Action::ResolvedLocal((_, _), l) => write!(f, "  <==== {} {}", l, show_path(l.path())),
-            Action::ResolvedRemote((_, _), r) => write!(f, "{} ====>   {}", r, show_path(r.path())),
-            Action::Identical(l, r) => write!(f, "{} --I-- {} {}", l, r, show_path(l.path())),
+        // Actions name the destination, not the source.
+        let size = match self {
+            Action::Local(c) | Action::Remote(c) | Action::Identical(c, _) => {
+                ListingSize(Some(change_entry(c)))
+            }
+            Action::ResolvedLocal(_, c) | Action::ResolvedRemote(_, c) => {
+                ListingSize(Some(change_entry(c)))
+            }
+            Action::Conflict(_, _) => ListingSize(None),
+        };
+        match self {
+            Action::Local(c) => write!(f, "  <---- {}", c)?,
+            Action::Remote(c) => write!(f, "{} ---->  ", c)?,
+            Action::Conflict(l, r) => write!(f, "{} {} {}", l, "<===>".bright_red(), r)?,
+            Action::ResolvedLocal(_, c) => write!(f, "  <==== {}", c)?,
+            Action::ResolvedRemote(_, c) => write!(f, "{} ====>  ", c)?,
+            Action::Identical(l, r) => write!(f, "{} --I-- {}", l, r)?,
         }
+        write!(f, " {} {}", size, show_path(self.path()))
     }
 }
 
@@ -286,6 +288,27 @@ pub fn details(action: &Action) -> String {
 fn change_entry(change: &Change) -> &Entry {
     match change {
         Change::Added(d) | Change::Removed(d) | Change::Modified(_, d) => d,
+    }
+}
+
+pub(crate) fn listing_size(change: &Change) -> impl fmt::Display + '_ {
+    ListingSize(Some(change_entry(change)))
+}
+
+struct ListingSize<'a>(Option<&'a Entry>);
+
+impl fmt::Display for ListingSize<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.filter(|entry| entry.is_file()) {
+            Some(entry) => {
+                let size = byte_unit::Byte::from_u64(entry.size().into())
+                    .get_appropriate_unit(byte_unit::UnitType::Binary);
+                let value = size.get_value();
+                let precision = if value.fract() == 0.0 { 0 } else { 1 };
+                write!(f, "{:>6.*} {:<3}", precision, value, size.get_unit())
+            }
+            None => write!(f, "{:>10}", "-"),
+        }
     }
 }
 

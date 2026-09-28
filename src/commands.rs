@@ -155,7 +155,12 @@ pub(crate) async fn changes(name: String, statefile: Option<PathBuf>) -> Result<
     .await?;
 
     for c in changes.changes {
-        println!("{} {}", c, c.path().display());
+        println!(
+            "{} {} {}",
+            c,
+            crate::actions::listing_size(&c),
+            c.path().display()
+        );
     }
 
     Ok(())
