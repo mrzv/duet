@@ -221,7 +221,13 @@ impl fmt::Display for Action {
             Action::ResolvedLocal(_, c) | Action::ResolvedRemote(_, c) => {
                 ListingSize(Some(change_entry(c)))
             }
-            Action::Conflict(_, _) => ListingSize(None),
+            Action::Conflict(l, r) => ListingSize(
+                [change_entry(l), change_entry(r)]
+                    .iter()
+                    .copied()
+                    .filter(|entry| entry.is_file())
+                    .max_by_key(|entry| entry.size()),
+            ),
         };
         match self {
             Action::Local(c) => write!(f, "  <---- {}", c)?,
@@ -307,7 +313,7 @@ impl fmt::Display for ListingSize<'_> {
                 let precision = if value.fract() == 0.0 { 0 } else { 1 };
                 write!(f, "{:>6.*} {:<3}", precision, value, size.get_unit())
             }
-            None => write!(f, "{:>10}", "-"),
+            None => write!(f, "{:>10}", ""),
         }
     }
 }

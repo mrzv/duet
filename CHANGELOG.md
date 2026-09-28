@@ -8,7 +8,7 @@
 
 ### Changed
 
-- Show right-aligned binary file sizes before filenames in sync plans and local change listings; directories, symlinks, and unresolved conflicts show `-`.
+- Show right-aligned binary file sizes before filenames in sync plans and local change listings; directories and symlinks leave the size column blank, unresolved conflicts show the larger file size, and resolved conflicts show the selected version's size.
 - Supported recovery journals larger than 16 MiB with incremental validation, bounded inspection output, streamed legacy phase rewrites, and existing V3 same-inode phase updates, while preserving record-size limits and identity-checked cleanup.
 - Clarified dependency-group staging-capacity failures with human-readable sizes, the minimum-free-space reserve policy, and actionable `--staging-reserve` guidance.
 - Replaced staged commit's action-inferred directory durability discovery with an exact identity-checked, descriptor-relative mutation and retirement ledger that records only successfully dirtied namespace parents, retires only descriptor-verified and confirmed-unlinked directories, and syncs remaining obligations deepest-first before syncing accumulated recovery records and entering the committed phase.
