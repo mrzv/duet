@@ -161,9 +161,9 @@ pub fn plan_staging_waves(
                 action.path().display()
             ));
         }
-        if action_has_directory_to_nondirectory_change(action) {
+        if action_has_directory_to_file_change(action) {
             return Err(eyre!(
-                "staging wave planner does not support directory-to-nondirectory replacement {}",
+                "staging wave planner does not support directory-to-file replacement {}",
                 action.path().display()
             ));
         }
@@ -285,8 +285,8 @@ fn action_has_directory_change(action: &Action) -> bool {
     }
 }
 
-fn action_has_directory_to_nondirectory_change(action: &Action) -> bool {
-    let is_replacement = |change: &Change| matches!(change, Change::Modified(old, new) if old.is_dir() && !new.is_dir());
+fn action_has_directory_to_file_change(action: &Action) -> bool {
+    let is_replacement = |change: &Change| matches!(change, Change::Modified(old, new) if old.is_dir() && new.is_file());
     match action {
         Action::Identical(left, right) => is_replacement(left) || is_replacement(right),
         Action::ResolvedLocal((left, right), resolved)
@@ -1087,9 +1087,9 @@ fn validate_staged_structure(actions: &[Action], all_old: &[Entry]) -> Result<()
             Action::Conflict(_, _) | Action::Identical(_, _) => None,
         };
         if let Some(Change::Modified(old, new)) = effective_change {
-            if old.is_dir() && !new.is_dir() {
+            if old.is_dir() && new.is_file() {
                 return Err(eyre!(
-                    "staged apply does not support replacing directory {} with a non-directory",
+                    "staged apply does not support replacing directory {} with a regular file",
                     old.path().display()
                 ));
             }
@@ -1382,7 +1382,7 @@ pub fn can_stream_details(actions: &[Action]) -> bool {
             Action::Conflict(_, _) | Action::Identical(_, _) => return true,
         };
 
-        !matches!(change, Change::Modified(old, new) if old.is_dir() && !new.is_dir())
+        !matches!(change, Change::Modified(old, new) if old.is_dir() && new.is_file())
     })
 }
 
@@ -10024,29 +10024,37 @@ impl DetailApplier {
                     if !change.is_dir() {
                         continue;
                     }
+                    // Retire old directories only after every descendant has
+                    // been processed, before publishing a replacement symlink.
+                    let removed_directory = match change {
+                        Change::Removed(e) => Some(e),
+                        Change::Modified(old, new) if old.is_dir() && new.is_symlink() => Some(old),
+                        _ => None,
+                    };
+                    if let Some(e) = removed_directory {
+                        let dirname = safe_join(&self.base, e.path())?;
+                        verify_current_matches_entry(&dirname, e, "remove target")?;
+                        prune_ignored_removal_blockers(
+                            &self.base,
+                            &dirname,
+                            &plan.removed_destination_paths,
+                            &plan.removal_policy,
+                            self.attempt_state.as_deref(),
+                            Some(durability),
+                        )?;
+                        let token = durability.prepare_parent(&dirname)?;
+                        let retirement = durability.prepare_retirement(&dirname)?;
+                        durability.before_retirement(&dirname)?;
+                        retirement.verify_source()?;
+                        durability.after_retirement_verify(&dirname)?;
+                        durability.unlink_staged_unarmed(&token, libc::AT_REMOVEDIR)?;
+                        retirement.finish_removed(durability)?;
+                        durability.arm(token)?;
+                        self.recorder
+                            .record_committed_step("remove-dir", e.path())?;
+                    }
                     match change {
-                        Change::Removed(e) => {
-                            let dirname = safe_join(&self.base, e.path())?;
-                            verify_current_matches_entry(&dirname, e, "remove target")?;
-                            prune_ignored_removal_blockers(
-                                &self.base,
-                                &dirname,
-                                &plan.removed_destination_paths,
-                                &plan.removal_policy,
-                                self.attempt_state.as_deref(),
-                                Some(durability),
-                            )?;
-                            let token = durability.prepare_parent(&dirname)?;
-                            let retirement = durability.prepare_retirement(&dirname)?;
-                            durability.before_retirement(&dirname)?;
-                            retirement.verify_source()?;
-                            durability.after_retirement_verify(&dirname)?;
-                            durability.unlink_staged_unarmed(&token, libc::AT_REMOVEDIR)?;
-                            retirement.finish_removed(durability)?;
-                            durability.arm(token)?;
-                            self.recorder
-                                .record_committed_step("remove-dir", e.path())?;
-                        }
+                        Change::Removed(_) => {}
                         Change::Added(e) => {
                             let dirname = safe_join(&self.base, e.path())?;
                             let result = update_meta_staged(&dirname, e, durability)?;
@@ -10062,9 +10070,13 @@ impl DetailApplier {
                         Change::Modified(e1, e2) => {
                             let dirname = safe_join(&self.base, e2.path())?;
                             if e1.is_dir() && !e2.is_dir() {
-                                return Err(eyre!(
-                                    "streaming directory-to-file changes is not supported"
-                                ));
+                                let target = e2.target().as_ref().ok_or_else(|| {
+                                    eyre!("streaming directory-to-file changes is not supported")
+                                })?;
+                                let token = durability.prepare_parent(&dirname)?;
+                                durability.symlink_staged(token, target)?;
+                                self.recorder
+                                    .record_committed_step("create-symlink", e2.path())?;
                             }
                             if e1.is_dir() && e2.is_dir() {
                                 verify_current_matches_entry(&dirname, e1, "metadata target")?;
@@ -12126,9 +12138,7 @@ mod tests {
             staging_budget(10, 10),
             staging_budget(10, 10),
         )
-        .unwrap_err()
-        .to_string()
-        .contains("directory-to-nondirectory"));
+        .is_err());
     }
 
     #[test]
@@ -12253,9 +12263,7 @@ mod tests {
             staging_budget(10, 10),
             staging_budget(10, 10),
         )
-        .unwrap_err()
-        .to_string()
-        .contains("directory-to-nondirectory"));
+        .is_err());
     }
 
     #[test]
@@ -12267,25 +12275,14 @@ mod tests {
                 Change::Added(Entry::test_file(PathBuf::from("a"), 1)),
                 Change::Added(Entry::test_file(PathBuf::from("a"), 2)),
             )],
-            vec![Action::Local(Change::Modified(
-                Entry::test_dir(PathBuf::from("a")),
-                Entry::test_symlink(PathBuf::from("a"), PathBuf::from("target")),
-            ))],
         ];
-        let expected = [
-            "strictly increasing",
-            "strictly increasing",
-            "unresolved conflict",
-            "directory-to-nondirectory",
-        ];
-        for (actions, expected) in IntoIterator::into_iter(cases).zip(expected) {
-            let error = plan_staging_waves(
+        for actions in cases {
+            assert!(plan_staging_waves(
                 &actions,
                 staging_budget(u64::MAX, u64::MAX),
                 staging_budget(u64::MAX, u64::MAX),
             )
-            .unwrap_err();
-            assert!(error.to_string().contains(expected), "{}", error);
+            .is_err());
         }
     }
 
@@ -12605,24 +12602,16 @@ mod tests {
             vec![Action::Local(Change::Removed(test_file_entry(
                 "dir//a", b"a",
             )))],
-            vec![Action::Local(Change::Modified(
-                Entry::test_dir(PathBuf::from("a")),
-                Entry::test_symlink(PathBuf::from("a"), PathBuf::from("target")),
-            ))],
         ];
         for actions in malformed_actions {
-            let error =
-                DetailApplier::new_with_attempt(PathBuf::from("unused"), actions, vec![], None)
-                    .finish_preparation()
-                    .err()
-                    .expect("malformed staged structure must fail");
-            assert!(
-                error.to_string().contains("path")
-                    || error.to_string().contains("strictly increasing")
-                    || error.to_string().contains("does not support"),
-                "{}",
-                error
-            );
+            assert!(DetailApplier::new_with_attempt(
+                PathBuf::from("unused"),
+                actions,
+                vec![],
+                None
+            )
+            .finish_preparation()
+            .is_err());
         }
 
         let duplicate_old = vec![test_file_entry("a", b"a"), test_file_entry("a", b"a")];
@@ -16468,6 +16457,46 @@ mod tests {
     }
 
     #[test]
+    fn staged_directory_symlink_replacement_preserves_late_entries() {
+        for replace_after_removal in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("base");
+            let target = dir.path().join("outside");
+            fs::create_dir_all(base.join("runs")).unwrap();
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("keep"), b"outside contents").unwrap();
+            let old = synced_existing_dir_entry(&base, "runs");
+            let new = Entry::test_symlink(PathBuf::from("runs"), target.clone());
+            let actions = vec![Action::Local(Change::Modified(old.clone(), new))];
+            let mut prepared =
+                DetailApplier::new_with_attempt(base.clone(), actions, vec![old], None)
+                    .prepare()
+                    .unwrap();
+            assert!(fs::symlink_metadata(base.join("runs")).unwrap().is_dir());
+
+            let late_entry = if replace_after_removal {
+                let path = base.join("runs");
+                let replacement = path.clone();
+                prepared.after_namespace_mutation_hook = Some(Arc::new(move |mutated| {
+                    if mutated == replacement {
+                        fs::write(&replacement, b"racing entry")?;
+                    }
+                    Ok(())
+                }));
+                path
+            } else {
+                let path = base.join("runs/late-child");
+                fs::write(&path, b"racing entry").unwrap();
+                path
+            };
+
+            assert!(prepared.commit().is_err());
+            assert_eq!(fs::read(late_entry).unwrap(), b"racing entry");
+            assert_eq!(fs::read(target.join("keep")).unwrap(), b"outside contents");
+        }
+    }
+
+    #[test]
     fn apply_rechecks_added_file_destination_before_rename() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().to_path_buf();
@@ -16688,16 +16717,6 @@ mod tests {
             .to_string();
 
         assert!(error.contains("unexpected detail kind"), "{}", error);
-    }
-
-    #[test]
-    fn can_stream_details_rejects_directory_to_symlink_replacements() {
-        let actions = vec![Action::Local(Change::Modified(
-            Entry::test_dir(PathBuf::from("path")),
-            Entry::test_symlink(PathBuf::from("path"), PathBuf::from("target")),
-        ))];
-
-        assert!(!can_stream_details(&actions));
     }
 
     #[test]

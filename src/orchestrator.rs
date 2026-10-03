@@ -569,14 +569,14 @@ pub async fn sync(
         staging_policy_source,
     )?;
     if apply_strategy == ApplyStrategy::StagedStream
-        && actions_have_directory_to_nondirectory_change(actions.as_ref())
+        && actions_have_directory_to_file_change(actions.as_ref())
     {
         if let Some(configured_by) = staging_policy_source.configured_by() {
             return Err(eyre!(
-                "{configured_by} cannot currently be enforced for directory-to-nondirectory replacements"
+                "{configured_by} cannot currently be enforced for directory-to-file replacements"
             ));
         }
-        log::debug!("using legacy stream for a directory-to-nondirectory replacement");
+        log::debug!("using legacy stream for a directory-to-file replacement");
         apply_strategy = ApplyStrategy::LegacyStream;
     }
     if !can_stream_details {
@@ -1749,9 +1749,9 @@ fn validate_wave_side_capacity(
     Ok(())
 }
 
-fn actions_have_directory_to_nondirectory_change(actions: &[Action]) -> bool {
+fn actions_have_directory_to_file_change(actions: &[Action]) -> bool {
     fn replacement(change: &Change) -> bool {
-        matches!(change, Change::Modified(old, new) if old.is_dir() && !new.is_dir())
+        matches!(change, Change::Modified(old, new) if old.is_dir() && new.is_file())
     }
     actions.iter().any(|action| match action {
         Action::Local(change) | Action::Remote(change) => replacement(change),

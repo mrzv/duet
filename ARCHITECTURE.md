@@ -440,6 +440,15 @@ replacements, metadata updates, and pruning. `PreparedApply::commit()` applies
 forward operations in action order and directory cleanup in a second
 reverse-order pass so child entries are processed before parent directories.
 
+Directory-to-symlink replacements share a dependency group with their tracked
+descendant removals. The reverse pass prunes only policy-authorized blockers,
+retires the now-empty directory through the descriptor-relative durability ledger,
+then creates the symlink without following its target or overwriting a raced-in
+entry. Both sides finish preparation and validation before either commits.
+Directory-to-regular-file replacements remain unsupported by staging. This uses
+the existing action and RPC formats; older implementations may reject the new
+case during preflight or preparation, so both executables should be upgraded.
+
 Regular file output uses a lazy, side-local `StagingArea`. The first output
 creates one mode-0700 `.duet-stage-*` directory under the synchronization base,
 on the destination filesystem, and records its parent, component, and identity

@@ -40,6 +40,7 @@ struct SyncCase {
     local: PathBuf,
     remote: PathBuf,
     profile: PathBuf,
+    home: PathBuf,
 }
 
 impl SyncCase {
@@ -60,6 +61,8 @@ impl SyncCase {
         let local = temp.path().join("local");
         let remote = temp.path().join("remote");
         let profile = temp.path().join("profile.prf");
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
 
         fs::create_dir(&local).unwrap();
         fs::create_dir(&remote).unwrap();
@@ -84,6 +87,7 @@ impl SyncCase {
             local,
             remote,
             profile,
+            home,
         }
     }
 
@@ -98,6 +102,7 @@ impl SyncCase {
             .args(args)
             .arg("-b")
             .env("NO_COLOR", "1")
+            .env("HOME", &self.home)
             .output()
             .unwrap()
     }
@@ -237,6 +242,184 @@ fn exclusion_composes_with_restricted_synchronization() {
         "excluded updated"
     );
     assert_eq!(read(&case.remote.join("outside.txt")), "outside updated");
+}
+
+const REPLACEMENT_SCOPE: &str = "Research/Optimization/learned-gradient";
+const REPLACEMENT_RUNS: &str = "Research/Optimization/learned-gradient/runs";
+
+fn directory_symlink_case(local_source: bool) -> (SyncCase, PathBuf, PathBuf, PathBuf) {
+    let case = SyncCase::new_with_rules(&format!(
+        "+{REPLACEMENT_SCOPE}\n-{REPLACEMENT_RUNS}/private\n"
+    ));
+    let source = if local_source {
+        &case.local
+    } else {
+        &case.remote
+    };
+    let destination = if local_source {
+        &case.remote
+    } else {
+        &case.local
+    };
+    let source_runs = source.join(REPLACEMENT_RUNS);
+    let destination_runs = destination.join(REPLACEMENT_RUNS);
+    fs::create_dir_all(source_runs.join("nested/deeper")).unwrap();
+    fs::create_dir(source_runs.join("empty")).unwrap();
+    write(&source_runs.join("top.txt"), "top baseline");
+    write(
+        &source_runs.join("nested/deeper/result.txt"),
+        "nested baseline",
+    );
+    assert_success(case.sync_with_args(&[REPLACEMENT_SCOPE]));
+
+    // Both CLI processes can reach this target, but it is outside both roots.
+    let target = case._temp.path().join("moved-runs");
+    fs::rename(&source_runs, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &source_runs).unwrap();
+    write(
+        &target.join("target-only.txt"),
+        "must never be scanned or removed",
+    );
+    write(
+        &target.join("nested/deeper/result.txt"),
+        "moved target contents",
+    );
+    (case, source_runs, destination_runs, target)
+}
+
+fn assert_replacement_target_untouched(target: &Path) {
+    assert_eq!(read(&target.join("top.txt")), "top baseline");
+    assert_eq!(
+        read(&target.join("nested/deeper/result.txt")),
+        "moved target contents"
+    );
+    assert_eq!(
+        read(&target.join("target-only.txt")),
+        "must never be scanned or removed"
+    );
+    assert!(target.join("empty").is_dir());
+    assert_eq!(fs::read_dir(target).unwrap().count(), 4);
+}
+
+fn snapshot_bytes(case: &SyncCase) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut paths = vec![case.profile.with_extension("snp")];
+    paths.extend(
+        fs::read_dir(case.profile.with_extension("remotes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file()),
+    );
+    assert!(paths.len() >= 2, "expected local and remote snapshots");
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn assert_directory_symlink_propagates(local_source: bool) {
+    let (case, source, destination, target) = directory_symlink_case(local_source);
+    // An unrelated change must not leak through the restricted sync.
+    write(
+        &case.local.join("outside.txt"),
+        "outside restricted subtree",
+    );
+    assert_success(case.sync_with_args(&[REPLACEMENT_SCOPE]));
+
+    for path in [&source, &destination] {
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(path).unwrap(), target);
+    }
+    assert!(!case.remote.join("outside.txt").exists());
+    assert_replacement_target_untouched(&target);
+
+    // A second sync must leave the checkpoint manifests unchanged.
+    let before = snapshot_bytes(&case);
+    assert_success(case.sync_with_args(&[REPLACEMENT_SCOPE]));
+    assert_eq!(snapshot_bytes(&case), before);
+    assert_eq!(fs::read_link(&source).unwrap(), target);
+    assert_eq!(fs::read_link(&destination).unwrap(), target);
+    assert_replacement_target_untouched(&target);
+}
+
+#[test]
+fn directory_symlink_replacement_propagates_local_to_remote() {
+    assert_directory_symlink_propagates(true);
+}
+
+#[test]
+fn directory_symlink_replacement_propagates_remote_to_local() {
+    assert_directory_symlink_propagates(false);
+}
+
+#[test]
+fn directory_symlink_replacement_preserves_excluded_untracked_blocker_and_snapshots() {
+    for local_source in [true, false] {
+        let (case, source, destination, target) = directory_symlink_case(local_source);
+        fs::create_dir(destination.join("private")).unwrap();
+        write(
+            &destination.join("private/untracked.txt"),
+            "keep private data",
+        );
+        let before = snapshot_bytes(&case);
+
+        let output = case.sync_with_args(&[REPLACEMENT_SCOPE]);
+        let text = combined_output(&output);
+        assert!(!output.status.success(), "{}", text);
+        assert!(fs::symlink_metadata(&destination).unwrap().is_dir());
+        assert_eq!(
+            read(&destination.join("private/untracked.txt")),
+            "keep private data"
+        );
+        assert_eq!(read(&destination.join("top.txt")), "top baseline");
+        assert_eq!(
+            read(&destination.join("nested/deeper/result.txt")),
+            "nested baseline"
+        );
+        assert_eq!(fs::read_link(&source).unwrap(), target);
+        assert_replacement_target_untouched(&target);
+        assert_eq!(snapshot_bytes(&case), before);
+    }
+}
+
+#[test]
+fn directory_symlink_replacement_preserves_conflicting_descendant_and_snapshots() {
+    for local_source in [true, false] {
+        let (case, source, destination, target) = directory_symlink_case(local_source);
+        write(
+            &destination.join("nested/deeper/result.txt"),
+            "destination changed independently",
+        );
+        let before = snapshot_bytes(&case);
+
+        let output = case.sync_with_args(&[REPLACEMENT_SCOPE]);
+        let text = combined_output(&output);
+        assert!(!output.status.success(), "{}", text);
+        assert!(fs::symlink_metadata(&destination).unwrap().is_dir());
+        assert_eq!(
+            read(&destination.join("nested/deeper/result.txt")),
+            "destination changed independently"
+        );
+        assert_eq!(read(&destination.join("top.txt")), "top baseline");
+        assert_eq!(fs::read_link(&source).unwrap(), target);
+        assert_replacement_target_untouched(&target);
+        assert_eq!(snapshot_bytes(&case), before);
+
+        // --force skips unresolved conflicts; it must not publish their
+        // destructive ancestor's replacement through the retained directory.
+        let output = case.sync_with_args(&["--force", REPLACEMENT_SCOPE]);
+        assert_success(output);
+        assert!(fs::symlink_metadata(&destination).unwrap().is_dir());
+        assert_eq!(
+            read(&destination.join("nested/deeper/result.txt")),
+            "destination changed independently"
+        );
+        assert_eq!(fs::read_link(&source).unwrap(), target);
+        assert_replacement_target_untouched(&target);
+    }
 }
 
 #[test]

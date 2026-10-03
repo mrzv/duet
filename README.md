@@ -130,6 +130,19 @@ platform-specific permission models. Symlink permissions are ignored; the symlin
 target is synchronized instead. When applying mode metadata, Duet applies only
 Unix permission and special bits, not file-type bits.
 
+Staged sync supports replacing a tracked directory with a symlink. It removes
+the selected, tracked descendants on the receiving side before replacing the
+empty directory; it never follows the new link to copy or delete its target.
+Excluded or untracked children block replacement, and ignored children retain
+the pruning rules above. Unresolved descendant conflicts keep the replacement
+pending. Restrict such a sync to a parent directory that includes the replacement
+and its old descendants, rather than a path beneath the symlink.
+
+The symlink target text is copied unchanged, so make sure it makes sense on both
+machines. Update both Duet executables for staged directory-to-symlink support;
+older servers can reject the replacement during preflight or preparation.
+Staged directory-to-regular-file replacement remains unsupported.
+
 Permission failures are treated as sync errors. Duet fails fast rather than
 silently skipping unreadable or unwritable paths, because skipping a path can be
 mistaken for a deletion or a legitimate update. Fix the reported permission
