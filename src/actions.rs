@@ -211,24 +211,31 @@ fn escape_control_chars(value: &str) -> String {
     escaped
 }
 
+impl Action {
+    fn listing_entry(&self) -> Option<&Entry> {
+        // Actions name the destination, not the source.
+        match self {
+            Action::Local(c)
+            | Action::Remote(c)
+            | Action::Identical(c, _)
+            | Action::ResolvedLocal(_, c)
+            | Action::ResolvedRemote(_, c) => Some(change_entry(c)).filter(|entry| entry.is_file()),
+            Action::Conflict(l, r) => [change_entry(l), change_entry(r)]
+                .iter()
+                .copied()
+                .filter(|entry| entry.is_file())
+                .max_by_key(|entry| entry.size()),
+        }
+    }
+
+    pub(crate) fn listing_size_bytes(&self) -> Option<u64> {
+        self.listing_entry().map(|entry| entry.size().into())
+    }
+}
+
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Actions name the destination, not the source.
-        let size = match self {
-            Action::Local(c) | Action::Remote(c) | Action::Identical(c, _) => {
-                ListingSize(Some(change_entry(c)))
-            }
-            Action::ResolvedLocal(_, c) | Action::ResolvedRemote(_, c) => {
-                ListingSize(Some(change_entry(c)))
-            }
-            Action::Conflict(l, r) => ListingSize(
-                [change_entry(l), change_entry(r)]
-                    .iter()
-                    .copied()
-                    .filter(|entry| entry.is_file())
-                    .max_by_key(|entry| entry.size()),
-            ),
-        };
+        let size = ListingSize(self.listing_entry());
         match self {
             Action::Local(c) => write!(f, "  <---- {}", c)?,
             Action::Remote(c) => write!(f, "{} ---->  ", c)?,

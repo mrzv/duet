@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added an interactive `s` toggle between filename order and largest-first file size, preserving selection and updating size order after conflict resolution.
 - Added profile-level `[staging]` `reserve = <size|percent>` configuration, with `--staging-reserve` taking precedence.
 
 ### Changed

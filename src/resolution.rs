@@ -165,15 +165,27 @@ pub fn resolve_sequential(actions: &mut Actions, _verbose: bool) -> Result<AllRe
     }
 }
 
+fn sort_interactive_actions(actions: &mut [&mut Action], selected: usize, by_size: bool) -> usize {
+    let selected_action: *const Action = &*actions[selected];
+    actions.sort_unstable_by(|a, b| {
+        let size_order = if by_size {
+            b.listing_size_bytes().cmp(&a.listing_size_bytes())
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        size_order.then_with(|| a.path().cmp(b.path()))
+    });
+    actions
+        .iter()
+        .position(|action| std::ptr::eq(&**action, selected_action))
+        .expect("selected action remains in the interactive view")
+}
+
 pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllResolution> {
     use console::Term;
     use std::ops::Rem;
     let term = Term::stderr();
     let _cursor_restore = CursorRestore(&term);
-
-    let (height, _width) = term.size();
-
-    let mut page = 0;
 
     assert!(!actions.is_empty());
 
@@ -181,33 +193,44 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
         .iter_mut()
         .filter(|a| verbose || !a.is_identical())
         .collect();
-
-    let capacity = (height as usize).saturating_sub(3).max(1);
+    actions.sort_unstable_by(|a, b| a.path().cmp(b.path()));
+    let mut by_size = false;
 
     let mut sel = 0;
     let mut height = 0;
     let mut num_conflicts = num_unresolved_conflicts(actions.iter().map(|a| &**a));
 
     let resolution = loop {
-        term.write_line(
-            format!(
-                "{}, Shift+Up/Shift+Down = page, n/a = abort, f = force{} [{}]",
-                if num_conflicts == 0 {
-                    "y/g = proceed".bright_green()
-                } else {
-                    "Tab/S-Tab = next/previous conflict".bright_yellow()
-                },
-                if actions[sel].is_conflict() {
-                    ", left/l = update local, right/r = update remote, c = keep conflict"
-                } else {
-                    ""
-                },
-                num_conflicts
-            )
-            .as_str(),
-        )?;
+        let (terminal_height, width) = term.size();
+        let help = format!(
+            "{}, s = sort ({}), Shift+Up/Shift+Down = page, n/a = abort, f = force{} [{}]",
+            if num_conflicts == 0 {
+                "y/g = proceed".bright_green()
+            } else {
+                "Tab/S-Tab = next/previous conflict".bright_yellow()
+            },
+            if by_size {
+                "size, largest first"
+            } else {
+                "name"
+            },
+            if actions[sel].is_conflict() {
+                ", left/l = update local, right/r = update remote, c = keep conflict"
+            } else {
+                ""
+            },
+            num_conflicts
+        );
+        let help_rows = console::measure_text_width(&help)
+            .max(1)
+            .div_ceil(usize::from(width).max(1));
+        let capacity = usize::from(terminal_height)
+            .saturating_sub(help_rows + 2)
+            .max(1);
+        let page = sel / capacity;
+        term.write_line(&help)?;
         term.write_line(actions::details(&actions[sel]).as_str())?;
-        height += 2;
+        height += help_rows + 1;
 
         for (idx, action) in actions
             .iter()
@@ -232,7 +255,12 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
                 return Err(error);
             }
         };
+        let mut resort = false;
         match key {
+            InteractiveKey::Char('s') => {
+                by_size = !by_size;
+                resort = true;
+            }
             InteractiveKey::ArrowDown | InteractiveKey::Char('j') => loop {
                 sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
                 if verbose || !actions[sel].is_identical() {
@@ -261,6 +289,7 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
                         num_conflicts -= 1;
                     }
                     *actions[sel] = resolve_action(&actions[sel], Resolution::Local);
+                    resort = by_size;
                 }
                 sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
             }
@@ -270,6 +299,7 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
                         num_conflicts -= 1;
                     }
                     *actions[sel] = resolve_action(&actions[sel], Resolution::Remote);
+                    resort = by_size;
                 }
                 sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
             }
@@ -284,6 +314,7 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
                             _ => unreachable!(),
                         }
                         num_conflicts += 1;
+                        resort = by_size;
                     }
                 }
                 sel = (sel as u64 + 1).rem(actions.len() as u64) as usize;
@@ -313,9 +344,8 @@ pub fn resolve_interactive(actions: &mut Actions, verbose: bool) -> Result<AllRe
 
             _ => {}
         }
-
-        if sel < page * capacity || sel >= (page + 1) * capacity {
-            page = sel / capacity;
+        if resort {
+            sel = sort_interactive_actions(&mut actions, sel, by_size);
         }
 
         term.clear_last_lines(height)?;
