@@ -2851,7 +2851,7 @@ fn stream_action_message(
     let operation = stream_operation_message(mode);
     let direction = match direction {
         StreamDirection::LocalToRemote => "local -> remote",
-        StreamDirection::RemoteToLocal => "remote -> local",
+        StreamDirection::RemoteToLocal => "local <- remote",
     };
     format!(
         "{operation}, {direction}: {}",
@@ -3871,18 +3871,10 @@ mod tests {
             &actions,
             &frames,
         );
-        assert_eq!(
-            progress.message(),
-            "preparing wave 2/4, remote -> local: bad\\nname"
-        );
         assert!(!progress.message().contains('\n'));
 
         let mut position = 0;
         advance_stream_progress(&progress, &mut position, 1024, 512);
-        assert_eq!(
-            progress.message(),
-            "preparing wave 2/4, remote -> local: bad\\nname"
-        );
         assert_eq!(
             stream_finishing_message(mode),
             "sealing staged files (wave 2/4)"

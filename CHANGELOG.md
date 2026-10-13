@@ -9,6 +9,7 @@
 
 ### Changed
 
+- Display remote-to-local transfer hints as `local <- remote` to match the sync plan's direction layout.
 - Show right-aligned binary file sizes before filenames in sync plans and local change listings; directories and symlinks leave the size column blank, unresolved conflicts show the larger file size, and resolved conflicts show the selected version's size.
 - Supported recovery journals larger than 16 MiB with incremental validation, bounded inspection output, streamed legacy phase rewrites, and existing V3 same-inode phase updates, while preserving record-size limits and identity-checked cleanup.
 - Clarified dependency-group staging-capacity failures with human-readable sizes, the minimum-free-space reserve policy, and actionable `--staging-reserve` guidance.
